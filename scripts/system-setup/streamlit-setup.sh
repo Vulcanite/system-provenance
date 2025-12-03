@@ -21,7 +21,7 @@ fi
 
 echo "Installing additional system dependencies..."
 # FIX: Added graphviz as mentioned in description
-sudo apt-get install -y python3-pip graphviz
+sudo apt-get install -y python3-pip graphviz tshark
 
 echo "Creating Python virtual environment..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
