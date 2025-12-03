@@ -15,24 +15,10 @@ home_page = st.Page("pages/home.py", title="Dashboard", icon="🏠", default=Tru
 ebpf_events_page = st.Page("pages/ebpf_events.py", title="eBPF Events", icon="📝")
 pcap_flows_page = st.Page("pages/pcap_flows.py", title="PCAP Flows", icon="🌐")
 provenance_page = st.Page("pages/provenance.py", title="Provenance Analysis", icon="🔍")
+offline_analysis_page = st.Page("pages/offline_analysis.py", title="Offline Analysis", icon="📊")
 
 # Create navigation
-pg = st.navigation([home_page, ebpf_events_page, pcap_flows_page, provenance_page])
-
-# Add sidebar info
-with st.sidebar:
-    st.title("🔍 eBPF Provenance Monitor")
-    st.markdown("---")
-    st.markdown("### Post-Mortem Forensic Analysis")
-    st.markdown("""
-    **Features:**
-    - Real-time syscall monitoring
-    - Network flow tracking
-    - Provenance graph generation
-    - AI-powered analysis
-    """)
-    st.markdown("---")
-    st.caption("v2.0 - Multi-page Edition")
+pg = st.navigation([home_page, ebpf_events_page, pcap_flows_page, provenance_page, offline_analysis_page])
 
 # Run selected page
 pg.run()
