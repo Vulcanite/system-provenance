@@ -1,4 +1,4 @@
 #!/bin/sh
 
-systemctl stop ebpf-monitor
-systemctl disable ebpf-monitor
+systemctl stop system-monitor
+systemctl disable system-monitor

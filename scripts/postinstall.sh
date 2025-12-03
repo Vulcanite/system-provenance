@@ -1,4 +1,4 @@
 #!/bin/sh
 
 systemctl daemon-reload
-systemctl enable ebpf-monitor
+systemctl enable system-monitor
