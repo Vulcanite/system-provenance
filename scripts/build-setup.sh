@@ -4,7 +4,7 @@ set -e
 
 echo "[+] Installing build dependencies..."
 sudo apt-get update
-sudo apt-get install -y clang llvm libbpf-dev linux-headers-$(uname -r) make wget
+sudo apt-get install -y clang llvm libbpf-dev linux-headers-$(uname -r) make wget libpcap-dev
 
 # Install Go if not already installed
 if ! command -v go &> /dev/null; then
