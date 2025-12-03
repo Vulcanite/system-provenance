@@ -23,48 +23,48 @@ import (
 
 // AuditEvent represents a syscall event captured by eBPF
 type AuditEvent struct {
-	Hostname           string `json:"hostname"`
-	TimestampNs        int64  `json:"timestamp_ns"`
-	EpochTimestamp     int64  `json:"epoch_timestamp"`
-	Datetime           string `json:"datetime"`
-	Pid                uint32 `json:"pid"`
-	Ppid               uint32 `json:"ppid"`
-	Uid                uint32 `json:"uid"`
-	ProcessStartTime   uint64 `json:"process_start_time"`
-	Comm               string `json:"comm"`
-	Syscall            string `json:"syscall"`
-	Filename           string `json:"filename"`
-	Fd                 int64  `json:"fd"`
-	Ret                int64  `json:"ret"`
-	Error              string `json:"error,omitempty"`
-	ErrorCode          int64  `json:"error_code,omitempty"`
+	Hostname         string `json:"hostname"`
+	TimestampNs      int64  `json:"timestamp_ns"`
+	EpochTimestamp   int64  `json:"epoch_timestamp"`
+	Datetime         string `json:"datetime"`
+	Pid              uint32 `json:"pid"`
+	Ppid             uint32 `json:"ppid"`
+	Uid              uint32 `json:"uid"`
+	ProcessStartTime uint64 `json:"process_start_time"`
+	Comm             string `json:"comm"`
+	Syscall          string `json:"syscall"`
+	Filename         string `json:"filename"`
+	Fd               int64  `json:"fd"`
+	Ret              int64  `json:"ret"`
+	Error            string `json:"error,omitempty"`
+	ErrorCode        int64  `json:"error_code,omitempty"`
 
 	// Enhanced network fields
-	SrcIP              string `json:"src_ip,omitempty"`
-	DestIP             string `json:"dest_ip,omitempty"`
-	SrcIPv6            string `json:"src_ipv6,omitempty"`
-	DestIPv6           string `json:"dest_ipv6,omitempty"`
-	SrcPort            uint16 `json:"src_port,omitempty"`
-	DestPort           uint16 `json:"dest_port,omitempty"`
-	SaFamily           string `json:"sa_family,omitempty"`
-	Protocol           uint8  `json:"protocol,omitempty"`
-	SocketType         uint8  `json:"socket_type,omitempty"`
+	SrcIP      string `json:"src_ip,omitempty"`
+	DestIP     string `json:"dest_ip,omitempty"`
+	SrcIPv6    string `json:"src_ipv6,omitempty"`
+	DestIPv6   string `json:"dest_ipv6,omitempty"`
+	SrcPort    uint16 `json:"src_port,omitempty"`
+	DestPort   uint16 `json:"dest_port,omitempty"`
+	SaFamily   string `json:"sa_family,omitempty"`
+	Protocol   uint8  `json:"protocol,omitempty"`
+	SocketType uint8  `json:"socket_type,omitempty"`
 
 	// I/O fields
-	Count              uint64 `json:"count,omitempty"`
-	BytesRW            int64  `json:"bytes_rw,omitempty"`
+	Count   uint64 `json:"count,omitempty"`
+	BytesRW int64  `json:"bytes_rw,omitempty"`
 }
 
 // EBPFCollector handles eBPF program loading and event processing
 type EBPFCollector struct {
-	cfg          Config
-	outputFile   *os.File
-	fileLock     sync.Mutex
-	bulkIndexer  esutil.BulkIndexer
-	objs         bpfObjects
-	links        []link.Link
-	perfReader   *perf.Reader
-	stopChan     chan struct{}
+	cfg         Config
+	outputFile  *os.File
+	fileLock    sync.Mutex
+	bulkIndexer esutil.BulkIndexer
+	objs        bpfObjects
+	links       []link.Link
+	perfReader  *perf.Reader
+	stopChan    chan struct{}
 }
 
 // NewEBPFCollector creates a new eBPF collector instance
@@ -202,7 +202,9 @@ func (ec *EBPFCollector) attachTracepoints() error {
 	attach("syscalls", "sys_enter_bind", ec.objs.SysEnterBind)
 	attach("syscalls", "sys_enter_listen", ec.objs.SysEnterListen)
 	attach("syscalls", "sys_enter_accept", ec.objs.SysEnterAccept)
+	attach("syscalls", "sys_exit_accept", ec.objs.SysExitAccept)
 	attach("syscalls", "sys_enter_accept4", ec.objs.SysEnterAccept4)
+	attach("syscalls", "sys_exit_accept4", ec.objs.SysExitAccept4)
 	attach("syscalls", "sys_enter_sendto", ec.objs.SysEnterSendto)
 	attach("syscalls", "sys_exit_sendto", ec.objs.SysExitSendto)
 	attach("syscalls", "sys_enter_recvfrom", ec.objs.SysEnterRecvfrom)
