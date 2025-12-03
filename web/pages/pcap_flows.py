@@ -67,12 +67,13 @@ hostname_filter = st.sidebar.selectbox("Hostname", hostname_options)
 # Protocol filter
 protocol_filter = st.sidebar.selectbox("Protocol", ["All", "TCP", "UDP"])
 
-# Sort by option
+# Sort by option (for table display only)
 sort_by = st.sidebar.selectbox(
-    "Sort Top 100 Flows By",
+    "Sort Table By",
     ["Bytes (Highest)", "Packets (Highest)", "Duration (Longest)", "Most Recent"],
     index=0
 )
+st.sidebar.caption("Note: Visualizations use ALL flows in time range")
 
 # Build filters dict
 filters = {}
@@ -86,7 +87,7 @@ st.markdown("---")
 
 # Get total count
 total_count = get_event_count(es, pcap_index, start_ms, end_ms, filters)
-st.info(f"📊 **Total Flows:** {total_count:,}")
+st.info(f"📊 **Total Flows in Selected Time Range:** {total_count:,}")
 
 if total_count > 0:
     # Determine sort field and order based on selection
@@ -103,16 +104,21 @@ if total_count > 0:
         sort_field = "first_seen"
         sort_order = "desc"
 
-    # Fetch top 100 flows
-    with st.spinner("Loading top 100 flows..."):
-        flows = fetch_events(es, pcap_index, start_ms, end_ms, filters, page=1, page_size=100, sort_field=sort_field, sort_order=sort_order)
+    # Fetch top 100 flows for table display
+    with st.spinner("Loading top 100 flows for table..."):
+        top_flows = fetch_events(es, pcap_index, start_ms, end_ms, filters, page=1, page_size=100, sort_field=sort_field, sort_order=sort_order)
 
-    if flows:
-        st.success(f"✅ Showing top 100 flows (sorted by {sort_by})")
+    # Fetch ALL flows for visualizations (up to 10,000 to avoid memory issues)
+    viz_limit = min(total_count, 10000)
+    with st.spinner(f"Loading {viz_limit} flows for visualizations..."):
+        all_flows = fetch_events(es, pcap_index, start_ms, end_ms, filters, page=1, page_size=viz_limit, sort_field="epoch_first", sort_order="asc")
 
-        # Create DataFrame for table view
+    if top_flows:
+        st.success(f"✅ Table: Showing top 100 flows (sorted by {sort_by}) | Visualizations: Using {len(all_flows):,} flows from selected time range")
+
+        # Create DataFrame for table view (top 100)
         table_data = []
-        for flow in flows:
+        for flow in top_flows:
             duration_s = (flow.get('epoch_last', 0) - flow.get('epoch_first', 0)) / 1000.0
             table_data.append({
                 "Hostname": flow.get("hostname", "N/A"),
@@ -133,14 +139,38 @@ if total_count > 0:
                 "epoch_first": flow.get("epoch_first", 0),
             })
 
-        df = pd.DataFrame(table_data)
+        df_table = pd.DataFrame(table_data)
 
         # Display table (without raw data columns)
-        display_df = df[["Hostname", "Protocol", "Source", "Destination", "Domain", "Packets", "Bytes", "Duration (s)", "First Seen"]]
+        display_df = df_table[["Hostname", "Protocol", "Source", "Destination", "Domain", "Packets", "Bytes", "Duration (s)", "First Seen"]]
         st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        # Create DataFrame for visualizations (ALL flows in time range)
+        viz_data = []
+        for flow in all_flows:
+            duration_s = (flow.get('epoch_last', 0) - flow.get('epoch_first', 0)) / 1000.0
+            viz_data.append({
+                "Hostname": flow.get("hostname", "N/A"),
+                "Protocol": flow.get("protocol", "N/A"),
+                "Source": f"{flow.get('src_ip', 'N/A')}:{flow.get('src_port', '')}",
+                "Destination": f"{flow.get('dst_ip', 'N/A')}:{flow.get('dst_port', '')}",
+                "Domain": flow.get("domain_name", "-") if flow.get("dns_resolved") else "-",
+                "Packets": flow.get("packet_count", 0),
+                "Bytes": flow.get("byte_count", 0),
+                "Duration (s)": round(duration_s, 2),
+                "src_ip": flow.get("src_ip", "N/A"),
+                "dst_ip": flow.get("dst_ip", "N/A"),
+                "src_port": flow.get("src_port", 0),
+                "dst_port": flow.get("dst_port", 0),
+                "tcp_flags": flow.get("tcp_flags", []),
+                "epoch_first": flow.get("epoch_first", 0),
+            })
+
+        df = pd.DataFrame(viz_data)
 
         st.markdown("---")
         st.header("📊 Traffic Visualizations")
+        st.caption(f"Based on {len(df):,} flows from selected time range")
 
         # Row 1: Protocol distribution and Traffic over time
         col1, col2 = st.columns(2)
