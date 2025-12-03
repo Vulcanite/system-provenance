@@ -124,6 +124,15 @@ struct {
     __type(value, struct socket_data_t);
 } connect_data SEC(".maps");
 
+// --- NEW MAP FOR ACCEPT CORRELATION ---
+// Stores the sockaddr pointer from sys_enter_accept/4 to read it in sys_exit
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, u64);
+    __type(value, struct sockaddr *);
+} active_accepts SEC(".maps");
+
 // -------------------------------------------------------------------------
 // OPTIMIZED FILTERING LOGIC
 // -------------------------------------------------------------------------
@@ -165,48 +174,22 @@ static __always_inline int should_drop_comm(char *c) {
 static __always_inline int should_drop_file(struct so_event *e) {
     char *f = e->filename;
     char *sys = e->syscall;
-
     if (f[0] == 0) return 0;
-
-    // SECURITY FIX: Never filter files if the syscall is 'execve'.
-    // We want to know if someone executes a binary in /tmp, /usr/lib, or /var/log.
-    if (sys[0] == 'e' && sys[1] == 'x' && sys[2] == 'e' && sys[3] == 'c') {
-        return 0;
-    }
-
-    // NOTE: system-monitor's own file I/O is already filtered by should_drop_comm()
-    //       in STAGE 1 (init_event). This means:
-    //       ✅ system-monitor writes to /var/monitoring/events/* → DROPPED (by comm filter)
-    //       ✅ Attacker writes to /var/monitoring/events/*      → CAPTURED (different comm)
-    //       No need for path-based self-protection here.
-
-    // 1. Library Paths (High Volume Noise)
-    // Only drop these for non-exec events (like openat/read)
+    if (sys[0] == 'e' && sys[1] == 'x' && sys[2] == 'e' && sys[3] == 'c') return 0;
     if (f[0]=='/' && f[1]=='u' && f[2]=='s' && f[3]=='r' && f[4]=='/' &&
-        f[5]=='l' && f[6]=='i' && f[7]=='b') return 1; // /usr/lib
-
-    if (f[0]=='/' && f[1]=='l' && f[2]=='i' && f[3]=='b') return 1; // /lib
-
-    // 2. Pseudo Filesystems (Always noisy)
-    if (f[0]=='/' && f[1]=='s' && f[2]=='y' && f[3]=='s' && f[4]=='/') return 1; // /sys
-    if (f[0]=='/' && f[1]=='p' && f[2]=='r' && f[3]=='o' && f[4]=='c') return 1; // /proc
-
-    // 3. Noisy Devices
+        f[5]=='l' && f[6]=='i' && f[7]=='b') return 1;
+    if (f[0]=='/' && f[1]=='l' && f[2]=='i' && f[3]=='b') return 1;
+    if (f[0]=='/' && f[1]=='s' && f[2]=='y' && f[3]=='s' && f[4]=='/') return 1;
+    if (f[0]=='/' && f[1]=='p' && f[2]=='r' && f[3]=='o' && f[4]=='c') return 1;
     if (f[0]=='/' && f[1]=='d' && f[2]=='e' && f[3]=='v' && f[4]=='/') {
         if (f[5]=='n' && f[6]=='u' && f[7]=='l' && f[8]=='l') return 1;
         if (f[5]=='u' && f[6]=='r' && f[7]=='a' && f[8]=='n') return 1;
         if (f[5]=='z' && f[6]=='e' && f[7]=='r' && f[8]=='o') return 1;
-        // /dev/pts (Terminal noise)
         if (f[5]=='p' && f[6]=='t' && f[7]=='s' && f[8]=='/') return 1;
     }
-
-    // 4. Runtime state
-    if (f[0]=='/' && f[1]=='r' && f[2]=='u' && f[3]=='n' && f[4]=='/') return 1; // /run
-
+    if (f[0]=='/' && f[1]=='r' && f[2]=='u' && f[3]=='n' && f[4]=='/') return 1;
     return 0;
 }
-
-// --- HELPERS ---
 
 static __always_inline struct so_event* init_event() {
     u32 zero = 0;
@@ -215,22 +198,15 @@ static __always_inline struct so_event* init_event() {
 
     u64 pid_tgid = bpf_get_current_pid_tgid();
     event->pid = pid_tgid >> 32;
-
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
-
-    // STAGE 1 FILTER: Filter by Process Name ONLY
     if (should_drop_comm(event->comm)) return NULL;
 
     event->uid = bpf_get_current_uid_gid();
     event->timestamp = bpf_ktime_get_ns();
-
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     BPF_CORE_READ_INTO(&event->ppid, task, real_parent, tgid);
-
-    // Get process start time for correlation with PCAP
     BPF_CORE_READ_INTO(&event->process_start_time, task, start_time);
 
-    // Clear fields
     event->filename[0] = 0;
     event->src_ip = 0;
     event->dest_ip = 0;
@@ -243,95 +219,38 @@ static __always_inline struct so_event* init_event() {
     event->bytes_rw = 0;
     __builtin_memset(event->src_ipv6, 0, sizeof(event->src_ipv6));
     __builtin_memset(event->dest_ipv6, 0, sizeof(event->dest_ipv6));
-
     return event;
 }
 
-// Check if network event matches whitelist (IP+Port combination)
 static __always_inline bool is_whitelisted_network(u32 ip, u16 port) {
-    // Manually check up to 8 whitelist rules (enough for typical use cases)
-    // Manual unrolling to satisfy eBPF verifier (no unbounded loops allowed)
     struct whitelist_rule *rule;
     u64 idx;
-
-    idx = 0;
-    rule = bpf_map_lookup_elem(&whitelist_rules, &idx);
-    if (rule && rule->ip == ip && rule->port == port) return true;
-
-    idx = 1;
-    rule = bpf_map_lookup_elem(&whitelist_rules, &idx);
-    if (rule && rule->ip == ip && rule->port == port) return true;
-
-    idx = 2;
-    rule = bpf_map_lookup_elem(&whitelist_rules, &idx);
-    if (rule && rule->ip == ip && rule->port == port) return true;
-
-    idx = 3;
-    rule = bpf_map_lookup_elem(&whitelist_rules, &idx);
-    if (rule && rule->ip == ip && rule->port == port) return true;
-
-    idx = 4;
-    rule = bpf_map_lookup_elem(&whitelist_rules, &idx);
-    if (rule && rule->ip == ip && rule->port == port) return true;
-
-    idx = 5;
-    rule = bpf_map_lookup_elem(&whitelist_rules, &idx);
-    if (rule && rule->ip == ip && rule->port == port) return true;
-
-    idx = 6;
-    rule = bpf_map_lookup_elem(&whitelist_rules, &idx);
-    if (rule && rule->ip == ip && rule->port == port) return true;
-
-    idx = 7;
-    rule = bpf_map_lookup_elem(&whitelist_rules, &idx);
-    if (rule && rule->ip == ip && rule->port == port) return true;
-
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        idx = i;
+        rule = bpf_map_lookup_elem(&whitelist_rules, &idx);
+        if (rule && rule->ip == ip && rule->port == port) return true;
+    }
     return false;
 }
 
 // Check if event should be dropped due to whitelist
 static __always_inline bool should_drop_network(struct so_event *event) {
-    // Only check network syscalls
     if (event->syscall[0] == 'c' && event->syscall[1] == 'o' && event->syscall[2] == 'n') {
-        // connect syscall - check destination
-        if (event->sa_family == 2) {  // AF_INET (IPv4 only for now)
-            if (is_whitelisted_network(event->dest_ip, event->dest_port)) {
-                return true;
-            }
-        }
+        if (event->sa_family == 2 && is_whitelisted_network(event->dest_ip, event->dest_port)) return true;
     } else if (event->syscall[0] == 'b' && event->syscall[1] == 'i' && event->syscall[2] == 'n') {
-        // bind syscall - check source
-        if (event->sa_family == 2) {  // AF_INET
-            if (is_whitelisted_network(event->src_ip, event->src_port)) {
-                return true;
-            }
-        }
+        if (event->sa_family == 2 && is_whitelisted_network(event->src_ip, event->src_port)) return true;
     } else if (event->syscall[0] == 's' && event->syscall[1] == 'e' && event->syscall[2] == 'n') {
-        // sendto syscall - check destination
-        if (event->sa_family == 2) {  // AF_INET
-            if (is_whitelisted_network(event->dest_ip, event->dest_port)) {
-                return true;
-            }
-        }
+        if (event->sa_family == 2 && is_whitelisted_network(event->dest_ip, event->dest_port)) return true;
     } else if (event->syscall[0] == 'r' && event->syscall[1] == 'e' && event->syscall[2] == 'c') {
-        // recvfrom syscall - check source
-        if (event->sa_family == 2) {  // AF_INET
-            if (is_whitelisted_network(event->src_ip, event->src_port)) {
-                return true;
-            }
-        }
+        if (event->sa_family == 2 && is_whitelisted_network(event->src_ip, event->src_port)) return true;
     }
-
     return false;
 }
 
 static __always_inline void submit(void *ctx, struct so_event *event) {
-    // STAGE 2 FILTER: Filter by File Path (Context Aware)
     if (should_drop_file(event)) return;
-
-    // STAGE 3 FILTER: Filter by Network Whitelist (IP+Port)
     if (should_drop_network(event)) return;
-
     bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, event, sizeof(*event));
 }
 
@@ -602,22 +521,89 @@ int sys_enter_listen(struct args_listen *ctx) {
 
 SEC("tp/syscalls/sys_enter_accept")
 int sys_enter_accept(struct args_accept *ctx) {
-    struct so_event *event = init_event();
-    if (!event) return 0;
-    __builtin_memcpy(event->syscall, "accept", 7);
-    event->fd = ctx->fd;
-    submit(ctx, event);
+    u64 id = bpf_get_current_pid_tgid();
+    struct sockaddr *addr = ctx->upeer_sockaddr;
+    bpf_map_update_elem(&active_accepts, &id, &addr, BPF_ANY);
     return 0;
 }
 
 SEC("tp/syscalls/sys_enter_accept4")
 int sys_enter_accept4(struct args_accept *ctx) {
-    struct so_event *event = init_event();
-    if (!event) return 0;
-    __builtin_memcpy(event->syscall, "accept4", 8);
-    event->fd = ctx->fd;
-    submit(ctx, event);
+    u64 id = bpf_get_current_pid_tgid();
+    struct sockaddr *addr = ctx->upeer_sockaddr;
+    bpf_map_update_elem(&active_accepts, &id, &addr, BPF_ANY);
     return 0;
+}
+
+static __always_inline int process_exit_accept(struct args_exit *ctx, const char* syscall_name, size_t sys_len) {
+    u64 id = bpf_get_current_pid_tgid();
+    struct sockaddr **addr_ptr = bpf_map_lookup_elem(&active_accepts, &id);
+    
+    if (!addr_ptr || ctx->ret < 0) {
+        bpf_map_delete_elem(&active_accepts, &id);
+        return 0;
+    }
+
+    struct so_event *event = init_event();
+    if (!event) {
+        bpf_map_delete_elem(&active_accepts, &id);
+        return 0;
+    }
+
+    __builtin_memcpy(event->syscall, syscall_name, sys_len);
+    event->ret = ctx->ret;
+    // New File Descriptor
+    event->fd = ctx->ret; 
+
+    // Read the now-populated sockaddr struct
+    struct sockaddr *addr = *addr_ptr;
+    u16 family = 0;
+    bpf_probe_read_user(&family, sizeof(family), addr);
+    event->sa_family = family;
+
+    struct socket_data_t sock_data = {};
+    sock_data.sa_family = family;
+
+    if (family == 2) { // AF_INET
+        struct sockaddr_in in_addr = {};
+        bpf_probe_read_user(&in_addr, sizeof(in_addr), addr);
+        event->src_ip = bpf_ntohl(in_addr.sin_addr.s_addr);
+        event->src_port = bpf_ntohs(in_addr.sin_port);
+        
+        sock_data.dest_ip = event->src_ip; // For the accepted socket, remote is "dest" in our socket_map logic usually?
+        // Actually, let's keep it consistent: accept() receives a connection FROM a source.
+        // But for future read/write correlation, we want to know the remote peer.
+        // In socket_map, we usually store the REMOTE IP as dest_ip for client sockets.
+        // For server sockets, the remote IP is also the one we want to track.
+        sock_data.dest_ip = event->src_ip; 
+        sock_data.dest_port = event->src_port;
+    } else if (family == 10) { // AF_INET6
+        struct sockaddr_in6 in6_addr = {};
+        bpf_probe_read_user(&in6_addr, sizeof(in6_addr), addr);
+        event->src_port = bpf_ntohs(in6_addr.sin6_port);
+        bpf_probe_read_user(&event->src_ipv6, sizeof(event->src_ipv6), &in6_addr.sin6_addr);
+        
+        sock_data.dest_port = event->src_port;
+        __builtin_memcpy(sock_data.dest_ipv6, event->src_ipv6, sizeof(sock_data.dest_ipv6));
+    }
+
+    // Update socket_map with the NEW FD (ctx->ret) so future I/O is correlated
+    u64 sock_key = (id & 0xFFFFFFFF00000000ULL) | (u32)ctx->ret;
+    bpf_map_update_elem(&socket_map, &sock_key, &sock_data, BPF_ANY);
+
+    submit(ctx, event);
+    bpf_map_delete_elem(&active_accepts, &id);
+    return 0;
+}
+
+SEC("tp/syscalls/sys_exit_accept")
+int sys_exit_accept(struct args_exit *ctx) {
+    return process_exit_accept(ctx, "accept", 7);
+}
+
+SEC("tp/syscalls/sys_exit_accept4")
+int sys_exit_accept4(struct args_exit *ctx) {
+    return process_exit_accept(ctx, "accept4", 8);
 }
 
 SEC("tp/syscalls/sys_enter_sendto")
