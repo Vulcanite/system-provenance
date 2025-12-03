@@ -249,16 +249,43 @@ static __always_inline struct so_event* init_event() {
 
 // Check if network event matches whitelist (IP+Port combination)
 static __always_inline bool is_whitelisted_network(u32 ip, u16 port) {
-    // Check all whitelist rules
-    for (u64 i = 0; i < 64; i++) {
-        struct whitelist_rule *rule = bpf_map_lookup_elem(&whitelist_rules, &i);
-        if (!rule) break;  // No more rules
+    // Manually check up to 8 whitelist rules (enough for typical use cases)
+    // Manual unrolling to satisfy eBPF verifier (no unbounded loops allowed)
+    struct whitelist_rule *rule;
+    u64 idx;
 
-        // Check if both IP and port match
-        if (rule->ip == ip && rule->port == port) {
-            return true;
-        }
-    }
+    idx = 0;
+    rule = bpf_map_lookup_elem(&whitelist_rules, &idx);
+    if (rule && rule->ip == ip && rule->port == port) return true;
+
+    idx = 1;
+    rule = bpf_map_lookup_elem(&whitelist_rules, &idx);
+    if (rule && rule->ip == ip && rule->port == port) return true;
+
+    idx = 2;
+    rule = bpf_map_lookup_elem(&whitelist_rules, &idx);
+    if (rule && rule->ip == ip && rule->port == port) return true;
+
+    idx = 3;
+    rule = bpf_map_lookup_elem(&whitelist_rules, &idx);
+    if (rule && rule->ip == ip && rule->port == port) return true;
+
+    idx = 4;
+    rule = bpf_map_lookup_elem(&whitelist_rules, &idx);
+    if (rule && rule->ip == ip && rule->port == port) return true;
+
+    idx = 5;
+    rule = bpf_map_lookup_elem(&whitelist_rules, &idx);
+    if (rule && rule->ip == ip && rule->port == port) return true;
+
+    idx = 6;
+    rule = bpf_map_lookup_elem(&whitelist_rules, &idx);
+    if (rule && rule->ip == ip && rule->port == port) return true;
+
+    idx = 7;
+    rule = bpf_map_lookup_elem(&whitelist_rules, &idx);
+    if (rule && rule->ip == ip && rule->port == port) return true;
+
     return false;
 }
 
