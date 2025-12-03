@@ -25,18 +25,20 @@ generate:
 # 2. Build the Go binary
 build: generate
 	@echo "Building binary..."
-	go build -o $(BINARY_NAME) ./cmd/ebpf-monitor
+	go build -o $(BINARY_NAME) ./cmd/system-monitor
 
 # 3. Install to system (Requires Root)
 install: build
 	@echo "Installing to $(INSTALL_BIN)..."
 	@mkdir -p $(CONFIG_DIR)
+	@mkdir -p $(CONFIG_DIR)/events
+	@mkdir -p $(CONFIG_DIR)/outputs
 	@cp $(BINARY_NAME) $(INSTALL_BIN)
 	@chmod 755 $(INSTALL_BIN)
 	@# Only copy config if it doesn't exist to prevent overwriting custom settings
 	@if [ ! -f $(CONFIG_DIR)/config.json ]; then \
 		echo "Installing default config to $(CONFIG_DIR)/config.json..."; \
-		cp $(CONFIG_SRC) $(CONFIG_DIR)/monitor.json; \
+		cp $(CONFIG_SRC) $(CONFIG_DIR)/config.json; \
 		chmod 600 $(CONFIG_DIR)/config.json; \
 	else \
 		echo "[!] Config exists, skipping overwrite."; \

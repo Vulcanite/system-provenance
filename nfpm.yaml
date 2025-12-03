@@ -8,8 +8,8 @@ description: "System monitoring tool"
 license: "GPLv3"
 
 contents:
-  - src: ./ebpf-monitor
-    dst: /usr/bin/ebpf-monitor
+  - src: ./system-monitor
+    dst: /usr/bin/system-monitor
     file_info:
       mode: 0755
 
@@ -19,8 +19,18 @@ contents:
     file_info:
       mode: 0644
 
-  - src: ./scripts/ebpf-monitor.service
-    dst: /lib/systemd/system/ebpf-monitor.service
+  - dst: /var/monitoring/events
+    type: dir
+    file_info:
+      mode: 0755
+
+  - dst: /var/monitoring/outputs
+    type: dir
+    file_info:
+      mode: 0755
+
+  - src: ./scripts/system-monitor.service
+    dst: /lib/systemd/system/system-monitor.service
 
 scripts:
   postinstall: ./scripts/postinstall.sh

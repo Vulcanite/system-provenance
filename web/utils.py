@@ -10,7 +10,7 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-CONFIG_PATH = "/var/config.json"
+CONFIG_PATH = "/var/monitoring/config.json"
 
 def load_config():
     """Load configuration from JSON file"""

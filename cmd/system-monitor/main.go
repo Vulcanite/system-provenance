@@ -160,7 +160,7 @@ func setupES() {
 }
 
 func main() {
-	configPath := "/var/config.json"
+	configPath := "/var/monitoring/config.json"
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		log.Fatalf("[!] Config not found at %s", configPath)
