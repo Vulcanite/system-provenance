@@ -25,7 +25,7 @@ sudo apt-get install -y python3-pip graphviz
 
 echo "Creating Python virtual environment..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 WEBAPP_DIR="$PROJECT_DIR/web"
 
 cd "$WEBAPP_DIR"
