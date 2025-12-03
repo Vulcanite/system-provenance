@@ -20,10 +20,14 @@ else
 fi
 
 echo "Installing additional system dependencies..."
-sudo apt-get install -y python3-pip
+# FIX: Added graphviz as mentioned in description
+sudo apt-get install -y python3-pip graphviz
 
 echo "Creating Python virtual environment..."
-WEBAPP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/web"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+WEBAPP_DIR="$PROJECT_DIR/web"
+
 cd "$WEBAPP_DIR"
 
 if [ -d "venv" ]; then
@@ -47,21 +51,42 @@ if [ -f "$CONFIG_PATH" ]; then
 else
     echo "Creating config file at $CONFIG_PATH..."
     sudo mkdir -p /var/monitoring/events /var/monitoring/outputs
-    sudo cp ../config/config.json "$CONFIG_PATH"
-    sudo chmod 644 "$CONFIG_PATH"
+    # Ensure source config exists
+    if [ -f "$PROJECT_DIR/config/config.json" ]; then
+        sudo cp "$PROJECT_DIR/config/config.json" "$CONFIG_PATH"
+        sudo chmod 644 "$CONFIG_PATH"
+    else
+        echo "[!] Warning: ../config/config.json not found. You must create $CONFIG_PATH manually."
+    fi
 fi
 
 echo ""
 echo "Setting up systemd service..."
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# FIX: Dynamically generate the service file with absolute paths
+# Systemd does not support variable expansion for WorkingDirectory/ExecStart
+SERVICE_FILE="/lib/systemd/system/streamlit-webapp.service"
 
-echo "Creating environment configuration..."
-echo "PROJECT_ROOT=$PROJECT_DIR" | sudo tee /etc/default/streamlit-webapp > /dev/null
-echo "[+] Environment file created at /etc/default/streamlit-webapp"
+echo "Generating service file at $SERVICE_FILE..."
+sudo tee "$SERVICE_FILE" > /dev/null <<EOF
+[Unit]
+Description=Forensice Web Application
+After=network.target elasticsearch.service
 
-sudo cp "$SCRIPT_DIR/streamlit-webapp.service" /lib/systemd/system/
+[Service]
+Type=simple
+WorkingDirectory=$WEBAPP_DIR
+ExecStart=$WEBAPP_DIR/venv/bin/python -m streamlit run webapp.py --server.port=8501 --server.address=0.0.0.0
+Restart=always
+RestartSec=5s
+User=root
+Group=root
+Environment="PATH=$WEBAPP_DIR/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 sudo systemctl daemon-reload
 sudo systemctl enable streamlit-webapp.service
 echo "[+] Systemd service installed. Start with: sudo systemctl start streamlit-webapp"
