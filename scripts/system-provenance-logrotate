@@ -13,8 +13,8 @@
     dateformat -%Y%m%d
     postrotate
         # Send SIGHUP to ebpf-monitor to reopen log file
-        if systemctl is-active --quiet ebpf-monitor.service; then
-            systemctl kill -s HUP ebpf-monitor.service 2>/dev/null || true
+        if systemctl is-active --quiet system-monitor.service; then
+            systemctl kill -s HUP system-monitor.service 2>/dev/null || true
         fi
     endscript
 }
