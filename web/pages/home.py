@@ -101,7 +101,7 @@ try:
             },
             "aggs": {
                 "top_syscalls": {
-                    "terms": {"field": "syscall", "size": 5}
+                    "terms": {"field": "syscall.keyword", "size": 5}
                 }
             },
             "size": 0
@@ -117,7 +117,7 @@ try:
         st.markdown("**Top Processes**")
         query["aggs"] = {
             "top_procs": {
-                "terms": {"field": "comm", "size": 5}
+                "terms": {"field": "comm.keyword", "size": 5}
             }
         }
 

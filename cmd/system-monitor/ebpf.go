@@ -92,8 +92,14 @@ func NewEBPFCollector(cfg Config, outputFile *os.File, bulkIndexer esutil.BulkIn
 		return nil, fmt.Errorf("failed to attach tracepoints: %v", err)
 	}
 
-	// Create perf reader
-	rd, err := perf.NewReader(collector.objs.Events, os.Getpagesize()*4096)
+	// Populate whitelist rules
+	if err := collector.populateWhitelist(); err != nil {
+		log.Printf("[!] Warning: Failed to populate eBPF whitelist: %v", err)
+	}
+
+	// Create perf reader with larger buffer to prevent drops during high activity
+	// Buffer size = pagesize * 16384 = 4KB * 16384 = 64MB per CPU
+	rd, err := perf.NewReader(collector.objs.Events, os.Getpagesize()*16384)
 	if err != nil {
 		collector.cleanup()
 		return nil, fmt.Errorf("failed to create perf reader: %v", err)
@@ -101,6 +107,54 @@ func NewEBPFCollector(cfg Config, outputFile *os.File, bulkIndexer esutil.BulkIn
 	collector.perfReader = rd
 
 	return collector, nil
+}
+
+// populateWhitelist populates the eBPF whitelist map with rules
+func (ec *EBPFCollector) populateWhitelist() error {
+	// Add Elasticsearch host+port combination
+	if ec.cfg.ESConfig.Host != "" && ec.cfg.ESConfig.Port > 0 {
+		esHost := ec.cfg.ESConfig.Host
+		esPort := ec.cfg.ESConfig.Port
+
+		// Resolve hostname to IP
+		ips, err := net.LookupIP(esHost)
+		if err != nil {
+			return fmt.Errorf("failed to resolve ES host %s: %v", esHost, err)
+		}
+
+		// Add all resolved IPs to whitelist
+		for idx, ip := range ips {
+			// Only handle IPv4 for now
+			ip4 := ip.To4()
+			if ip4 == nil {
+				continue
+			}
+
+			// Convert IP to uint32 (network byte order)
+			ipUint32 := binary.BigEndian.Uint32(ip4)
+
+			// Convert port to network byte order (big endian)
+			portUint16 := uint16(esPort)
+			portBE := (portUint16 >> 8) | (portUint16 << 8)
+
+			// Create whitelist rule
+			rule := bpfWhitelistRule{
+				Ip:   ipUint32,
+				Port: portBE,
+			}
+
+			// Insert into map at index
+			key := uint64(idx)
+			if err := ec.objs.WhitelistRules.Put(&key, &rule); err != nil {
+				return fmt.Errorf("failed to add whitelist rule: %v", err)
+			}
+
+			fmt.Printf("[+] eBPF whitelist: Excluding traffic to %s:%d (Elasticsearch)\n",
+				ip4.String(), esPort)
+		}
+	}
+
+	return nil
 }
 
 // attachTracepoints attaches all eBPF programs to kernel tracepoints

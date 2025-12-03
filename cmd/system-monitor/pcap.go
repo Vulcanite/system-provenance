@@ -48,6 +48,12 @@ type DNSCacheEntry struct {
 	ExpiresAt time.Time
 }
 
+// WhitelistRule represents a combined IP+Port whitelist rule
+type WhitelistRule struct {
+	IP   string
+	Port uint16
+}
+
 // PCAPCollector handles packet capture and flow aggregation
 type PCAPCollector struct {
 	cfg               Config
@@ -59,17 +65,70 @@ type PCAPCollector struct {
 	outputFile        *os.File
 	fileLock          sync.Mutex
 	stopChan          chan struct{}
+	whitelistRules    []WhitelistRule  // Combined IP+Port rules to exclude
+	whitelistIPs      map[string]bool  // IPs to exclude (for localhost only)
 }
 
 // NewPCAPCollector creates a new PCAP collector instance
 func NewPCAPCollector(cfg Config, bi esutil.BulkIndexer) *PCAPCollector {
-	return &PCAPCollector{
-		cfg:          cfg,
-		flows:        make(map[FlowKey]*FlowStats),
-		dnsCache:     make(map[string]*DNSCacheEntry),
-		bulkIndexer:  bi,
-		stopChan:     make(chan struct{}),
+	pc := &PCAPCollector{
+		cfg:            cfg,
+		flows:          make(map[FlowKey]*FlowStats),
+		dnsCache:       make(map[string]*DNSCacheEntry),
+		bulkIndexer:    bi,
+		stopChan:       make(chan struct{}),
+		whitelistRules: make([]WhitelistRule, 0),
+		whitelistIPs:   make(map[string]bool),
 	}
+
+	// Build whitelist from Elasticsearch config
+	pc.buildWhitelist()
+
+	return pc
+}
+
+// buildWhitelist creates whitelist of IPs and ports to exclude from capture
+func (pc *PCAPCollector) buildWhitelist() {
+	// Add Elasticsearch host+port combination (must match BOTH)
+	if pc.cfg.ESConfig.Host != "" && pc.cfg.ESConfig.Port > 0 {
+		esHost := pc.cfg.ESConfig.Host
+		esPort := uint16(pc.cfg.ESConfig.Port)
+
+		rule := WhitelistRule{
+			IP:   esHost,
+			Port: esPort,
+		}
+		pc.whitelistRules = append(pc.whitelistRules, rule)
+
+		fmt.Printf("[+] PCAP whitelist: Excluding traffic to %s:%d (Elasticsearch)\n", esHost, esPort)
+	}
+
+	// Add localhost addresses (ANY port on localhost - internal system traffic)
+	pc.whitelistIPs["127.0.0.1"] = true
+	pc.whitelistIPs["::1"] = true
+	fmt.Printf("[+] PCAP whitelist: Excluding all localhost traffic (127.0.0.1, ::1)\n")
+}
+
+// isWhitelisted checks if a flow should be excluded from capture
+func (pc *PCAPCollector) isWhitelisted(srcIP, dstIP string, srcPort, dstPort uint16) bool {
+	// Check if any IP is localhost (exclude all localhost traffic regardless of port)
+	if pc.whitelistIPs[srcIP] || pc.whitelistIPs[dstIP] {
+		return true
+	}
+
+	// Check combined IP+Port rules (both must match)
+	for _, rule := range pc.whitelistRules {
+		// Check if source matches rule (IP AND port)
+		if rule.IP == srcIP && rule.Port == srcPort {
+			return true
+		}
+		// Check if destination matches rule (IP AND port)
+		if rule.IP == dstIP && rule.Port == dstPort {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Start begins packet capture and processing
@@ -228,6 +287,11 @@ func extractTCPFlags(tcp *layers.TCP) []string {
 
 // updateFlow updates or creates flow statistics
 func (pc *PCAPCollector) updateFlow(key FlowKey, packetLen int, tcpFlags []string) {
+	// Check if this flow should be excluded (whitelist check)
+	if pc.isWhitelisted(key.SrcIP, key.DstIP, key.SrcPort, key.DstPort) {
+		return // Skip whitelisted traffic
+	}
+
 	pc.flowsMutex.Lock()
 	defer pc.flowsMutex.Unlock()
 
@@ -383,33 +447,27 @@ func (pc *PCAPCollector) flushFlows() {
 		return
 	}
 
-	fmt.Printf("[+] Flushing %d PCAP flows\n", len(pc.flows))
-
-	// Check for expired flows
+	// Flush flows to storage
+	// Strategy: Send ALL flows to Elasticsearch for near real-time visibility
+	// Only remove from memory if they've been inactive for FlowTimeout
 	now := time.Now()
 	timeout := time.Duration(pc.cfg.PCAPConfig.FlowTimeout) * time.Second
 
-	for key, flow := range pc.flows {
-		// Only flush flows that haven't seen activity in FlowTimeout seconds
-		if now.Sub(flow.LastSeen) < timeout {
-			continue
-		}
+	flushedCount := 0
+	removedCount := 0
 
+	for key, flow := range pc.flows {
+		// Check if flow has been inactive
+		inactive := now.Sub(flow.LastSeen) >= timeout
+
+		// Serialize flow
 		jsonBytes, err := json.Marshal(flow)
 		if err != nil {
 			log.Printf("[!] Failed to marshal flow: %v", err)
 			continue
 		}
 
-		// Write to file
-		if pc.cfg.Storage.FileLoggingEnabled && pc.outputFile != nil {
-			pc.fileLock.Lock()
-			pc.outputFile.Write(jsonBytes)
-			pc.outputFile.WriteString("\n")
-			pc.fileLock.Unlock()
-		}
-
-		// Write to Elasticsearch
+		// Always send to Elasticsearch for real-time visibility
 		if pc.bulkIndexer != nil {
 			pc.bulkIndexer.Add(context.Background(), esutil.BulkIndexerItem{
 				Action: "index",
@@ -422,9 +480,25 @@ func (pc *PCAPCollector) flushFlows() {
 					}
 				},
 			})
+			flushedCount++
 		}
 
-		// Remove flushed flow
-		delete(pc.flows, key)
+		// Write to file (only inactive flows to avoid duplicates)
+		if inactive && pc.cfg.Storage.FileLoggingEnabled && pc.outputFile != nil {
+			pc.fileLock.Lock()
+			pc.outputFile.Write(jsonBytes)
+			pc.outputFile.WriteString("\n")
+			pc.fileLock.Unlock()
+		}
+
+		// Remove from memory if inactive
+		if inactive {
+			delete(pc.flows, key)
+			removedCount++
+		}
+	}
+
+	if flushedCount > 0 {
+		fmt.Printf("[+] Sent %d PCAP flows to ES (%d removed, %d active remain)\n", flushedCount, removedCount, len(pc.flows))
 	}
 }

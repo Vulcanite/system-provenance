@@ -8,7 +8,7 @@
   },
   "storage": {
     "file_logging_enabled": true,
-    "type": "elasticsearch"
+    "storage_type": "elasticsearch"
   },
   "es_config": {
     "es_host": "139.59.247.254",

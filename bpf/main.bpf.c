@@ -101,6 +101,21 @@ struct {
     __type(value, struct socket_data_t);
 } socket_map SEC(".maps");
 
+// Whitelist rule structure (IP + Port combination)
+struct whitelist_rule {
+    u32 ip;      // IPv4 address in network byte order
+    u16 port;    // Port in network byte order
+    u16 padding; // Alignment
+};
+
+// Whitelist map for combined IP+Port rules
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 64);  // Max 64 whitelist rules
+    __type(key, u64);  // Index
+    __type(value, struct whitelist_rule);
+} whitelist_rules SEC(".maps");
+
 // Map to track connect enter data
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -116,7 +131,14 @@ struct {
 // Filter based on Process Name (Comm) - Called EARLY
 static __always_inline int should_drop_comm(char *c) {
     // 1. Self-Protection (Infinite Loop prevention)
+    // Drop "ebpf-*" and "system-monitor" - ALL their syscalls
+    // SECURITY NOTE: Attackers accessing /var/monitoring/* will be captured
+    //                because they won't have comm="system-monitor"
     if (c[0]=='e' && c[1]=='b' && c[2]=='p' && c[3]=='f' && c[4]=='-') return 1;
+
+    // "system-monitor" - our own binary (drops all I/O, including writes to logs)
+    if (c[0]=='s' && c[1]=='y' && c[2]=='s' && c[3]=='t' && c[4]=='e' && c[5]=='m' &&
+        c[6]=='-' && c[7]=='m' && c[8]=='o' && c[9]=='n' && c[10]=='i' && c[11]=='t' && c[12]=='o' && c[13]=='r') return 1;
 
     // 2. Noisy System Daemons
     // "systemd-*"
@@ -127,7 +149,7 @@ static __always_inline int should_drop_comm(char *c) {
     if (c[0]=='s' && c[1]=='n' && c[2]=='a' && c[3]=='p' && c[4]=='d') return 1;
 
     // 3. Smart kworker filter
-    // Only drop if it is ACTUALLY a kernel thread (PF_KTHREAD). 
+    // Only drop if it is ACTUALLY a kernel thread (PF_KTHREAD).
     // Keeps malware named "kworker".
     if (c[0]=='k' && c[1]=='w' && c[2]=='o' && c[3]=='r' && c[4]=='k') {
         struct task_struct *task = (struct task_struct *)bpf_get_current_task();
@@ -152,11 +174,17 @@ static __always_inline int should_drop_file(struct so_event *e) {
         return 0;
     }
 
+    // NOTE: system-monitor's own file I/O is already filtered by should_drop_comm()
+    //       in STAGE 1 (init_event). This means:
+    //       ✅ system-monitor writes to /var/monitoring/events/* → DROPPED (by comm filter)
+    //       ✅ Attacker writes to /var/monitoring/events/*      → CAPTURED (different comm)
+    //       No need for path-based self-protection here.
+
     // 1. Library Paths (High Volume Noise)
     // Only drop these for non-exec events (like openat/read)
-    if (f[0]=='/' && f[1]=='u' && f[2]=='s' && f[3]=='r' && f[4]=='/' && 
+    if (f[0]=='/' && f[1]=='u' && f[2]=='s' && f[3]=='r' && f[4]=='/' &&
         f[5]=='l' && f[6]=='i' && f[7]=='b') return 1; // /usr/lib
-    
+
     if (f[0]=='/' && f[1]=='l' && f[2]=='i' && f[3]=='b') return 1; // /lib
 
     // 2. Pseudo Filesystems (Always noisy)
@@ -219,10 +247,64 @@ static __always_inline struct so_event* init_event() {
     return event;
 }
 
+// Check if network event matches whitelist (IP+Port combination)
+static __always_inline bool is_whitelisted_network(u32 ip, u16 port) {
+    // Check all whitelist rules
+    for (u64 i = 0; i < 64; i++) {
+        struct whitelist_rule *rule = bpf_map_lookup_elem(&whitelist_rules, &i);
+        if (!rule) break;  // No more rules
+
+        // Check if both IP and port match
+        if (rule->ip == ip && rule->port == port) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Check if event should be dropped due to whitelist
+static __always_inline bool should_drop_network(struct so_event *event) {
+    // Only check network syscalls
+    if (event->syscall[0] == 'c' && event->syscall[1] == 'o' && event->syscall[2] == 'n') {
+        // connect syscall - check destination
+        if (event->sa_family == 2) {  // AF_INET (IPv4 only for now)
+            if (is_whitelisted_network(event->dest_ip, event->dest_port)) {
+                return true;
+            }
+        }
+    } else if (event->syscall[0] == 'b' && event->syscall[1] == 'i' && event->syscall[2] == 'n') {
+        // bind syscall - check source
+        if (event->sa_family == 2) {  // AF_INET
+            if (is_whitelisted_network(event->src_ip, event->src_port)) {
+                return true;
+            }
+        }
+    } else if (event->syscall[0] == 's' && event->syscall[1] == 'e' && event->syscall[2] == 'n') {
+        // sendto syscall - check destination
+        if (event->sa_family == 2) {  // AF_INET
+            if (is_whitelisted_network(event->dest_ip, event->dest_port)) {
+                return true;
+            }
+        }
+    } else if (event->syscall[0] == 'r' && event->syscall[1] == 'e' && event->syscall[2] == 'c') {
+        // recvfrom syscall - check source
+        if (event->sa_family == 2) {  // AF_INET
+            if (is_whitelisted_network(event->src_ip, event->src_port)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 static __always_inline void submit(void *ctx, struct so_event *event) {
     // STAGE 2 FILTER: Filter by File Path (Context Aware)
     if (should_drop_file(event)) return;
-    
+
+    // STAGE 3 FILTER: Filter by Network Whitelist (IP+Port)
+    if (should_drop_network(event)) return;
+
     bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, event, sizeof(*event));
 }
 

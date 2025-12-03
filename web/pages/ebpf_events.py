@@ -77,12 +77,18 @@ if syscall_filter:
 if comm_filter:
     filters["comm"] = comm_filter
 if pid_filter:
-    filters["pid"] = int(pid_filter)
+    try:
+        filters["pid"] = int(pid_filter)
+    except ValueError:
+        st.sidebar.error("PID must be a number")
 if ppid_filter:
-    filters["ppid"] = int(ppid_filter)
+    try:
+        filters["ppid"] = int(ppid_filter)
+    except ValueError:
+        st.sidebar.error("PPID must be a number")
 
-# Pagination
-page_size = st.sidebar.selectbox("Events per page", [100, 500, 1000, 2000], index=1)
+# Events per page - default to 1000
+page_size = st.sidebar.selectbox("Events per page", [500, 1000, 2000, 5000], index=1)
 
 # Main content
 st.markdown("---")
@@ -105,84 +111,125 @@ if total_count > 0:
     if events:
         st.success(f"✅ Showing {len(events)} events (Page {page} of {total_pages})")
 
-        # Display as expandable cards
-        for idx, event in enumerate(events):
-            timestamp = event.get("datetime", "N/A")
+        # Create DataFrame for table view
+        table_data = []
+        for event in events:
+            # Determine event type
             syscall = event.get("syscall", "unknown")
-            comm = event.get("comm", "unknown")
-            pid = event.get("pid", "N/A")
-            filename = event.get("filename", "")
-            ret_val = event.get("ret", 0)
-
-            # Determine event type for styling
-            if syscall in ["connect", "bind", "listen", "accept", "sendto", "recvfrom"]:
+            if syscall in ["connect", "bind", "listen", "accept", "accept4", "sendto", "recvfrom"]:
                 event_type = "🌐 Network"
-            elif syscall in ["execve", "clone", "vfork"]:
+            elif syscall in ["execve", "clone", "clone3", "vfork"]:
                 event_type = "⚙️ Process"
-            elif syscall in ["openat", "read", "write", "unlinkat"]:
+            elif syscall in ["openat", "openat2", "read", "write", "unlinkat"]:
                 event_type = "📂 File"
             else:
                 event_type = "📝 Other"
 
-            # Create expander title
-            title = f"{event_type} | `{syscall}` | **{comm}** (PID:{pid}) | {timestamp}"
+            # Build target field based on syscall type
+            target = ""
+            if event.get("filename"):
+                target = event.get("filename", "")
+            elif event.get("dest_ip"):
+                target = f"{event.get('dest_ip', '')}:{event.get('dest_port', '')}"
+            elif event.get("src_ip"):
+                target = f"{event.get('src_ip', '')}:{event.get('src_port', '')}"
 
-            with st.expander(title):
-                col1, col2 = st.columns(2)
+            # Truncate target if too long
+            if len(target) > 60:
+                target = target[:57] + "..."
 
-                with col1:
-                    st.markdown("**Process Info:**")
-                    st.write(f"- **Hostname:** `{event.get('hostname', 'N/A')}`")
-                    st.write(f"- **Command:** `{comm}`")
-                    st.write(f"- **PID:** {pid}")
-                    st.write(f"- **PPID:** {event.get('ppid', 'N/A')}")
-                    st.write(f"- **UID:** {event.get('uid', 'N/A')}")
+            # Format return value
+            ret_val = event.get("ret", 0)
+            if ret_val < 0:
+                ret_str = f"❌ {ret_val}"
+            else:
+                ret_str = str(ret_val)
 
-                with col2:
-                    st.markdown("**Syscall Details:**")
-                    st.write(f"- **Syscall:** `{syscall}`")
-                    st.write(f"- **Return Value:** {ret_val}")
-                    if event.get("error"):
-                        st.write(f"- **Error:** {event.get('error')}")
+            table_data.append({
+                "Timestamp": event.get("datetime", "N/A")[:19] if event.get("datetime") else "N/A",
+                "Hostname": event.get("hostname", "N/A"),
+                "Type": event_type,
+                "Syscall": syscall,
+                "Process": event.get("comm", "unknown"),
+                "PID": event.get("pid", "N/A"),
+                "PPID": event.get("ppid", "N/A"),
+                "UID": event.get("uid", "N/A"),
+                "Target": target,
+                "Return": ret_str,
+                "Error": event.get("error", ""),
+            })
 
-                # Additional details based on syscall type
-                if filename:
-                    st.markdown("**File:**")
-                    st.code(filename, language=None)
+        df = pd.DataFrame(table_data)
 
-                # Network details
-                if event.get("dest_ip") or event.get("src_ip"):
-                    st.markdown("**Network:**")
-                    if event.get("src_ip"):
-                        st.write(f"- **Source:** {event.get('src_ip')}:{event.get('src_port', '')}")
-                    if event.get("dest_ip"):
-                        st.write(f"- **Destination:** {event.get('dest_ip')}:{event.get('dest_port', '')}")
-                    if event.get("sa_family"):
-                        st.write(f"- **Family:** {event.get('sa_family')}")
-                    if event.get("protocol"):
-                        st.write(f"- **Protocol:** {event.get('protocol')}")
+        # Configure column widths and display
+        st.dataframe(
+            df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Timestamp": st.column_config.TextColumn("Timestamp", width="medium"),
+                "Hostname": st.column_config.TextColumn("Hostname", width="small"),
+                "Type": st.column_config.TextColumn("Type", width="small"),
+                "Syscall": st.column_config.TextColumn("Syscall", width="small"),
+                "Process": st.column_config.TextColumn("Process", width="small"),
+                "PID": st.column_config.NumberColumn("PID", width="small"),
+                "PPID": st.column_config.NumberColumn("PPID", width="small"),
+                "UID": st.column_config.NumberColumn("UID", width="small"),
+                "Target": st.column_config.TextColumn("Target", width="large"),
+                "Return": st.column_config.TextColumn("Return", width="small"),
+                "Error": st.column_config.TextColumn("Error", width="small"),
+            }
+        )
 
-                # I/O details
-                if event.get("bytes_rw"):
-                    st.write(f"**Bytes:** {event.get('bytes_rw')} bytes")
+        # Summary statistics
+        st.markdown("---")
+        st.subheader("📊 Event Statistics (Current Page)")
 
-                # Raw JSON
-                with st.expander("🔍 Raw JSON"):
-                    st.json(event)
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            syscall_counts = df['Syscall'].value_counts()
+            st.metric("Unique Syscalls", len(syscall_counts))
+
+        with col2:
+            process_counts = df['Process'].value_counts()
+            st.metric("Unique Processes", len(process_counts))
+
+        with col3:
+            error_count = len(df[df['Error'] != ''])
+            st.metric("Errors", error_count)
+
+        with col4:
+            network_events = len(df[df['Type'] == '🌐 Network'])
+            st.metric("Network Events", network_events)
+
+        # Top syscalls and processes
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("**Top 10 Syscalls**")
+            top_syscalls = df['Syscall'].value_counts().head(10)
+            for syscall, count in top_syscalls.items():
+                st.write(f"- `{syscall}`: {count:,}")
+
+        with col2:
+            st.markdown("**Top 10 Processes**")
+            top_processes = df['Process'].value_counts().head(10)
+            for process, count in top_processes.items():
+                st.write(f"- `{process}`: {count:,}")
+
+        # Export option
+        st.markdown("---")
+        if st.button("📥 Export Current Page as JSON"):
+            json_str = json.dumps(events, indent=2)
+            st.download_button(
+                label="Download JSON",
+                data=json_str,
+                file_name=f"ebpf_events_page_{page}.json",
+                mime="application/json"
+            )
 
     else:
         st.warning("No events found for this page.")
 else:
     st.warning("No events found matching the filters.")
-
-# Export option
-if total_count > 0:
-    st.markdown("---")
-    if st.button("📥 Export Current Page as JSON"):
-        json_str = json.dumps(events, indent=2)
-        st.download_button(
-            label="Download JSON",
-            data=json_str,
-            file_name=f"ebpf_events_page_{page}.json",
-            mime="application/json"
-        )

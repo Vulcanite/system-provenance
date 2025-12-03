@@ -61,12 +61,19 @@ def get_event_count(es, index_name, start_ms=None, end_ms=None, filters=None):
     must_conditions = []
 
     if start_ms and end_ms:
-        must_conditions.append({"range": {"epoch_timestamp": {"gte": start_ms, "lte": end_ms}}})
+        # PCAP flows use epoch_first, eBPF events use epoch_timestamp
+        timestamp_field = "epoch_first" if "pcap" in index_name else "epoch_timestamp"
+        must_conditions.append({"range": {timestamp_field: {"gte": start_ms, "lte": end_ms}}})
 
     if filters:
+        # Text fields that need .keyword suffix for term queries
+        text_fields = ["hostname", "syscall", "comm", "protocol", "src_ip", "dst_ip"]
+
         for field, value in filters.items():
             if value:
-                must_conditions.append({"term": {field: value}})
+                # Add .keyword suffix for text fields
+                query_field = f"{field}.keyword" if field in text_fields else field
+                must_conditions.append({"term": {query_field: value}})
 
     query = {"query": {"bool": {"must": must_conditions}}} if must_conditions else {"query": {"match_all": {}}}
 
@@ -80,14 +87,22 @@ def get_event_count(es, index_name, start_ms=None, end_ms=None, filters=None):
 
 def fetch_events(es, index_name, start_ms, end_ms, filters=None, page=1, page_size=1000, sort_field="datetime", sort_order="desc"):
     """Fetch events from Elasticsearch with pagination"""
+    # PCAP flows use epoch_first, eBPF events use epoch_timestamp
+    timestamp_field = "epoch_first" if "pcap" in index_name else "epoch_timestamp"
+
     must_conditions = [
-        {"range": {"epoch_timestamp": {"gte": start_ms, "lte": end_ms}}}
+        {"range": {timestamp_field: {"gte": start_ms, "lte": end_ms}}}
     ]
 
     if filters:
+        # Text fields that need .keyword suffix for term queries
+        text_fields = ["hostname", "syscall", "comm", "protocol", "src_ip", "dst_ip"]
+
         for field, value in filters.items():
             if value:
-                must_conditions.append({"term": {field: value}})
+                # Add .keyword suffix for text fields
+                query_field = f"{field}.keyword" if field in text_fields else field
+                must_conditions.append({"term": {query_field: value}})
 
     query = {
         "query": {"bool": {"must": must_conditions}},
