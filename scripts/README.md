@@ -26,10 +26,16 @@ These scripts automate the installation and configuration of all system componen
 - **ebpf-provenance-logrotate** - Logrotate configuration
 - **postinstall.sh** - Post-installation tasks (for .deb package)
 - **preremove.sh** - Pre-removal tasks (for .deb package)
-
-### Setup Scripts
-
 - **logrotate-setup.sh** - Install logrotate configuration
+
+### Forensic Testing & Data Generation
+
+- **generate_activity.sh** - Generate realistic system activity for testing
+- **generate_attack_scenario.sh** - Simulate attack patterns (reconnaissance, exfiltration, etc.)
+- **generate_forensic_activity.sh** - Generate activity while system-monitor service captures
+- **capture_forensics.sh** - Capture PCAP + audit logs with activity generation
+- **capture_with_ebpf.sh** - Capture PCAP + eBPF events (better than auditd for network correlation)
+- **convert_audit_to_json.py** - Convert ausearch output to JSON for offline analysis
 
 ## Setup Scripts Usage
 
@@ -204,6 +210,7 @@ After=network.target elasticsearch.service
 
 [Service]
 Type=simple
+EnvironmentFile=-/etc/default/streamlit-webapp
 WorkingDirectory=${PROJECT_ROOT}/web
 ExecStart=${PROJECT_ROOT}/web/venv/bin/python -m streamlit run webapp.py --server.port=8501 --server.address=0.0.0.0
 Restart=always
@@ -211,7 +218,6 @@ RestartSec=5s
 User=root
 Group=root
 Environment="PATH=${PROJECT_ROOT}/web/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-EnvironmentFile=-/etc/default/streamlit-webapp
 
 [Install]
 WantedBy=multi-user.target
@@ -289,3 +295,332 @@ Runs before .deb package removal.
 - Clean up (but preserve config)
 
 **Location:** Called by nfpm during package removal
+
+## Forensic Testing & Data Generation Scripts
+
+These scripts generate realistic system activity and capture forensic data for testing the offline analysis features.
+
+### generate_activity.sh
+
+Generates realistic system activity patterns for testing.
+
+**Usage:**
+```bash
+./generate_activity.sh [duration_in_seconds]
+
+# Example: Generate 60 seconds of activity
+./generate_activity.sh 60
+```
+
+**What it generates:**
+1. **File I/O Operations:**
+   - Create, read, write, delete operations
+   - Various file types (JSON, XML, binary)
+   - Copy and move operations
+
+2. **Network Activity:**
+   - DNS lookups (google.com, github.com, amazon.com, etc.)
+   - HTTPS requests to legitimate sites
+   - API calls (POST/GET)
+   - HTTP requests
+
+3. **Process Operations:**
+   - Standard system commands (whoami, hostname, uname, etc.)
+   - Process listing (ps, top)
+   - Child process spawning (fork/exec)
+
+4. **System Monitoring:**
+   - Disk usage checks
+   - Memory information
+   - Network interface stats
+   - Connection listing
+
+5. **Suspicious Activity (for detection testing):**
+   - Reconnaissance (port scanning, network enumeration)
+   - Lateral movement simulation (SSH attempts)
+   - Persistence simulation (cron enumeration, service listing)
+   - Credential access (shadow file reads, SSH key enumeration)
+   - Data exfiltration (compression, upload simulation, DNS tunneling)
+   - Evasion techniques (hidden files, log deletion)
+
+**Output:** Generates activity captured by monitoring tools
+
+**Use cases:**
+- Testing eBPF event capture
+- Testing PCAP flow aggregation
+- Validating correlation logic
+- Training ML models
+- Demonstrating detection capabilities
+
+### generate_attack_scenario.sh
+
+Simulates a realistic 5-phase attack scenario for testing detection and forensic analysis.
+
+**Usage:**
+```bash
+./generate_attack_scenario.sh [duration_in_seconds]
+
+# Example: 45-second attack simulation
+./generate_attack_scenario.sh 45
+```
+
+**Attack Phases:**
+
+**Phase 1: Reconnaissance (0-15s)**
+- System information gathering (uname, whoami, id)
+- Network configuration mapping
+- Running process enumeration
+- Network connection scanning
+
+**Phase 2: Data Collection (15-30s)**
+- SSH key enumeration
+- Browser data location checking
+- Environment variable collection
+- Command history extraction
+- Data aggregation
+
+**Phase 3: C2 Communication (30-40s)**
+- DNS tunneling attempts
+- HTTP/HTTPS beacon signals
+- Pastebin-like communication
+
+**Phase 4: Data Exfiltration (40-50s)**
+- Data compression
+- DNS exfiltration simulation
+- HTTP upload attempts
+- HTTPS exfiltration to suspicious ports
+
+**Phase 5: Persistence & Cleanup (50+s)**
+- Cron job creation attempts
+- Log tampering attempts
+- Artifact deletion
+
+**Expected Anomalies:**
+- Unusual port connections
+- High volume DNS queries to suspicious domains
+- Large HTTP POST requests
+- Access to sensitive file locations
+- Multiple curl processes from single parent
+
+**Use cases:**
+- Testing offline analysis anomaly detection
+- Demonstrating attack pattern recognition
+- Training security analysts
+- Validating SIEM rules
+- Incident response practice
+
+### generate_forensic_activity.sh
+
+Generates activity while the system-monitor service is running (requires service to be active).
+
+**Usage:**
+```bash
+sudo ./generate_forensic_activity.sh [duration_in_seconds]
+
+# Example: Generate activity for 60 seconds
+sudo ./generate_forensic_activity.sh 60
+```
+
+**Prerequisites:**
+- system-monitor service must be running
+- Service automatically captures eBPF events and PCAP flows
+
+**What it does:**
+1. Checks if system-monitor service is active
+2. Runs generate_activity.sh for specified duration
+3. Waits for system-monitor to flush events
+4. Displays summary of captured data
+
+**Output locations:**
+- eBPF events: `/var/monitoring/events/ebpf-events.jsonl`
+- PCAP flows: `/var/monitoring/events/pcap-flows.jsonl`
+
+**Analysis options:**
+1. **Web Interface (Real-time):** View in eBPF Events or PCAP Flows pages
+2. **Offline Analysis:** Upload PCAP file from separate capture
+3. **Command Line:** Use `jq` to analyze JSONL files
+
+**Use cases:**
+- Testing live monitoring
+- Generating real-world datasets
+- Performance testing under load
+- Demonstrating real-time correlation
+
+### capture_forensics.sh
+
+Captures PCAP and audit logs while generating activity (standalone, doesn't require service).
+
+**Usage:**
+```bash
+sudo ./capture_forensics.sh [duration_in_seconds]
+
+# Example: Capture for 60 seconds
+sudo ./capture_forensics.sh 60
+```
+
+**Prerequisites:**
+- Root privileges (for tcpdump and auditd)
+- tcpdump installed
+- auditd or strace installed (for syscall monitoring)
+- generate_activity.sh present
+
+**What it does:**
+1. Starts PCAP capture on default network interface
+2. Configures auditd rules for network syscalls (connect, bind, socket, etc.)
+3. Runs generate_activity.sh
+4. Collects audit logs from auditd
+5. Converts audit logs to JSON format
+
+**Output files:**
+- `./forensic_captures/capture_TIMESTAMP.pcap`
+- `./forensic_captures/audit_TIMESTAMP.log` (raw)
+- `./forensic_captures/audit_TIMESTAMP.json` (JSON format)
+
+**Audit syscalls monitored:**
+- Network: connect, bind, socket
+- File: openat
+- Process: execve
+
+**Fallback behavior:**
+- If auditd not available, uses strace as fallback
+- If neither available, captures PCAP only
+
+**Use cases:**
+- Organizations without eBPF deployment
+- Testing offline analysis feature
+- Forensic data collection
+- Incident response scenarios
+- Compliance audits
+
+### capture_with_ebpf.sh
+
+Captures PCAP + eBPF events using the project's system-monitor binary (better than auditd for network correlation).
+
+**Usage:**
+```bash
+sudo ./capture_with_ebpf.sh [duration_in_seconds]
+
+# Example: Capture for 60 seconds
+sudo ./capture_with_ebpf.sh 60
+```
+
+**Prerequisites:**
+- Root privileges
+- system-monitor binary compiled (`make build`)
+- tcpdump installed
+- generate_activity.sh present
+
+**What it does:**
+1. Starts PCAP capture
+2. Starts system-monitor in foreground mode
+3. Runs generate_activity.sh
+4. Stops both captures gracefully
+5. Saves eBPF events to JSONL
+
+**Output files:**
+- `./forensic_captures/capture_TIMESTAMP.pcap`
+- `./forensic_captures/ebpf_events_TIMESTAMP.jsonl`
+
+**Advantages over auditd:**
+- Captures network IP addresses and ports in eBPF events
+- Better correlation with PCAP flows (same 5-tuple)
+- Process start time included (PID reuse protection)
+- More detailed network information
+- No kernel audit support required
+
+**Use cases:**
+- Testing offline analysis with eBPF+PCAP
+- Generating correlated datasets
+- Network-process attribution testing
+- Demonstrating correlation accuracy
+
+### convert_audit_to_json.py
+
+Python utility to convert ausearch interpreted output to JSON format compatible with offline analysis.
+
+**Usage:**
+```bash
+# First, extract audit logs
+sudo ausearch -i --start recent > audit.log
+
+# Convert to JSON
+./convert_audit_to_json.py audit.log audit.json
+```
+
+**What it does:**
+- Parses multi-line ausearch -i output
+- Groups related audit records (SYSCALL, SOCKADDR, EXECVE, PATH)
+- Extracts network information from SOCKADDR records
+- Parses timestamps to ISO format
+- Outputs JSONL (one JSON object per line)
+
+**Extracted fields:**
+- `timestamp`: ISO 8601 format
+- `syscall`: System call name
+- `pid`, `ppid`, `uid`: Process identifiers
+- `comm`: Process name
+- `dst_ip`, `dst_port`: Network destination (from SOCKADDR)
+- `filename`: File path (from PATH)
+
+**Use cases:**
+- Convert existing audit logs for offline analysis
+- Process historical audit data
+- Import audit data into visualization tools
+- Integrate with SIEM platforms
+
+**Example pipeline:**
+```bash
+# Capture audit events
+sudo ausearch -i --start "12/01/25 10:00:00" --end "12/01/25 11:00:00" > audit.log
+
+# Convert to JSON
+./convert_audit_to_json.py audit.log audit.json
+
+# Upload audit.json to Offline Analysis page in web interface
+```
+
+## Workflow Examples
+
+### Example 1: Testing Network-Process Correlation
+
+```bash
+# Step 1: Capture with eBPF
+sudo ./capture_with_ebpf.sh 60
+
+# Step 2: Upload files to web interface
+# - Navigate to "Correlation" page
+# - Select time range matching capture
+# - Observe correlated flows
+```
+
+### Example 2: Offline Forensic Analysis
+
+```bash
+# Step 1: Capture forensic data
+sudo ./capture_forensics.sh 120
+
+# Step 2: Upload to Offline Analysis
+# - Open web interface
+# - Navigate to "Offline Analysis"
+# - Upload PCAP file
+# - Upload audit JSON file
+# - Run correlation and view visualizations
+```
+
+### Example 3: Attack Simulation Testing
+
+```bash
+# Step 1: Start monitoring service
+sudo systemctl start system-monitor
+
+# Step 2: Run attack scenario
+sudo ./generate_forensic_activity.sh 60
+# OR for attack patterns:
+sudo ./generate_attack_scenario.sh 45
+
+# Step 3: Analyze in web interface
+# - View eBPF Events page
+# - View PCAP Flows page
+# - Generate Provenance Graph
+# - Run AI Analysis
+```

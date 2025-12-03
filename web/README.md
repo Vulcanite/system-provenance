@@ -1,46 +1,80 @@
 # Web Application - Streamlit Interface
 
-Interactive web interface for querying events, generating provenance graphs, and performing AI-powered security analysis.
+Multi-page interactive web interface for system and network monitoring, correlation analysis, provenance graphs, and AI-powered security analysis.
 
 ## Overview
 
-The Streamlit web application provides a user-friendly interface for forensic analysis of eBPF-captured system events. It supports real-time querying, interactive graph visualization, and optional AI-powered threat assessment using Ollama.
+The Streamlit web application provides a comprehensive forensic analysis platform with real-time monitoring, network-process correlation, offline PCAP analysis, and provenance graph generation.
 
 ## Files
 
-- **webapp.py** - Main Streamlit application (UI and event querying)
-- **analyzer.py** - Provenance graph generation with context-aware filtering
-- **ollama_agent.py** - AI analysis integration for threat assessment
+### Core Application
+- **webapp.py** - Main entry point with navigation and routing
+- **utils.py** - Shared utilities (ES connection, queries, hostname aggregation)
+- **analyzer.py** - Provenance graph generation with BEEP algorithm
 - **requirements.txt** - Python dependencies
+
+### Pages (Multi-Page App)
+- **pages/home.py** - Dashboard with system status and metrics
+- **pages/ebpf_events.py** - eBPF syscall event viewer
+- **pages/pcap_flows.py** - Network flow viewer with DNS enrichment
+- **pages/correlation.py** - Network-process correlation (Who made this connection?)
+- **pages/provenance.py** - Provenance graph generation and AI analysis
+- **pages/offline_analysis.py** - PCAP/audit log correlation for forensics
 
 ## Features
 
-### 1. Event Search and Querying
-- Time range selection (relative or absolute)
-- Filter by syscall type
-- Filter by process name (comm)
-- Filter by PID or PPID
-- Paginated results with configurable page size
-- Real-time event count display
+### 1. Home Dashboard
+- System status (monitoring mode, storage, Elasticsearch connection)
+- Multi-host overview (number of monitored hosts)
+- 24-hour activity metrics (events, flows, connections, file opens)
+- Top syscalls and processes in last hour
+- Quick navigation to analysis pages
 
-### 2. Provenance Graph Generation
-- Target selection (by PID, process name, or time window)
-- Multiple output formats (DOT, GraphML, Interactive HTML)
-- Context-aware noise filtering
-- Automatic suspicious activity highlighting
-- Color-coded nodes for different entity types
+### 2. eBPF Events Viewer
+- Real-time syscall event monitoring
+- Time range filtering (1h, 6h, 24h, 7d, custom)
+- Hostname, syscall, comm, PID, PPID filters
+- Pagination (100-2000 events per page)
+- Expandable event cards with detailed info
+- JSON export functionality
 
-### 3. Interactive Visualization
-- Zoomable, pannable graphs
-- Physics-based layout
-- Hover tooltips with detailed information
-- Keyboard navigation
-- Color-coded security relevance
+### 3. PCAP Flows Viewer
+- Aggregated network traffic analysis
+- Time range and hostname filtering
+- Protocol (TCP/UDP), IP, port filters
+- DNS enrichment (domain names)
+- TCP flag extraction
+- Flow statistics (top destinations, top ports)
+- JSON export
 
-### 4. AI-Powered Analysis (Optional)
-- Upload graphs to Ollama for analysis
-- Natural language threat assessment
-- Behavioral pattern detection
+### 4. Network-Process Correlation
+- Matches network flows (PCAP) to processes (eBPF)
+- Answers: "Who made this connection?"
+- Time-based correlation with configurable window (1-30 seconds)
+- PID reuse protection using process_start_time
+- Confidence scoring (High/Medium/Low based on time delta)
+- Hostname filtering for multi-host deployments
+- Sankey diagram visualization
+- Ghost flow detection (unidentified traffic)
+
+### 5. Provenance Graph Analysis
+- Target selection (by process name or PID)
+- Advanced filtering options (disable filters, prune high-degree files)
+- BEEP edge grouping algorithm for noise reduction
+- Interactive PyVis graph visualization
+- PNG export
+- AI-powered analysis with Ollama integration
+- Chat interface for discussing results
+
+### 6. Offline PCAP/Audit Analysis
+- Four-tab interface for forensic investigations
+- PCAP file upload (.pcap, .pcapng) with tshark parsing
+- Audit log upload (JSON: auditbeat/auditd)
+- Time-based correlation with multiple methods
+- Process attribution for network flows
+- Interactive visualizations (timeline, top processes, protocols)
+- AI-powered anomaly detection
 
 ## Dependencies
 
@@ -48,10 +82,12 @@ From `requirements.txt`:
 
 ```
 streamlit==1.51.0       # Web framework
-elasticsearch==9.2.0     # ES client
+elasticsearch==9.2.0    # ES client
 networkx==3.1           # Graph analysis
 pydot==4.0.1            # DOT format support
 pyvis==0.3.1            # Interactive graph visualization
+plotly==5.18.0          # Charts and visualizations
+pandas==2.1.4           # Data analysis
 ```
 
 ## Architecture
