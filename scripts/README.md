@@ -1,50 +1,49 @@
 # Installation and Setup Scripts
 
-Collection of scripts for installing, configuring, and managing the eBPF Provenance Monitor system.
+Collection of scripts for installing, configuring, testing, and managing the eBPF Provenance Monitor system.
 
 ## Overview
 
-These scripts automate the installation and configuration of all system components, including dependencies, services, and auxiliary tools.
+These scripts automate the installation and configuration of all system components, including dependencies, services, and forensic testing tools. Scripts are organized into subdirectories by function.
 
-## Files
+## Directory Structure
 
-### Setup Scripts
+```
+scripts/
+├── system-setup/              # Installation and configuration scripts
+│   ├── build-setup.sh         # Build dependencies (Go, Clang, LLVM)
+│   ├── es-setup.sh            # Elasticsearch installation
+│   ├── ollama-setup.sh        # Ollama AI installation
+│   ├── streamlit-setup.sh     # Web application setup
+│   └── logrotate-setup.sh     # Log rotation configuration
+│
+├── event-generation/          # Forensic testing and data generation
+│   ├── generate_activity.sh         # Realistic system activity
+│   ├── generate_attack_scenario.sh  # Attack simulation (5 phases)
+│   ├── generate_forensic_activity.sh # Activity with service capture
+│   └── capture_forensics.sh         # PCAP + audit log capture
+│
+├── system-monitor.service     # Systemd service file
+├── system-provenance-logrotate # Logrotate configuration
+├── postinstall.sh             # Post-installation tasks (.deb)
+└── preremove.sh               # Pre-removal tasks (.deb)
+```
 
-- **build-setup.sh** - Install build dependencies (Go, Clang, LLVM, headers)
-- **streamlit-setup.sh** - Install and configure web application
-- **es-setup.sh** - Install and configure Elasticsearch
-- **ollama-setup.sh** - Install Ollama for AI analysis
+---
 
-### Service Files
+## System Setup Scripts
 
-- **ebpf-monitor.service** - Systemd service for eBPF monitor
-- **streamlit-webapp.service** - Systemd service for web application
-- **streamlit-webapp.env** - Environment template for web service
-
-### Maintenance
-
-- **ebpf-provenance-logrotate** - Logrotate configuration
-- **postinstall.sh** - Post-installation tasks (for .deb package)
-- **preremove.sh** - Pre-removal tasks (for .deb package)
-- **logrotate-setup.sh** - Install logrotate configuration
-
-### Forensic Testing & Data Generation
-
-- **generate_activity.sh** - Generate realistic system activity for testing
-- **generate_attack_scenario.sh** - Simulate attack patterns (reconnaissance, exfiltration, etc.)
-- **generate_forensic_activity.sh** - Generate activity while system-monitor service captures
-- **capture_forensics.sh** - Capture PCAP + audit logs with activity generation
-- **capture_with_ebpf.sh** - Capture PCAP + eBPF events (better than auditd for network correlation)
-- **convert_audit_to_json.py** - Convert ausearch output to JSON for offline analysis
-
-## Setup Scripts Usage
+Located in `system-setup/` directory.
 
 ### build-setup.sh
 
-Installs all build dependencies for compiling the eBPF monitor.
+Installs all build dependencies for compiling the system-monitor binary.
+
+**Location:** `system-setup/build-setup.sh`
 
 **Usage:**
 ```bash
+cd scripts/system-setup
 sudo ./build-setup.sh
 ```
 
@@ -56,19 +55,20 @@ sudo ./build-setup.sh
 - Linux headers for current kernel
 - bpftool
 - make and build essentials
+- libpcap-dev (for packet capture)
 
 **When to use:**
 - Before first build from source
 - Setting up development environment
 - After kernel upgrade (to install matching headers)
 
-**Example:**
+**Example workflow:**
 ```bash
-cd scripts
+cd scripts/system-setup
 sudo ./build-setup.sh
 
 # Then build the project
-cd ..
+cd ../..
 make generate
 make build
 ```
@@ -77,41 +77,42 @@ make build
 
 Installs and configures the Streamlit web application.
 
+**Location:** `system-setup/streamlit-setup.sh`
+
 **Usage:**
 ```bash
+cd scripts/system-setup
 sudo ./streamlit-setup.sh
 ```
 
 **What it does:**
 1. Checks for Python 3.12 (installs if missing via deadsnakes PPA)
-2. Creates Python virtual environment in `web/venv`
-3. Installs Python dependencies from `web/requirements.txt`
-4. Creates monitoring directories (`/var/monitoring/events`, `/var/monitoring/outputs`)
-5. Copies default config to `/var/config.json` (if not exists)
-6. Sets up systemd service for web app
-7. Creates environment file at `/etc/default/streamlit-webapp`
-8. Installs logrotate configuration
+2. Creates Python virtual environment in `../../web/venv`
+3. Installs Python dependencies from `requirements.txt`
+4. Creates monitoring directories:
+   - `/var/monitoring/events`
+   - `/var/monitoring/outputs`
+5. Copies default config to `/var/monitoring/config.json` (if not exists)
+6. Installs logrotate configuration
 
-**Environment Configuration:**
+**Note:** This script does NOT install a systemd service. The web application is designed to be run manually or via user-specific service configuration.
 
-The script automatically creates `/etc/default/streamlit-webapp`:
+**Starting the web app:**
 ```bash
-PROJECT_ROOT=/path/to/ebpf-provenance
-```
-
-**Service management:**
-```bash
-sudo systemctl start streamlit-webapp
-sudo systemctl enable streamlit-webapp
-sudo systemctl status streamlit-webapp
+cd web
+source venv/bin/activate
+streamlit run webapp.py --server.port=8501 --server.address=0.0.0.0
 ```
 
 ### es-setup.sh
 
-Installs and configures Elasticsearch.
+Installs and configures Elasticsearch 9.x.
+
+**Location:** `system-setup/es-setup.sh`
 
 **Usage:**
 ```bash
+cd scripts/system-setup
 sudo ./es-setup.sh
 ```
 
@@ -123,189 +124,87 @@ sudo ./es-setup.sh
 5. Displays initial elastic password
 6. Tests connection
 
+**Post-installation:**
+```bash
+# Update config with Elasticsearch credentials
+sudo nano /var/monitoring/config.json
+
+# Update es_config section:
+#   "es_host": "localhost",
+#   "es_port": 9200,
+#   "es_user": "elastic",
+#   "es_password": "<password_from_setup>"
+```
+
 ### ollama-setup.sh
 
 Installs Ollama for AI-powered analysis.
 
+**Location:** `system-setup/ollama-setup.sh`
+
 **Usage:**
 ```bash
+cd scripts/system-setup
 sudo ./ollama-setup.sh
 ```
 
 **What it does:**
 1. Downloads and installs Ollama
 2. Starts Ollama service
-3. Instructions for pulling models
+3. Provides instructions for pulling models
 
 **Post-installation:**
 ```bash
 # Pull a model (choose one)
 ollama pull llama3        # General purpose (4.7GB)
+ollama pull mistral       # Alternative (4.1GB)
+ollama pull llama3.2      # Newer version (3.2GB)
 ```
 
 **Using with web app:**
-- AI analysis tab will automatically detect Ollama
-- Upload graph files for automated threat analysis
+- AI analysis tab will automatically detect Ollama at `http://localhost:11434`
+- Upload provenance graphs for automated threat analysis
 - Models run locally (no data sent externally)
 
-## Service Files
+### logrotate-setup.sh
 
-### ebpf-monitor.service
+Installs logrotate configuration for automated log management.
 
-Systemd service for the eBPF monitor.
+**Location:** `system-setup/logrotate-setup.sh`
 
-**Location:** `/lib/systemd/system/ebpf-monitor.service`
-
-**Content:**
-```ini
-[Unit]
-Description=eBPF System Call Monitor
-After=network.target auditd.service
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/ebpf-monitor
-Restart=always
-RestartSec=5s
-User=root
-Group=root
-
-[Install]
-WantedBy=multi-user.target
-```
-
-**Management:**
+**Usage:**
 ```bash
-sudo systemctl start ebpf-monitor
-sudo systemctl stop ebpf-monitor
-sudo systemctl restart ebpf-monitor
-sudo systemctl status ebpf-monitor
-sudo systemctl enable ebpf-monitor   # Start on boot
-sudo systemctl disable ebpf-monitor  # Don't start on boot
+cd scripts/system-setup
+sudo ./logrotate-setup.sh
 ```
 
-**Logs:**
-```bash
-# Follow live logs
-sudo journalctl -u ebpf-monitor -f
-
-# View last 100 lines
-sudo journalctl -u ebpf-monitor -n 100
-
-# View logs since boot
-sudo journalctl -u ebpf-monitor -b
-```
-
-### streamlit-webapp.service
-
-Systemd service for the web application.
-
-**Location:** `/lib/systemd/system/streamlit-webapp.service`
-
-**Content:**
-```ini
-[Unit]
-Description=Streamlit eBPF Forensic Web Application
-After=network.target elasticsearch.service
-
-[Service]
-Type=simple
-EnvironmentFile=-/etc/default/streamlit-webapp
-WorkingDirectory=${PROJECT_ROOT}/web
-ExecStart=${PROJECT_ROOT}/web/venv/bin/python -m streamlit run webapp.py --server.port=8501 --server.address=0.0.0.0
-Restart=always
-RestartSec=5s
-User=root
-Group=root
-Environment="PATH=${PROJECT_ROOT}/web/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-[Install]
-WantedBy=multi-user.target
-```
-
-**Key features:**
-- Uses `${PROJECT_ROOT}` from environment file
-- Runs from virtual environment
-- Auto-restarts on failure
-- Waits for Elasticsearch (if installed)
-
-**Environment file:** `/etc/default/streamlit-webapp`
-```bash
-PROJECT_ROOT=/path/to/your/ebpf-provenance
-```
-
-### streamlit-webapp.env
-
-Template for the environment file.
-
-## Log Rotation
-
-### ebpf-provenance-logrotate
-
-Logrotate configuration for automatic log management.
-
-**Location:** `/etc/logrotate.d/ebpf-provenance`
-
-**What it manages:**
-1. eBPF monitor events (`/var/monitoring/events/events.jsonl`)
-2. Output files (`/var/monitoring/outputs/*.log`)
-3. Streamlit logs (`/var/log/streamlit-webapp/*.log`)
+**What it installs:**
+- Copies `../system-provenance-logrotate` to `/etc/logrotate.d/system-provenance`
+- Configures rotation for:
+  - `/var/monitoring/events/*.jsonl`
+  - `/var/monitoring/outputs/*.log`
 
 **Configuration:**
-```
-/var/monitoring/events/events.jsonl {
-    daily                    # Rotate daily
-    rotate 30                # Keep 30 days
-    compress                 # Compress old logs
-    delaycompress            # Don't compress most recent
-    missingok                # Don't error if missing
-    notifempty               # Don't rotate empty logs
-    create 0644 root root    # Create new file with permissions
-    dateext                  # Add date to filename
-    dateformat -%Y%m%d       # Date format
-    postrotate
-        # Send SIGHUP to reopen log file
-        if systemctl is-active --quiet ebpf-monitor.service; then
-            systemctl kill -s HUP ebpf-monitor.service
-        fi
-    endscript
-}
-```
+- Daily rotation
+- Keep 30 days
+- Compress old logs
+- Send SIGHUP to system-monitor on rotation
 
-## Package Scripts
+---
 
-### postinstall.sh
+## Event Generation Scripts
 
-Runs after .deb package installation.
-
-**Actions:**
-- Reload systemd daemon
-- Enable ebpf-monitor service
-- Display installation summary
-
-**Location:** Called by nfpm during package installation
-
-### preremove.sh
-
-Runs before .deb package removal.
-
-**Actions:**
-- Stop ebpf-monitor service
-- Disable service
-- Clean up (but preserve config)
-
-**Location:** Called by nfpm during package removal
-
-## Forensic Testing & Data Generation Scripts
-
-These scripts generate realistic system activity and capture forensic data for testing the offline analysis features.
+Located in `event-generation/` directory. These scripts generate realistic system activity and capture forensic data for testing.
 
 ### generate_activity.sh
 
 Generates realistic system activity patterns for testing.
 
+**Location:** `event-generation/generate_activity.sh`
+
 **Usage:**
 ```bash
+cd scripts/event-generation
 ./generate_activity.sh [duration_in_seconds]
 
 # Example: Generate 60 seconds of activity
@@ -313,6 +212,7 @@ Generates realistic system activity patterns for testing.
 ```
 
 **What it generates:**
+
 1. **File I/O Operations:**
    - Create, read, write, delete operations
    - Various file types (JSON, XML, binary)
@@ -343,7 +243,7 @@ Generates realistic system activity patterns for testing.
    - Data exfiltration (compression, upload simulation, DNS tunneling)
    - Evasion techniques (hidden files, log deletion)
 
-**Output:** Generates activity captured by monitoring tools
+**Output:** Generates activity that can be captured by monitoring tools
 
 **Use cases:**
 - Testing eBPF event capture
@@ -356,8 +256,11 @@ Generates realistic system activity patterns for testing.
 
 Simulates a realistic 5-phase attack scenario for testing detection and forensic analysis.
 
+**Location:** `event-generation/generate_attack_scenario.sh`
+
 **Usage:**
 ```bash
+cd scripts/event-generation
 ./generate_attack_scenario.sh [duration_in_seconds]
 
 # Example: 45-second attack simulation
@@ -413,8 +316,11 @@ Simulates a realistic 5-phase attack scenario for testing detection and forensic
 
 Generates activity while the system-monitor service is running (requires service to be active).
 
+**Location:** `event-generation/generate_forensic_activity.sh`
+
 **Usage:**
 ```bash
+cd scripts/event-generation
 sudo ./generate_forensic_activity.sh [duration_in_seconds]
 
 # Example: Generate activity for 60 seconds
@@ -427,7 +333,7 @@ sudo ./generate_forensic_activity.sh 60
 
 **What it does:**
 1. Checks if system-monitor service is active
-2. Runs generate_activity.sh for specified duration
+2. Runs `generate_activity.sh` for specified duration
 3. Waits for system-monitor to flush events
 4. Displays summary of captured data
 
@@ -450,8 +356,11 @@ sudo ./generate_forensic_activity.sh 60
 
 Captures PCAP and audit logs while generating activity (standalone, doesn't require service).
 
+**Location:** `event-generation/capture_forensics.sh`
+
 **Usage:**
 ```bash
+cd scripts/event-generation
 sudo ./capture_forensics.sh [duration_in_seconds]
 
 # Example: Capture for 60 seconds
@@ -462,12 +371,12 @@ sudo ./capture_forensics.sh 60
 - Root privileges (for tcpdump and auditd)
 - tcpdump installed
 - auditd or strace installed (for syscall monitoring)
-- generate_activity.sh present
+- `generate_activity.sh` in same directory
 
 **What it does:**
 1. Starts PCAP capture on default network interface
 2. Configures auditd rules for network syscalls (connect, bind, socket, etc.)
-3. Runs generate_activity.sh
+3. Runs `generate_activity.sh`
 4. Collects audit logs from auditd
 5. Converts audit logs to JSON format
 
@@ -477,7 +386,7 @@ sudo ./capture_forensics.sh 60
 - `./forensic_captures/audit_TIMESTAMP.json` (JSON format)
 
 **Audit syscalls monitored:**
-- Network: connect, bind, socket
+- Network: connect, bind, socket, sendto, recvfrom, accept, accept4
 - File: openat
 - Process: execve
 
@@ -492,135 +401,287 @@ sudo ./capture_forensics.sh 60
 - Incident response scenarios
 - Compliance audits
 
-### capture_with_ebpf.sh
+---
 
-Captures PCAP + eBPF events using the project's system-monitor binary (better than auditd for network correlation).
+## Service Files
 
-**Usage:**
+### system-monitor.service
+
+Systemd service file for the system-monitor daemon.
+
+**Location:** `system-monitor.service`
+
+**Installation:**
 ```bash
-sudo ./capture_with_ebpf.sh [duration_in_seconds]
-
-# Example: Capture for 60 seconds
-sudo ./capture_with_ebpf.sh 60
+sudo cp scripts/system-monitor.service /lib/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable system-monitor
+sudo systemctl start system-monitor
 ```
 
-**Prerequisites:**
-- Root privileges
-- system-monitor binary compiled (`make build`)
-- tcpdump installed
-- generate_activity.sh present
+**Service configuration:**
+```ini
+[Unit]
+Description=System Provenance Monitor (eBPF + PCAP)
+After=network.target
 
-**What it does:**
-1. Starts PCAP capture
-2. Starts system-monitor in foreground mode
-3. Runs generate_activity.sh
-4. Stops both captures gracefully
-5. Saves eBPF events to JSONL
+[Service]
+Type=simple
+ExecStart=/usr/bin/system-monitor
+Restart=always
+RestartSec=5s
+User=root
+Group=root
 
-**Output files:**
-- `./forensic_captures/capture_TIMESTAMP.pcap`
-- `./forensic_captures/ebpf_events_TIMESTAMP.jsonl`
-
-**Advantages over auditd:**
-- Captures network IP addresses and ports in eBPF events
-- Better correlation with PCAP flows (same 5-tuple)
-- Process start time included (PID reuse protection)
-- More detailed network information
-- No kernel audit support required
-
-**Use cases:**
-- Testing offline analysis with eBPF+PCAP
-- Generating correlated datasets
-- Network-process attribution testing
-- Demonstrating correlation accuracy
-
-### convert_audit_to_json.py
-
-Python utility to convert ausearch interpreted output to JSON format compatible with offline analysis.
-
-**Usage:**
-```bash
-# First, extract audit logs
-sudo ausearch -i --start recent > audit.log
-
-# Convert to JSON
-./convert_audit_to_json.py audit.log audit.json
+[Install]
+WantedBy=multi-user.target
 ```
 
-**What it does:**
-- Parses multi-line ausearch -i output
-- Groups related audit records (SYSCALL, SOCKADDR, EXECVE, PATH)
-- Extracts network information from SOCKADDR records
-- Parses timestamps to ISO format
-- Outputs JSONL (one JSON object per line)
-
-**Extracted fields:**
-- `timestamp`: ISO 8601 format
-- `syscall`: System call name
-- `pid`, `ppid`, `uid`: Process identifiers
-- `comm`: Process name
-- `dst_ip`, `dst_port`: Network destination (from SOCKADDR)
-- `filename`: File path (from PATH)
-
-**Use cases:**
-- Convert existing audit logs for offline analysis
-- Process historical audit data
-- Import audit data into visualization tools
-- Integrate with SIEM platforms
-
-**Example pipeline:**
+**Management:**
 ```bash
-# Capture audit events
-sudo ausearch -i --start "12/01/25 10:00:00" --end "12/01/25 11:00:00" > audit.log
+# Start/stop service
+sudo systemctl start system-monitor
+sudo systemctl stop system-monitor
+sudo systemctl restart system-monitor
 
-# Convert to JSON
-./convert_audit_to_json.py audit.log audit.json
+# View status
+sudo systemctl status system-monitor
 
-# Upload audit.json to Offline Analysis page in web interface
+# View logs
+sudo journalctl -u system-monitor -f
+
+# Trigger log rotation
+sudo systemctl kill -s HUP system-monitor
 ```
+
+### system-provenance-logrotate
+
+Logrotate configuration for automatic log management.
+
+**Location:** `system-provenance-logrotate`
+
+**Installed to:** `/etc/logrotate.d/system-provenance`
+
+**What it manages:**
+- eBPF events: `/var/monitoring/events/ebpf-events.jsonl`
+- PCAP flows: `/var/monitoring/events/pcap-flows.jsonl`
+- Output files: `/var/monitoring/outputs/*.log`
+
+**Configuration:**
+```
+/var/monitoring/events/*.jsonl {
+    daily                    # Rotate daily
+    rotate 30                # Keep 30 days
+    compress                 # Compress old logs
+    delaycompress            # Don't compress most recent
+    missingok                # Don't error if missing
+    notifempty               # Don't rotate empty logs
+    create 0644 root root    # Create new file with permissions
+    dateext                  # Add date to filename
+    dateformat -%Y%m%d       # Date format
+    postrotate
+        # Send SIGHUP to reopen log file
+        if systemctl is-active --quiet system-monitor.service; then
+            systemctl kill -s HUP system-monitor.service
+        fi
+    endscript
+}
+```
+
+---
+
+## Package Management Scripts
+
+### postinstall.sh
+
+Runs after .deb package installation.
+
+**Location:** `postinstall.sh`
+
+**Actions:**
+- Reload systemd daemon
+- Enable system-monitor service
+- Display installation summary
+
+**When executed:** Called by nfpm during package installation
+
+### preremove.sh
+
+Runs before .deb package removal.
+
+**Location:** `preremove.sh`
+
+**Actions:**
+- Stop system-monitor service
+- Disable service
+- Clean up (but preserve config)
+
+**When executed:** Called by nfpm during package removal
+
+---
 
 ## Workflow Examples
 
-### Example 1: Testing Network-Process Correlation
+### Example 1: Fresh Installation
 
 ```bash
-# Step 1: Capture with eBPF
-sudo ./capture_with_ebpf.sh 60
+# Step 1: Install build dependencies
+cd scripts/system-setup
+sudo ./build-setup.sh
 
-# Step 2: Upload files to web interface
-# - Navigate to "Correlation" page
-# - Select time range matching capture
-# - Observe correlated flows
+# Step 2: Build the project
+cd ../..
+make generate
+make build
+
+# Step 3: Install the binary
+sudo cp system-monitor /usr/bin/
+sudo chmod +x /usr/bin/system-monitor
+
+# Step 4: Set up configuration
+sudo mkdir -p /var/monitoring/events /var/monitoring/outputs
+sudo cp config/config.json /var/monitoring/config.json
+sudo nano /var/monitoring/config.json  # Edit as needed
+
+# Step 5: Install service
+cd scripts
+sudo cp system-monitor.service /lib/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable system-monitor
+sudo systemctl start system-monitor
+
+# Step 6: Set up web interface
+cd system-setup
+sudo ./streamlit-setup.sh
+
+# Step 7: (Optional) Install Elasticsearch
+sudo ./es-setup.sh
+
+# Step 8: (Optional) Install Ollama for AI analysis
+sudo ./ollama-setup.sh
+ollama pull llama3
 ```
 
-### Example 2: Offline Forensic Analysis
+### Example 2: Testing Network-Process Correlation
 
 ```bash
-# Step 1: Capture forensic data
+# Start monitoring service
+sudo systemctl start system-monitor
+
+# Generate forensic activity
+cd scripts/event-generation
+sudo ./generate_forensic_activity.sh 60
+
+# View results in web interface
+# Navigate to: http://localhost:8501
+# - View "eBPF Events" page
+# - View "PCAP Flows" page
+# - View "Correlation" page to see matched flows
+```
+
+### Example 3: Offline Forensic Analysis
+
+```bash
+# Capture forensic data (doesn't require service)
+cd scripts/event-generation
 sudo ./capture_forensics.sh 120
 
-# Step 2: Upload to Offline Analysis
-# - Open web interface
-# - Navigate to "Offline Analysis"
+# Files created in ./forensic_captures/
+# - capture_TIMESTAMP.pcap
+# - audit_TIMESTAMP.json
+
+# Upload to web interface
+# Navigate to: http://localhost:8501
+# - Go to "Offline Analysis" page
 # - Upload PCAP file
 # - Upload audit JSON file
 # - Run correlation and view visualizations
 ```
 
-### Example 3: Attack Simulation Testing
+### Example 4: Attack Simulation Testing
 
 ```bash
-# Step 1: Start monitoring service
+# Start monitoring
 sudo systemctl start system-monitor
 
-# Step 2: Run attack scenario
-sudo ./generate_forensic_activity.sh 60
-# OR for attack patterns:
+# Run attack scenario
+cd scripts/event-generation
 sudo ./generate_attack_scenario.sh 45
 
-# Step 3: Analyze in web interface
-# - View eBPF Events page
-# - View PCAP Flows page
-# - Generate Provenance Graph
-# - Run AI Analysis
+# Wait for events to flush
+sleep 5
+
+# Analyze in web interface
+# - View attack phases in "eBPF Events" page
+# - Check network exfiltration in "PCAP Flows" page
+# - Generate provenance graph of attacker process
+# - Run AI analysis to identify attack patterns
 ```
+
+---
+
+## Troubleshooting
+
+### Script Permissions
+
+If you get "Permission denied" errors:
+```bash
+chmod +x scripts/system-setup/*.sh
+chmod +x scripts/event-generation/*.sh
+```
+
+### Missing Dependencies
+
+**For capture_forensics.sh:**
+```bash
+# Install tcpdump
+sudo apt-get install tcpdump
+
+# Install auditd (preferred)
+sudo apt-get install auditd
+
+# OR install strace (fallback)
+sudo apt-get install strace
+```
+
+**For event generation:**
+```bash
+# Install network tools
+sudo apt-get install curl dnsutils netcat-openbsd
+```
+
+### Service Issues
+
+**system-monitor won't start:**
+```bash
+# Check logs
+sudo journalctl -u system-monitor -n 50
+
+# Check config
+sudo cat /var/monitoring/config.json
+
+# Check binary exists
+ls -la /usr/bin/system-monitor
+
+# Check permissions
+sudo chmod +x /usr/bin/system-monitor
+```
+
+**Logrotate not working:**
+```bash
+# Test logrotate
+sudo logrotate -f /etc/logrotate.d/system-provenance
+
+# Check if config installed
+ls -la /etc/logrotate.d/system-provenance
+```
+
+---
+
+## Notes
+
+- All setup scripts should be run with `sudo` for proper installation
+- Event generation scripts can run without `sudo` (except capture scripts which need root for PCAP)
+- The web application does NOT require a systemd service and runs in user space
+- Captured forensic data is stored in `./forensic_captures/` relative to script location
+- System-monitor service logs to `/var/monitoring/events/` by default
