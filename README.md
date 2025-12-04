@@ -121,14 +121,7 @@ sudo systemctl enable streamlit-webapp
   "hostname": "",
   "events_dir": "/var/monitoring/events/",
   "output_dir": "/var/monitoring/outputs/",
-  "monitoring": {
-    "ebpf_enabled": true,
-    "pcap_enabled": true
-  },
-  "storage": {
-    "file_logging_enabled": true,
-    "type": "elasticsearch"
-  },
+  "storage_type": "elasticsearch",
   "es_config": {
     "es_host": "localhost",
     "es_port": 9200,
@@ -136,10 +129,16 @@ sudo systemctl enable streamlit-webapp
     "es_password": "changeme",
     "ebpf_index": "ebpf-events",
     "pcap_index": "pcap-flows",
-    "batch_size": 500,
+    "batch_size": 1000,
     "secure": true
   },
+  "ebpf_config": {
+    "enabled": true,
+    "file_logging_enabled": false
+  },
   "pcap_config": {
+    "enabled": true,
+    "file_logging_enabled": true,
     "interface": "eth0",
     "bpf_filter": "tcp or udp",
     "flow_timeout": 300,
@@ -151,14 +150,19 @@ sudo systemctl enable streamlit-webapp
 
 ### Configuration Options
 
-| Field                    | Description                                    | Default         |
-| ------------------------ | ---------------------------------------------- | --------------- |
-| `hostname`               | Hostname tag for events (auto-detect if empty) | `""`            |
-| `ebpf_enabled`           | Enable eBPF syscall monitoring                 | `true`          |
-| `pcap_enabled`           | Enable PCAP network capture                    | `true`          |
-| `storage.type`           | Storage backend: `elasticsearch` or `local`    | `elasticsearch` |
-| `pcap_config.interface`  | Network interface to capture                   | `eth0`          |
-| `pcap_config.bpf_filter` | Berkeley Packet Filter expression              | `tcp or udp`    |
+| Field                                  | Description                                    | Default         |
+| -------------------------------------- | ---------------------------------------------- | --------------- |
+| `hostname`                             | Hostname tag for events (auto-detect if empty) | `""`            |
+| `storage_type`                         | Storage backend: `elasticsearch` or `local`    | `elasticsearch` |
+| `ebpf_config.enabled`                  | Enable eBPF syscall monitoring                 | `true`          |
+| `ebpf_config.file_logging_enabled`     | Enable eBPF events JSONL file logging          | `false`         |
+| `pcap_config.enabled`                  | Enable PCAP network capture                    | `true`          |
+| `pcap_config.file_logging_enabled`     | Enable PCAP flows JSONL file logging           | `true`          |
+| `pcap_config.interface`                | Network interface to capture                   | `eth0`          |
+| `pcap_config.bpf_filter`               | Berkeley Packet Filter expression              | `tcp or udp`    |
+| `pcap_config.flow_timeout`             | Flow inactivity timeout (seconds)              | `300`           |
+| `pcap_config.dns_cache_ttl`            | DNS cache entry lifetime (seconds)             | `300`           |
+| `pcap_config.flush_interval`           | Flow flush interval (seconds)                  | `60`            |
 
 ### Elasticsearch Setup
 
