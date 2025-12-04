@@ -85,10 +85,14 @@ def get_event_count(es, index_name, start_ms=None, end_ms=None, filters=None):
     except Exception:
         return 0
 
-def fetch_events(es, index_name, start_ms, end_ms, filters=None, page=1, page_size=1000, sort_field="datetime", sort_order="desc"):
+def fetch_events(es, index_name, start_ms, end_ms, filters=None, page=1, page_size=1000, sort_field=None, sort_order="desc"):
     """Fetch events from Elasticsearch with pagination"""
     # PCAP flows use epoch_first, eBPF events use epoch_timestamp
     timestamp_field = "epoch_first" if "pcap" in index_name else "epoch_timestamp"
+
+    # Auto-detect sort field if not specified based on index type
+    if sort_field is None:
+        sort_field = "epoch_first" if "pcap" in index_name else "datetime"
 
     must_conditions = [
         {"range": {timestamp_field: {"gte": start_ms, "lte": end_ms}}}
