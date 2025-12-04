@@ -252,7 +252,7 @@ func (ec *EBPFCollector) processEvent() error {
 	evt := ec.parseEvent(&raw)
 
 	// Write to file
-	if ec.cfg.Storage.FileLoggingEnabled && ec.outputFile != nil {
+	if ec.cfg.EBPFConfig.FileLoggingEnabled && ec.outputFile != nil {
 		jsonBytes, _ := json.Marshal(evt)
 		ec.fileLock.Lock()
 		ec.outputFile.Write(jsonBytes)

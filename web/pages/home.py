@@ -21,10 +21,20 @@ es_config = config.get("es_config", {})
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    st.metric("🔧 Monitoring Mode", "eBPF + PCAP" if config.get("monitoring", {}).get("ebpf_enabled") and config.get("monitoring", {}).get("pcap_enabled") else "eBPF Only")
+    ebpf_enabled = config.get("ebpf_config", {}).get("enabled", True)
+    pcap_enabled = config.get("pcap_config", {}).get("enabled", True)
+    if ebpf_enabled and pcap_enabled:
+        mode = "eBPF + PCAP"
+    elif ebpf_enabled:
+        mode = "eBPF Only"
+    elif pcap_enabled:
+        mode = "PCAP Only"
+    else:
+        mode = "Disabled"
+    st.metric("🔧 Monitoring Mode", mode)
 
 with col2:
-    storage_type = config.get("storage", {}).get("storage_type", "local")
+    storage_type = config.get("storage_type", "local")
     st.metric("💾 Storage", storage_type.upper())
 
 with col3:

@@ -2,14 +2,7 @@
   "hostname": "",
   "events_dir": "/var/monitoring/events/",
   "output_dir": "/var/monitoring/outputs/",
-  "monitoring": {
-    "ebpf_enabled": true,
-    "pcap_enabled": true
-  },
-  "storage": {
-    "file_logging_enabled": true,
-    "storage_type": "elasticsearch"
-  },
+  "storage_type": "elasticsearch",
   "es_config": {
     "es_host": "localhost",
     "es_port": 9200,
@@ -20,7 +13,13 @@
     "batch_size": 1000,
     "secure": true
   },
+  "ebpf_config": {
+    "enabled": true,
+    "file_logging_enabled": false
+  },
   "pcap_config": {
+    "enabled": true,
+    "file_logging_enabled": true,
     "interface": "eth0",
     "bpf_filter": "tcp or udp",
     "flow_timeout": 300,

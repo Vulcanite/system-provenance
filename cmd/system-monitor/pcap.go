@@ -134,7 +134,7 @@ func (pc *PCAPCollector) isWhitelisted(srcIP, dstIP string, srcPort, dstPort uin
 // Start begins packet capture and processing
 func (pc *PCAPCollector) Start() error {
 	// Setup file logging for PCAP flows
-	if pc.cfg.Storage.FileLoggingEnabled {
+	if pc.cfg.PCAPConfig.FileLoggingEnabled {
 		if err := pc.setupLogging(); err != nil {
 			return fmt.Errorf("failed to setup PCAP logging: %v", err)
 		}
@@ -484,7 +484,7 @@ func (pc *PCAPCollector) flushFlows() {
 		}
 
 		// Write to file (only inactive flows to avoid duplicates)
-		if inactive && pc.cfg.Storage.FileLoggingEnabled && pc.outputFile != nil {
+		if inactive && pc.cfg.PCAPConfig.FileLoggingEnabled && pc.outputFile != nil {
 			pc.fileLock.Lock()
 			pc.outputFile.Write(jsonBytes)
 			pc.outputFile.WriteString("\n")

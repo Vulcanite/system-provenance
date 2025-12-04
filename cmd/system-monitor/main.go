@@ -29,32 +29,29 @@ type ESConfig struct {
 	SslEnabled bool   `json:"secure"`
 }
 
-type MonitoringConfig struct {
-	EBPFEnabled bool `json:"ebpf_enabled"`
-	PCAPEnabled bool `json:"pcap_enabled"`
-}
-
-type StorageConfig struct {
-	FileLoggingEnabled bool   `json:"file_logging_enabled"`
-	StorageType        string `json:"storage_type"`
+type EBPFConfig struct {
+	Enabled            bool `json:"enabled"`
+	FileLoggingEnabled bool `json:"file_logging_enabled"`
 }
 
 type PCAPConfig struct {
-	Interface     string `json:"interface"`
-	BPFFilter     string `json:"bpf_filter"`
-	FlowTimeout   int    `json:"flow_timeout"`
-	DNSCacheTTL   int    `json:"dns_cache_ttl"`
-	FlushInterval int    `json:"flush_interval"`
+	Enabled            bool   `json:"enabled"`
+	FileLoggingEnabled bool   `json:"file_logging_enabled"`
+	Interface          string `json:"interface"`
+	BPFFilter          string `json:"bpf_filter"`
+	FlowTimeout        int    `json:"flow_timeout"`
+	DNSCacheTTL        int    `json:"dns_cache_ttl"`
+	FlushInterval      int    `json:"flush_interval"`
 }
 
 type Config struct {
-	Hostname   string           `json:"hostname"`
-	EventsDir  string           `json:"events_dir"`
-	OutputDir  string           `json:"output_dir"`
-	Monitoring MonitoringConfig `json:"monitoring"`
-	Storage    StorageConfig    `json:"storage"`
-	ESConfig   ESConfig         `json:"es_config"`
-	PCAPConfig PCAPConfig       `json:"pcap_config"`
+	Hostname    string     `json:"hostname"`
+	EventsDir   string     `json:"events_dir"`
+	OutputDir   string     `json:"output_dir"`
+	StorageType string     `json:"storage_type"`
+	ESConfig    ESConfig   `json:"es_config"`
+	EBPFConfig  EBPFConfig `json:"ebpf_config"`
+	PCAPConfig  PCAPConfig `json:"pcap_config"`
 }
 
 var (
@@ -119,7 +116,7 @@ func setupES() {
 	fmt.Printf("[+] Connected to ES: %s\n", info.Status())
 
 	// Setup eBPF events bulk indexer
-	if cfg.Monitoring.EBPFEnabled {
+	if cfg.EBPFConfig.Enabled {
 		bi, err := esutil.NewBulkIndexer(esutil.BulkIndexerConfig{
 			Client:        es,
 			Index:         cfg.ESConfig.EBPFIndex,
@@ -139,7 +136,7 @@ func setupES() {
 	}
 
 	// Setup PCAP flows bulk indexer
-	if cfg.Monitoring.PCAPEnabled {
+	if cfg.PCAPConfig.Enabled {
 		pcapBI, err := esutil.NewBulkIndexer(esutil.BulkIndexerConfig{
 			Client:        es,
 			Index:         cfg.ESConfig.PCAPIndex,
@@ -179,17 +176,17 @@ func main() {
 	}
 	log.Printf("[+] Hostname: %s", cfg.Hostname)
 
-	if cfg.Storage.FileLoggingEnabled {
+	if cfg.EBPFConfig.FileLoggingEnabled || cfg.PCAPConfig.FileLoggingEnabled {
 		setupLogging()
 	}
 
-	if strings.EqualFold(cfg.Storage.StorageType, "elasticsearch") {
+	if strings.EqualFold(cfg.StorageType, "elasticsearch") {
 		setupES()
 	}
 
 	// Start PCAP collector if enabled
 	var pcapCollector *PCAPCollector
-	if cfg.Monitoring.PCAPEnabled {
+	if cfg.PCAPConfig.Enabled {
 		pcapCollector = NewPCAPCollector(cfg, pcapBulkIndexer)
 		go func() {
 			if err := pcapCollector.Start(); err != nil {
@@ -212,7 +209,7 @@ func main() {
 				if outputFile != nil {
 					outputFile.Close()
 				}
-				if cfg.Storage.FileLoggingEnabled {
+				if cfg.EBPFConfig.FileLoggingEnabled || cfg.PCAPConfig.FileLoggingEnabled {
 					setupLogging()
 				}
 				fileLock.Unlock()
@@ -230,7 +227,7 @@ func main() {
 	}()
 
 	// Start eBPF collector if enabled
-	if cfg.Monitoring.EBPFEnabled {
+	if cfg.EBPFConfig.Enabled {
 		ec, err := NewEBPFCollector(cfg, outputFile, bulkIndexer)
 		if err != nil {
 			log.Fatalf("[!] Failed to create eBPF collector: %v", err)
