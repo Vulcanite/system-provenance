@@ -17,12 +17,14 @@ import numpy as np
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-st.title("📊 Offline PCAP Analysis")
-st.markdown("### Network Traffic Forensics & Visualization")
+st.title("📊 Offline Forensic Analysis")
+st.markdown("### Network Traffic (PCAP) & System Audit (auditd) Analysis")
 
 # Session state
 if 'pcap_flows' not in st.session_state:
     st.session_state['pcap_flows'] = None
+if 'auditd_events' not in st.session_state:
+    st.session_state['auditd_events'] = None
 
 # Main upload section
 st.markdown("## 🌐 PCAP File Upload")
@@ -203,6 +205,165 @@ if pcap_file:
             finally:
                 if os.path.exists(tmp_pcap_path):
                     os.unlink(tmp_pcap_path)
+
+# ===== AUDITD LOG SECTION =====
+st.markdown("---")
+st.markdown("## 🔍 Auditd Log Upload")
+
+auditd_file = st.file_uploader(
+    "Upload auditd log file",
+    type=['log', 'txt'],
+    help="Linux audit daemon log file (usually from /var/log/audit/audit.log)"
+)
+
+if auditd_file:
+    st.success(f"✅ Uploaded: {auditd_file.name} ({auditd_file.size:,} bytes)")
+
+    # Processing options
+    with st.expander("⚙️ Auditd Processing Options", expanded=False):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            event_type_filter = st.text_input(
+                "Event Type Filter (optional)",
+                placeholder="e.g., EXECVE, SYSCALL, PATH",
+                help="Filter by audit event type (comma-separated)"
+            )
+
+        with col2:
+            max_events = st.number_input(
+                "Max events to process",
+                min_value=100,
+                max_value=1000000,
+                value=50000,
+                step=5000,
+                help="Limit for large log files"
+            )
+
+    if st.button("🔄 Process Auditd Log", type="primary", use_container_width=True):
+        with st.spinner("Parsing auditd log file..."):
+            try:
+                # Read uploaded file
+                content = auditd_file.getvalue().decode('utf-8')
+                lines = content.split('\n')
+
+                # Parse auditd events
+                events = []
+                current_event = {}
+                event_filters = [f.strip().upper() for f in event_type_filter.split(',')] if event_type_filter else []
+
+                def parse_auditd_line(line):
+                    """Parse a single auditd log line into key-value pairs"""
+                    if not line.strip() or line.startswith('#'):
+                        return None
+
+                    # Extract timestamp and event type
+                    parts = line.split(':', 1)
+                    if len(parts) < 2:
+                        return None
+
+                    event = {}
+
+                    # Parse timestamp (format: type=TYPE msg=audit(timestamp:sequence))
+                    if 'type=' in line and 'msg=audit' in line:
+                        # Extract type
+                        type_match = line.split('type=', 1)[1].split()[0]
+                        event['type'] = type_match
+
+                        # Extract timestamp
+                        if 'msg=audit(' in line:
+                            ts_part = line.split('msg=audit(', 1)[1].split(')', 1)[0]
+                            timestamp = ts_part.split(':')[0]
+                            try:
+                                event['timestamp'] = float(timestamp)
+                                event['datetime'] = pd.to_datetime(float(timestamp), unit='s')
+                            except:
+                                event['timestamp'] = 0
+                                event['datetime'] = pd.NaT
+
+                        # Parse key-value pairs in the rest of the line
+                        kv_part = line.split(')', 1)[1] if ')' in line else ''
+
+                        # Common fields to extract
+                        fields = ['pid', 'ppid', 'uid', 'gid', 'euid', 'suid', 'comm', 'exe',
+                                 'syscall', 'success', 'exit', 'key', 'name', 'cwd', 'a0', 'a1', 'a2', 'a3']
+
+                        for field in fields:
+                            pattern = f'{field}='
+                            if pattern in kv_part:
+                                try:
+                                    value = kv_part.split(pattern, 1)[1].split()[0]
+                                    # Remove quotes
+                                    value = value.strip('"\'')
+                                    event[field] = value
+                                except:
+                                    pass
+
+                        return event
+
+                    return None
+
+                # Process lines
+                event_count = 0
+                for line in lines:
+                    if event_count >= max_events:
+                        break
+
+                    event = parse_auditd_line(line)
+                    if event:
+                        # Apply event type filter
+                        if event_filters and event.get('type') not in event_filters:
+                            continue
+
+                        events.append(event)
+                        event_count += 1
+
+                if events:
+                    df_auditd = pd.DataFrame(events)
+
+                    # Clean and process data
+                    for col in ['pid', 'ppid', 'uid', 'gid', 'euid', 'suid']:
+                        if col in df_auditd.columns:
+                            df_auditd[col] = pd.to_numeric(df_auditd[col], errors='coerce')
+
+                    # Decode hex-encoded strings (common in auditd for comm and exe)
+                    for col in ['comm', 'exe', 'name', 'cwd']:
+                        if col in df_auditd.columns:
+                            df_auditd[col] = df_auditd[col].apply(lambda x:
+                                bytes.fromhex(x).decode('utf-8', errors='ignore') if isinstance(x, str) and len(x) > 0 and all(c in '0123456789ABCDEFabcdef' for c in x) else x
+                            )
+
+                    st.session_state['auditd_events'] = df_auditd
+                    st.success(f"✅ Parsed {len(events)} audit events")
+
+                    # Summary metrics
+                    st.markdown("### 📊 Auditd Summary")
+                    col1, col2, col3, col4, col5 = st.columns(5)
+
+                    with col1:
+                        st.metric("Total Events", f"{len(events):,}")
+                    with col2:
+                        event_types = df_auditd['type'].nunique() if 'type' in df_auditd.columns else 0
+                        st.metric("Event Types", event_types)
+                    with col3:
+                        unique_procs = df_auditd['comm'].nunique() if 'comm' in df_auditd.columns else 0
+                        st.metric("Unique Processes", unique_procs)
+                    with col4:
+                        if 'datetime' in df_auditd.columns and not df_auditd['datetime'].isna().all():
+                            time_range = df_auditd['datetime'].max() - df_auditd['datetime'].min()
+                            st.metric("Time Span", f"{time_range.total_seconds():.1f}s")
+                        else:
+                            st.metric("Time Span", "N/A")
+                    with col5:
+                        unique_users = df_auditd['uid'].nunique() if 'uid' in df_auditd.columns else 0
+                        st.metric("Unique UIDs", unique_users)
+                else:
+                    st.error("No valid audit events found in log file")
+
+            except Exception as e:
+                st.error(f"Error processing auditd log: {e}")
+                import traceback
+                st.text(traceback.format_exc())
 
 # Visualizations section
 if st.session_state['pcap_flows'] is not None:
@@ -543,5 +704,450 @@ if st.session_state['pcap_flows'] is not None:
             use_container_width=True
         )
 
+# ===== AUDITD VISUALIZATIONS =====
+if st.session_state['auditd_events'] is not None:
+    df_audit = st.session_state['auditd_events']
+
+    st.markdown("---")
+    st.markdown("## 🔍 Auditd Event Analysis")
+
+    # ===== EVENT OVERVIEW =====
+    st.markdown("### 📋 Event Overview")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        # Event type distribution
+        if 'type' in df_audit.columns:
+            type_counts = df_audit['type'].value_counts().head(15)
+            fig_types = px.bar(
+                x=type_counts.values,
+                y=type_counts.index,
+                orientation='h',
+                title="Top 15 Audit Event Types",
+                labels={'x': 'Count', 'y': 'Event Type'}
+            )
+            st.plotly_chart(fig_types, use_container_width=True)
+
+    with col2:
+        # Events over time
+        if 'datetime' in df_audit.columns and not df_audit['datetime'].isna().all():
+            df_time = df_audit.copy()
+            df_time['minute'] = df_time['datetime'].dt.floor('T')
+            time_events = df_time.groupby('minute').size().reset_index(name='count')
+
+            fig_time = go.Figure()
+            fig_time.add_trace(go.Scatter(
+                x=time_events['minute'],
+                y=time_events['count'],
+                mode='lines',
+                fill='tozeroy',
+                name='Events/min'
+            ))
+            fig_time.update_layout(
+                title="Audit Events Over Time",
+                xaxis_title="Time",
+                yaxis_title="Events per Minute"
+            )
+            st.plotly_chart(fig_time, use_container_width=True)
+
+    # ===== PROCESS ACTIVITY =====
+    st.markdown("### 👤 Process & User Activity")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        # Top processes
+        if 'comm' in df_audit.columns:
+            top_procs = df_audit['comm'].value_counts().head(10)
+            fig_procs = px.bar(
+                x=top_procs.values,
+                y=top_procs.index,
+                orientation='h',
+                title="Top 10 Processes (by event count)",
+                labels={'x': 'Events', 'y': 'Process'}
+            )
+            st.plotly_chart(fig_procs, use_container_width=True)
+
+    with col2:
+        # Top executables
+        if 'exe' in df_audit.columns:
+            top_exes = df_audit['exe'].value_counts().head(10)
+            fig_exes = px.bar(
+                x=top_exes.values,
+                y=top_exes.index,
+                orientation='h',
+                title="Top 10 Executables",
+                labels={'x': 'Events', 'y': 'Executable'}
+            )
+            st.plotly_chart(fig_exes, use_container_width=True)
+
+    with col3:
+        # User activity (by UID)
+        if 'uid' in df_audit.columns:
+            uid_counts = df_audit['uid'].value_counts().head(10)
+            fig_uids = px.bar(
+                x=uid_counts.values,
+                y=uid_counts.index.astype(str),
+                orientation='h',
+                title="Top 10 User IDs (by activity)",
+                labels={'x': 'Events', 'y': 'UID'}
+            )
+            st.plotly_chart(fig_uids, use_container_width=True)
+
+    # ===== SYSCALL ANALYSIS =====
+    if 'syscall' in df_audit.columns:
+        st.markdown("### 🔧 Syscall Analysis")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            # Syscall distribution
+            syscall_counts = df_audit['syscall'].value_counts().head(15)
+            fig_syscalls = px.bar(
+                x=syscall_counts.values,
+                y=syscall_counts.index,
+                orientation='h',
+                title="Top 15 Syscalls",
+                labels={'x': 'Count', 'y': 'Syscall'}
+            )
+            st.plotly_chart(fig_syscalls, use_container_width=True)
+
+        with col2:
+            # Success/failure analysis
+            if 'success' in df_audit.columns:
+                success_counts = df_audit['success'].value_counts()
+                fig_success = px.pie(
+                    values=success_counts.values,
+                    names=success_counts.index,
+                    title="Syscall Success vs Failure",
+                    hole=0.4
+                )
+                st.plotly_chart(fig_success, use_container_width=True)
+
+    # ===== FILE ACCESS ANALYSIS =====
+    if 'name' in df_audit.columns:
+        st.markdown("### 📁 File Access Patterns")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            # Top accessed files
+            top_files = df_audit['name'].value_counts().head(15)
+            fig_files = px.bar(
+                x=top_files.values,
+                y=top_files.index,
+                orientation='h',
+                title="Top 15 Accessed Files/Paths",
+                labels={'x': 'Access Count', 'y': 'Path'}
+            )
+            st.plotly_chart(fig_files, use_container_width=True)
+
+        with col2:
+            # Directory analysis (extract directory from path)
+            df_dirs = df_audit[df_audit['name'].notna()].copy()
+            df_dirs['directory'] = df_dirs['name'].apply(lambda x: '/'.join(str(x).split('/')[:-1]) if '/' in str(x) else '/')
+            top_dirs = df_dirs['directory'].value_counts().head(15)
+            fig_dirs = px.bar(
+                x=top_dirs.values,
+                y=top_dirs.index,
+                orientation='h',
+                title="Top 15 Accessed Directories",
+                labels={'x': 'Access Count', 'y': 'Directory'}
+            )
+            st.plotly_chart(fig_dirs, use_container_width=True)
+
+    # ===== PROCESS TREE VISUALIZATION =====
+    if 'pid' in df_audit.columns and 'ppid' in df_audit.columns and 'comm' in df_audit.columns:
+        st.markdown("### 🌳 Process Relationships")
+
+        # Build process tree (sample top processes)
+        df_procs = df_audit[['pid', 'ppid', 'comm']].dropna()
+        top_pids = df_procs['pid'].value_counts().head(50).index
+        df_tree = df_procs[df_procs['pid'].isin(top_pids)]
+
+        # Create network graph
+        edges = []
+        for _, row in df_tree.iterrows():
+            if row['ppid'] != row['pid'] and row['ppid'] in top_pids:
+                edges.append((row['ppid'], row['pid'], row['comm']))
+
+        if edges:
+            # Sunburst chart showing process hierarchy
+            tree_data = []
+            for ppid, pid, comm in edges:
+                tree_data.append({
+                    'parent': f"PID {int(ppid)}",
+                    'child': f"PID {int(pid)}",
+                    'comm': comm
+                })
+
+            if tree_data:
+                df_tree_viz = pd.DataFrame(tree_data)
+                # Create a simple hierarchy visualization
+                parent_child_counts = df_tree_viz.groupby(['parent', 'child']).size().reset_index(name='count')
+
+                st.info(f"📊 Showing process relationships for top 50 most active PIDs ({len(edges)} parent-child relationships)")
+
+    # ===== DETAILED EVENT TABLE =====
+    st.markdown("### 📋 Detailed Event Data")
+
+    # Filters
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        if 'type' in df_audit.columns:
+            filter_type = st.multiselect(
+                "Filter by Event Type",
+                options=df_audit['type'].unique(),
+                default=[]
+            )
+        else:
+            filter_type = []
+
+    with col2:
+        if 'comm' in df_audit.columns:
+            filter_comm = st.text_input("Filter by Process Name", "")
+        else:
+            filter_comm = ""
+
+    with col3:
+        sort_by_audit = st.selectbox(
+            "Sort by",
+            options=['timestamp', 'type', 'comm', 'uid'] if 'timestamp' in df_audit.columns else df_audit.columns.tolist()[:4],
+            index=0
+        )
+
+    # Apply filters
+    filtered_audit = df_audit.copy()
+
+    if filter_type:
+        filtered_audit = filtered_audit[filtered_audit['type'].isin(filter_type)]
+
+    if filter_comm:
+        if 'comm' in filtered_audit.columns:
+            filtered_audit = filtered_audit[filtered_audit['comm'].str.contains(filter_comm, case=False, na=False)]
+
+    # Sort
+    if sort_by_audit in filtered_audit.columns:
+        filtered_audit = filtered_audit.sort_values(by=sort_by_audit, ascending=False)
+
+    # Display table
+    display_cols = [col for col in ['datetime', 'type', 'comm', 'exe', 'pid', 'ppid', 'uid', 'syscall', 'success', 'name'] if col in filtered_audit.columns]
+
+    st.dataframe(
+        filtered_audit[display_cols].head(100),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # ===== EXPORT OPTIONS =====
+    st.markdown("### 📥 Auditd Export Options")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        csv_audit = df_audit.to_csv(index=False)
+        st.download_button(
+            label="Download Full Auditd Dataset (CSV)",
+            data=csv_audit,
+            file_name=f"auditd_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
+    with col2:
+        # Export filtered data as JSON
+        filtered_json = filtered_audit.head(1000).to_json(orient='records', date_format='iso')
+        st.download_button(
+            label="Download Filtered Events (JSON)",
+            data=filtered_json,
+            file_name=f"auditd_filtered_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+            use_container_width=True
+        )
+
+# ===== CORRELATION ANALYSIS =====
+if st.session_state['pcap_flows'] is not None and st.session_state['auditd_events'] is not None:
+    st.markdown("---")
+    st.markdown("## 🔗 PCAP-Auditd Correlation Analysis")
+
+    df_pcap = st.session_state['pcap_flows']
+    df_audit = st.session_state['auditd_events']
+
+    # Check if both have timestamps
+    if 'first_seen_dt' in df_pcap.columns and 'datetime' in df_audit.columns and not df_audit['datetime'].isna().all():
+        st.markdown("### ⏰ Timeline Correlation")
+
+        # Time tolerance for correlation
+        time_tolerance = st.slider(
+            "Time correlation tolerance (seconds)",
+            min_value=1,
+            max_value=300,
+            value=30,
+            help="Match PCAP flows with auditd events within this time window"
+        )
+
+        # Find overlapping time range
+        pcap_start = df_pcap['first_seen_dt'].min()
+        pcap_end = df_pcap['last_seen_dt'].max()
+        audit_start = df_audit['datetime'].min()
+        audit_end = df_audit['datetime'].max()
+
+        overlap_start = max(pcap_start, audit_start)
+        overlap_end = min(pcap_end, audit_end)
+
+        if overlap_start < overlap_end:
+            st.success(f"✅ Found overlapping time period: {overlap_start} to {overlap_end}")
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("PCAP Flows in overlap", len(df_pcap[(df_pcap['first_seen_dt'] >= overlap_start) & (df_pcap['first_seen_dt'] <= overlap_end)]))
+            with col2:
+                st.metric("Auditd Events in overlap", len(df_audit[(df_audit['datetime'] >= overlap_start) & (df_audit['datetime'] <= overlap_end)]))
+            with col3:
+                overlap_duration = (overlap_end - overlap_start).total_seconds()
+                st.metric("Overlap Duration", f"{overlap_duration:.1f}s")
+
+            # Combined timeline visualization
+            st.markdown("### 📊 Combined Timeline")
+
+            # Create combined timeline data
+            df_pcap_timeline = df_pcap.copy()
+            df_pcap_timeline['minute'] = df_pcap_timeline['first_seen_dt'].dt.floor('T')
+            pcap_timeline = df_pcap_timeline.groupby('minute').size().reset_index(name='pcap_count')
+
+            df_audit_timeline = df_audit.copy()
+            df_audit_timeline['minute'] = df_audit_timeline['datetime'].dt.floor('T')
+            audit_timeline = df_audit_timeline.groupby('minute').size().reset_index(name='audit_count')
+
+            # Merge timelines
+            combined_timeline = pd.merge(pcap_timeline, audit_timeline, on='minute', how='outer').fillna(0)
+            combined_timeline = combined_timeline.sort_values('minute')
+
+            # Plot combined timeline
+            fig_combined = go.Figure()
+            fig_combined.add_trace(go.Scatter(
+                x=combined_timeline['minute'],
+                y=combined_timeline['pcap_count'],
+                mode='lines',
+                name='PCAP Flows',
+                line=dict(color='blue')
+            ))
+            fig_combined.add_trace(go.Scatter(
+                x=combined_timeline['minute'],
+                y=combined_timeline['audit_count'],
+                mode='lines',
+                name='Audit Events',
+                line=dict(color='red'),
+                yaxis='y2'
+            ))
+            fig_combined.update_layout(
+                title="Combined Activity Timeline",
+                xaxis_title="Time",
+                yaxis_title="PCAP Flows",
+                yaxis2=dict(
+                    title="Audit Events",
+                    overlaying='y',
+                    side='right'
+                ),
+                hovermode='x unified'
+            )
+            st.plotly_chart(fig_combined, use_container_width=True)
+
+            # Process-Network correlation
+            st.markdown("### 🔍 Process-Network Correlation")
+
+            # Try to correlate network connections with processes
+            if 'comm' in df_audit.columns and 'pid' in df_audit.columns:
+                st.info("💡 Analyzing which processes were active during network flows...")
+
+                # Get processes active during PCAP capture
+                pcap_processes = df_audit[
+                    (df_audit['datetime'] >= overlap_start) &
+                    (df_audit['datetime'] <= overlap_end)
+                ]
+
+                if len(pcap_processes) > 0:
+                    col1, col2 = st.columns(2)
+
+                    with col1:
+                        # Top processes during network activity
+                        top_net_procs = pcap_processes['comm'].value_counts().head(10)
+                        fig_net_procs = px.bar(
+                            x=top_net_procs.values,
+                            y=top_net_procs.index,
+                            orientation='h',
+                            title="Top Processes During PCAP Capture",
+                            labels={'x': 'Event Count', 'y': 'Process'}
+                        )
+                        st.plotly_chart(fig_net_procs, use_container_width=True)
+
+                    with col2:
+                        # Protocol distribution for context
+                        protocol_dist = df_pcap['protocol'].value_counts()
+                        fig_proto = px.pie(
+                            values=protocol_dist.values,
+                            names=protocol_dist.index,
+                            title="Network Protocol Distribution",
+                            hole=0.4
+                        )
+                        st.plotly_chart(fig_proto, use_container_width=True)
+
+                    # Correlation table
+                    st.markdown("### 📋 Potential Process-Flow Correlations")
+
+                    # Find processes that might be responsible for network activity
+                    correlations = []
+
+                    for _, flow in df_pcap.head(50).iterrows():  # Limit to top 50 flows
+                        flow_time = flow['first_seen_dt']
+                        time_window_start = flow_time - pd.Timedelta(seconds=time_tolerance)
+                        time_window_end = flow_time + pd.Timedelta(seconds=time_tolerance)
+
+                        # Find processes active in this time window
+                        matching_procs = df_audit[
+                            (df_audit['datetime'] >= time_window_start) &
+                            (df_audit['datetime'] <= time_window_end)
+                        ]
+
+                        if len(matching_procs) > 0:
+                            for proc in matching_procs['comm'].unique()[:3]:  # Top 3 processes
+                                correlations.append({
+                                    'time': flow_time,
+                                    'src_ip': flow['src_ip'],
+                                    'dst_ip': flow['dst_ip'],
+                                    'dst_port': flow['dst_port'],
+                                    'protocol': flow['protocol'],
+                                    'process': proc,
+                                    'bytes': flow['byte_count']
+                                })
+
+                    if correlations:
+                        df_corr = pd.DataFrame(correlations).head(100)
+                        st.dataframe(
+                            df_corr,
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                        st.caption(f"Showing potential correlations (processes active within ±{time_tolerance}s of network flows)")
+                    else:
+                        st.warning("No strong correlations found with current tolerance settings")
+
+        else:
+            st.warning("⚠️ No overlapping time period found between PCAP and auditd data")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write(f"**PCAP Time Range:**")
+                st.write(f"Start: {pcap_start}")
+                st.write(f"End: {pcap_end}")
+            with col2:
+                st.write(f"**Auditd Time Range:**")
+                st.write(f"Start: {audit_start}")
+                st.write(f"End: {audit_end}")
+    else:
+        st.info("⏰ Both datasets need valid timestamps for correlation analysis")
+
 else:
-    st.info("👆 Upload a PCAP file above to begin analysis")
+    if st.session_state['pcap_flows'] is None and st.session_state['auditd_events'] is None:
+        st.info("👆 Upload a PCAP file or auditd log above to begin analysis")
