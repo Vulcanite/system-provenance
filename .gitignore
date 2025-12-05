@@ -8,6 +8,8 @@ bpf_bpf.o
 # --- Build Directory ---
 build/
 
+
+
 # --- Packaging (nfpm) ---
 *.deb
 *.rpm
@@ -21,9 +23,9 @@ build/
 .claude/
 .DS_Store
 
-# --- Python ---
+# --- Python  ---
+venv/
 *.pyc
 __pycache__/
-
 
 CLAUDE.md
