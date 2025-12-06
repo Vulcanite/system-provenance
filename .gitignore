@@ -7,8 +7,7 @@ bpf_bpf.o
 
 # --- Build Directory ---
 build/
-
-
+output/
 
 # --- Packaging (nfpm) ---
 *.deb

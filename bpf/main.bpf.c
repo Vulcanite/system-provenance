@@ -13,6 +13,7 @@ struct enter_data_t {
     char filename[256];
     u64 flags;
     u64 count;
+    s64 fd;  // Explicit fd field for I/O syscalls
 };
 
 // Network socket tracking data
@@ -27,6 +28,45 @@ struct socket_data_t {
     u8 protocol;  // IPPROTO_TCP, IPPROTO_UDP
 };
 
+// Accept args storage (replaces raw pointer)
+struct accept_args_t {
+    u16 sa_family;
+    u16 port;
+    u32 ipv4;
+    u32 ipv6[4];
+};
+
+// Event type classification
+enum event_type {
+    EV_FS = 1,    // Filesystem event
+    EV_NET = 2,   // Network event
+    EV_PROC = 3,  // Process event
+};
+
+// Helper functions for safe IP address copying
+static __always_inline void copy_ipv4_from_sockaddr(u32 *dest, struct sockaddr_in *addr) {
+    if (!dest || !addr) return;
+    u32 raw_ip;
+    bpf_probe_read_user(&raw_ip, sizeof(raw_ip), &addr->sin_addr.s_addr);
+    *dest = bpf_ntohl(raw_ip);
+}
+
+static __always_inline void copy_ipv6_from_sockaddr(u32 dest[4], struct sockaddr_in6 *addr) {
+    if (!dest || !addr) return;
+    bpf_probe_read_user(dest, 16, &addr->sin6_addr);
+}
+
+static __always_inline u16 copy_port_from_sockaddr(struct sockaddr *addr, u16 family) {
+    if (!addr) return 0;
+    u16 port = 0;
+    if (family == 2) {  // AF_INET
+        bpf_probe_read_user(&port, sizeof(port), &((struct sockaddr_in *)addr)->sin_port);
+    } else if (family == 10) {  // AF_INET6
+        bpf_probe_read_user(&port, sizeof(port), &((struct sockaddr_in6 *)addr)->sin6_port);
+    }
+    return bpf_ntohs(port);
+}
+
 struct so_event {
     u64 timestamp;
     u32 pid;
@@ -39,6 +79,7 @@ struct so_event {
     s64 fd;
     u64 flags;
     s64 ret;
+    u8 event_type;  // Event classification
 
     // Network fields (enhanced)
     u32 src_ip;
@@ -73,21 +114,21 @@ struct {
 } event_heap SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 10240);
     __type(key, u64);
     __type(value, struct enter_data_t);
 } open_data SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 10240);
     __type(key, u64);
     __type(value, struct enter_data_t);
 } write_data SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 10240);
     __type(key, u64);
     __type(value, struct enter_data_t);
@@ -95,7 +136,7 @@ struct {
 
 // Map to track socket FD to network info (for correlation)
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 10240);
     __type(key, u64);  // pid_tgid << 32 | fd
     __type(value, struct socket_data_t);
@@ -118,19 +159,27 @@ struct {
 
 // Map to track connect enter data
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 10240);
     __type(key, u64);
     __type(value, struct socket_data_t);
 } connect_data SEC(".maps");
 
-// --- NEW MAP FOR ACCEPT CORRELATION ---
-// Stores the sockaddr pointer from sys_enter_accept/4 to read it in sys_exit
+// Map for user-space configurable ignored process names
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 128);  // Max 128 ignored process names
+    __type(key, char[64]);     // Process name (comm)
+    __type(value, u8);         // 1 = ignore
+} ignored_comms SEC(".maps");
+
+// --- MAP FOR ACCEPT CORRELATION ---
+// Stores copied sockaddr data from sys_enter_accept/4 to read it in sys_exit
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 10240);
     __type(key, u64);
-    __type(value, struct sockaddr *);
+    __type(value, struct accept_args_t);
 } active_accepts SEC(".maps");
 
 // -------------------------------------------------------------------------
@@ -139,26 +188,13 @@ struct {
 
 // Filter based on Process Name (Comm) - Called EARLY
 static __always_inline int should_drop_comm(char *c) {
-    // 1. Self-Protection (Infinite Loop prevention)
-    // Drop "ebpf-*" and "system-monitor" - ALL their syscalls
-    // SECURITY NOTE: Attackers accessing /var/monitoring/* will be captured
-    //                because they won't have comm="system-monitor"
-    if (c[0]=='e' && c[1]=='b' && c[2]=='p' && c[3]=='f' && c[4]=='-') return 1;
+    // Check if this comm is in the ignored_comms map
+    u8 *ignored = bpf_map_lookup_elem(&ignored_comms, c);
+    if (ignored && *ignored == 1) {
+        return 1;
+    }
 
-    // "system-monitor" - our own binary (drops all I/O, including writes to logs)
-    if (c[0]=='s' && c[1]=='y' && c[2]=='s' && c[3]=='t' && c[4]=='e' && c[5]=='m' &&
-        c[6]=='-' && c[7]=='m' && c[8]=='o' && c[9]=='n' && c[10]=='i' && c[11]=='t' && c[12]=='o' && c[13]=='r') return 1;
-
-    // 2. Noisy System Daemons
-    // "systemd-*"
-    if (c[0]=='s' && c[1]=='y' && c[2]=='s' && c[3]=='t' && c[4]=='e' && c[5]=='m' && c[6]=='d') return 1;
-    // "node_exporter"
-    if (c[0]=='n' && c[1]=='o' && c[2]=='d' && c[3]=='e' && c[4]=='_') return 1;
-    // "snapd"
-    if (c[0]=='s' && c[1]=='n' && c[2]=='a' && c[3]=='p' && c[4]=='d') return 1;
-
-    // 3. Smart kworker filter
-    // Only drop if it is ACTUALLY a kernel thread (PF_KTHREAD).
+    // Smart kworker filter - Only drop if it is ACTUALLY a kernel thread (PF_KTHREAD).
     // Keeps malware named "kworker".
     if (c[0]=='k' && c[1]=='w' && c[2]=='o' && c[3]=='r' && c[4]=='k') {
         struct task_struct *task = (struct task_struct *)bpf_get_current_task();
@@ -208,6 +244,7 @@ static __always_inline struct so_event* init_event() {
     BPF_CORE_READ_INTO(&event->process_start_time, task, start_time);
 
     event->filename[0] = 0;
+    event->event_type = 0;
     event->src_ip = 0;
     event->dest_ip = 0;
     event->src_port = 0;
@@ -234,8 +271,25 @@ static __always_inline bool is_whitelisted_network(u32 ip, u16 port) {
     return false;
 }
 
+// Check if this is the system-monitor process (collector itself)
+static __always_inline bool is_collector_process(char *comm) {
+    // Check for "system-monitor"
+    if (comm[0]=='s' && comm[1]=='y' && comm[2]=='s' && comm[3]=='t' && comm[4]=='e' && comm[5]=='m' &&
+        comm[6]=='-' && comm[7]=='m' && comm[8]=='o' && comm[9]=='n' && comm[10]=='i' && comm[11]=='t' &&
+        comm[12]=='o' && comm[13]=='r') {
+        return true;
+    }
+    return false;
+}
+
 // Check if event should be dropped due to whitelist
+// Only applies whitelist to the collector process itself to prevent attacker evasion
 static __always_inline bool should_drop_network(struct so_event *event) {
+    // Only apply whitelist if this is the collector process
+    if (!is_collector_process(event->comm)) {
+        return false;
+    }
+
     if (event->syscall[0] == 'c' && event->syscall[1] == 'o' && event->syscall[2] == 'n') {
         if (event->sa_family == 2 && is_whitelisted_network(event->dest_ip, event->dest_port)) return true;
     } else if (event->syscall[0] == 'b' && event->syscall[1] == 'i' && event->syscall[2] == 'n') {
@@ -277,6 +331,7 @@ SEC("tp/syscalls/sys_enter_execve")
 int sys_enter_execve(struct args_execve *ctx) {
     struct so_event *event = init_event();
     if (!event) return 0;
+    event->event_type = EV_PROC;
     __builtin_memcpy(event->syscall, "execve", 7);
     bpf_probe_read_user_str(&event->filename, sizeof(event->filename), ctx->filename);
     submit(ctx, event);
@@ -312,6 +367,7 @@ int sys_exit_openat(struct args_exit *ctx) {
     if (!data) return 0;
     struct so_event *event = init_event();
     if (event) {
+        event->event_type = EV_FS;
         __builtin_memcpy(event->syscall, "openat", 7);
         __builtin_memcpy(event->filename, data->filename, sizeof(event->filename));
         event->flags = data->flags;
@@ -329,6 +385,7 @@ int sys_exit_openat2(struct args_exit *ctx) {
     if (!data) return 0;
     struct so_event *event = init_event();
     if (event) {
+        event->event_type = EV_FS;
         __builtin_memcpy(event->syscall, "openat2", 8);
         __builtin_memcpy(event->filename, data->filename, sizeof(event->filename));
         event->flags = data->flags;
@@ -343,7 +400,7 @@ SEC("tp/syscalls/sys_enter_write")
 int sys_enter_write(struct args_write *ctx) {
     u64 id = bpf_get_current_pid_tgid();
     struct enter_data_t data = {};
-    data.flags = ctx->fd;
+    data.fd = ctx->fd;
     data.count = ctx->count;
     bpf_map_update_elem(&write_data, &id, &data, BPF_ANY);
     return 0;
@@ -357,8 +414,9 @@ int sys_exit_write(struct args_exit *ctx) {
     if (ctx->ret < 0) { bpf_map_delete_elem(&write_data, &id); return 0; }
     struct so_event *event = init_event();
     if (event) {
+        event->event_type = EV_FS;
         __builtin_memcpy(event->syscall, "write", 6);
-        event->fd = data->flags;
+        event->fd = data->fd;
         event->count = data->count;
         event->bytes_rw = ctx->ret;
         event->ret = ctx->ret;
@@ -372,7 +430,7 @@ SEC("tp/syscalls/sys_enter_read")
 int sys_enter_read(struct args_read *ctx) {
     u64 id = bpf_get_current_pid_tgid();
     struct enter_data_t data = {};
-    data.flags = ctx->fd;
+    data.fd = ctx->fd;
     data.count = ctx->count;
     bpf_map_update_elem(&read_data, &id, &data, BPF_ANY);
     return 0;
@@ -386,8 +444,9 @@ int sys_exit_read(struct args_exit *ctx) {
     if (ctx->ret < 4) { bpf_map_delete_elem(&read_data, &id); return 0; } // Filter small reads
     struct so_event *event = init_event();
     if (event) {
+        event->event_type = EV_FS;
         __builtin_memcpy(event->syscall, "read", 5);
-        event->fd = data->flags;
+        event->fd = data->fd;
         event->count = data->count;
         event->bytes_rw = ctx->ret;
         event->ret = ctx->ret;
@@ -401,6 +460,7 @@ SEC("tp/syscalls/sys_enter_unlinkat")
 int sys_enter_unlinkat(struct args_unlinkat *ctx) {
     struct so_event *event = init_event();
     if (!event) return 0;
+    event->event_type = EV_FS;
     __builtin_memcpy(event->syscall, "unlinkat", 9);
     bpf_probe_read_user_str(&event->filename, sizeof(event->filename), ctx->pathname);
     submit(ctx, event);
@@ -411,6 +471,7 @@ SEC("tp/syscalls/sys_enter_vfork")
 int sys_enter_vfork(void *ctx) {
     struct so_event *event = init_event();
     if (!event) return 0;
+    event->event_type = EV_PROC;
     __builtin_memcpy(event->syscall, "vfork", 6);
     submit(ctx, event);
     return 0;
@@ -422,6 +483,7 @@ SEC("tp/syscalls/sys_enter_socket")
 int sys_enter_socket(struct args_socket *ctx) {
     struct so_event *event = init_event();
     if (!event) return 0;
+    event->event_type = EV_NET;
     __builtin_memcpy(event->syscall, "socket", 7);
     event->sa_family = ctx->family;
     event->socket_type = ctx->type;
@@ -463,6 +525,7 @@ int sys_exit_connect(struct args_exit *ctx) {
 
     struct so_event *event = init_event();
     if (event) {
+        event->event_type = EV_NET;
         __builtin_memcpy(event->syscall, "connect", 8);
         event->sa_family = sock_data->sa_family;
         event->dest_ip = sock_data->dest_ip;
@@ -486,6 +549,7 @@ SEC("tp/syscalls/sys_enter_bind")
 int sys_enter_bind(struct args_bind *ctx) {
     struct so_event *event = init_event();
     if (!event) return 0;
+    event->event_type = EV_NET;
     __builtin_memcpy(event->syscall, "bind", 5);
     event->fd = ctx->fd;
 
@@ -513,6 +577,7 @@ SEC("tp/syscalls/sys_enter_listen")
 int sys_enter_listen(struct args_listen *ctx) {
     struct so_event *event = init_event();
     if (!event) return 0;
+    event->event_type = EV_NET;
     __builtin_memcpy(event->syscall, "listen", 7);
     event->fd = ctx->fd;
     submit(ctx, event);
@@ -522,24 +587,62 @@ int sys_enter_listen(struct args_listen *ctx) {
 SEC("tp/syscalls/sys_enter_accept")
 int sys_enter_accept(struct args_accept *ctx) {
     u64 id = bpf_get_current_pid_tgid();
-    struct sockaddr *addr = ctx->upeer_sockaddr;
-    bpf_map_update_elem(&active_accepts, &id, &addr, BPF_ANY);
+    struct accept_args_t args = {};
+
+    if (ctx->upeer_sockaddr) {
+        u16 family = 0;
+        bpf_probe_read_user(&family, sizeof(family), ctx->upeer_sockaddr);
+        args.sa_family = family;
+
+        if (family == 2) {  // AF_INET
+            struct sockaddr_in addr = {};
+            bpf_probe_read_user(&addr, sizeof(addr), ctx->upeer_sockaddr);
+            args.ipv4 = bpf_ntohl(addr.sin_addr.s_addr);
+            args.port = bpf_ntohs(addr.sin_port);
+        } else if (family == 10) {  // AF_INET6
+            struct sockaddr_in6 addr = {};
+            bpf_probe_read_user(&addr, sizeof(addr), ctx->upeer_sockaddr);
+            args.port = bpf_ntohs(addr.sin6_port);
+            bpf_probe_read_user(&args.ipv6, sizeof(args.ipv6), &addr.sin6_addr);
+        }
+    }
+
+    bpf_map_update_elem(&active_accepts, &id, &args, BPF_ANY);
     return 0;
 }
 
 SEC("tp/syscalls/sys_enter_accept4")
 int sys_enter_accept4(struct args_accept *ctx) {
     u64 id = bpf_get_current_pid_tgid();
-    struct sockaddr *addr = ctx->upeer_sockaddr;
-    bpf_map_update_elem(&active_accepts, &id, &addr, BPF_ANY);
+    struct accept_args_t args = {};
+
+    if (ctx->upeer_sockaddr) {
+        u16 family = 0;
+        bpf_probe_read_user(&family, sizeof(family), ctx->upeer_sockaddr);
+        args.sa_family = family;
+
+        if (family == 2) {  // AF_INET
+            struct sockaddr_in addr = {};
+            bpf_probe_read_user(&addr, sizeof(addr), ctx->upeer_sockaddr);
+            args.ipv4 = bpf_ntohl(addr.sin_addr.s_addr);
+            args.port = bpf_ntohs(addr.sin_port);
+        } else if (family == 10) {  // AF_INET6
+            struct sockaddr_in6 addr = {};
+            bpf_probe_read_user(&addr, sizeof(addr), ctx->upeer_sockaddr);
+            args.port = bpf_ntohs(addr.sin6_port);
+            bpf_probe_read_user(&args.ipv6, sizeof(args.ipv6), &addr.sin6_addr);
+        }
+    }
+
+    bpf_map_update_elem(&active_accepts, &id, &args, BPF_ANY);
     return 0;
 }
 
 static __always_inline int process_exit_accept(struct args_exit *ctx, const char* syscall_name, size_t sys_len) {
     u64 id = bpf_get_current_pid_tgid();
-    struct sockaddr **addr_ptr = bpf_map_lookup_elem(&active_accepts, &id);
-    
-    if (!addr_ptr || ctx->ret < 0) {
+    struct accept_args_t *args = bpf_map_lookup_elem(&active_accepts, &id);
+
+    if (!args || ctx->ret < 0) {
         bpf_map_delete_elem(&active_accepts, &id);
         return 0;
     }
@@ -550,41 +653,30 @@ static __always_inline int process_exit_accept(struct args_exit *ctx, const char
         return 0;
     }
 
+    event->event_type = EV_NET;
     __builtin_memcpy(event->syscall, syscall_name, sys_len);
     event->ret = ctx->ret;
     // New File Descriptor
-    event->fd = ctx->ret; 
+    event->fd = ctx->ret;
 
-    // Read the now-populated sockaddr struct
-    struct sockaddr *addr = *addr_ptr;
-    u16 family = 0;
-    bpf_probe_read_user(&family, sizeof(family), addr);
-    event->sa_family = family;
+    // Use copied sockaddr data
+    event->sa_family = args->sa_family;
 
     struct socket_data_t sock_data = {};
-    sock_data.sa_family = family;
+    sock_data.sa_family = args->sa_family;
 
-    if (family == 2) { // AF_INET
-        struct sockaddr_in in_addr = {};
-        bpf_probe_read_user(&in_addr, sizeof(in_addr), addr);
-        event->src_ip = bpf_ntohl(in_addr.sin_addr.s_addr);
-        event->src_port = bpf_ntohs(in_addr.sin_port);
-        
-        sock_data.dest_ip = event->src_ip; // For the accepted socket, remote is "dest" in our socket_map logic usually?
-        // Actually, let's keep it consistent: accept() receives a connection FROM a source.
-        // But for future read/write correlation, we want to know the remote peer.
-        // In socket_map, we usually store the REMOTE IP as dest_ip for client sockets.
-        // For server sockets, the remote IP is also the one we want to track.
-        sock_data.dest_ip = event->src_ip; 
-        sock_data.dest_port = event->src_port;
-    } else if (family == 10) { // AF_INET6
-        struct sockaddr_in6 in6_addr = {};
-        bpf_probe_read_user(&in6_addr, sizeof(in6_addr), addr);
-        event->src_port = bpf_ntohs(in6_addr.sin6_port);
-        bpf_probe_read_user(&event->src_ipv6, sizeof(event->src_ipv6), &in6_addr.sin6_addr);
-        
-        sock_data.dest_port = event->src_port;
-        __builtin_memcpy(sock_data.dest_ipv6, event->src_ipv6, sizeof(sock_data.dest_ipv6));
+    if (args->sa_family == 2) { // AF_INET
+        event->src_ip = args->ipv4;
+        event->src_port = args->port;
+
+        sock_data.dest_ip = args->ipv4;
+        sock_data.dest_port = args->port;
+    } else if (args->sa_family == 10) { // AF_INET6
+        event->src_port = args->port;
+        __builtin_memcpy(event->src_ipv6, args->ipv6, sizeof(event->src_ipv6));
+
+        sock_data.dest_port = args->port;
+        __builtin_memcpy(sock_data.dest_ipv6, args->ipv6, sizeof(sock_data.dest_ipv6));
     }
 
     // Update socket_map with the NEW FD (ctx->ret) so future I/O is correlated
@@ -610,7 +702,7 @@ SEC("tp/syscalls/sys_enter_sendto")
 int sys_enter_sendto(struct args_sendto *ctx) {
     u64 id = bpf_get_current_pid_tgid();
     struct enter_data_t data = {};
-    data.flags = ctx->fd;
+    data.fd = ctx->fd;
     data.count = ctx->len;
     bpf_map_update_elem(&write_data, &id, &data, BPF_ANY);
     return 0;
@@ -625,8 +717,9 @@ int sys_exit_sendto(struct args_exit *ctx) {
 
     struct so_event *event = init_event();
     if (event) {
+        event->event_type = EV_NET;
         __builtin_memcpy(event->syscall, "sendto", 7);
-        event->fd = data->flags;
+        event->fd = data->fd;
         event->count = data->count;
         event->bytes_rw = ctx->ret;
         event->ret = ctx->ret;
@@ -650,7 +743,7 @@ SEC("tp/syscalls/sys_enter_recvfrom")
 int sys_enter_recvfrom(struct args_recvfrom *ctx) {
     u64 id = bpf_get_current_pid_tgid();
     struct enter_data_t data = {};
-    data.flags = ctx->fd;
+    data.fd = ctx->fd;
     data.count = ctx->size;
     bpf_map_update_elem(&read_data, &id, &data, BPF_ANY);
     return 0;
@@ -665,8 +758,9 @@ int sys_exit_recvfrom(struct args_exit *ctx) {
 
     struct so_event *event = init_event();
     if (event) {
+        event->event_type = EV_NET;
         __builtin_memcpy(event->syscall, "recvfrom", 9);
-        event->fd = data->flags;
+        event->fd = data->fd;
         event->count = data->count;
         event->bytes_rw = ctx->ret;
         event->ret = ctx->ret;
@@ -690,6 +784,7 @@ SEC("tp/syscalls/sys_enter_clone")
 int sys_enter_clone(void *ctx) {
     struct so_event *event = init_event();
     if (!event) return 0;
+    event->event_type = EV_PROC;
     __builtin_memcpy(event->syscall, "clone", 6);
     submit(ctx, event);
     return 0;
@@ -699,6 +794,7 @@ SEC("tp/syscalls/sys_enter_clone3")
 int sys_enter_clone3(void *ctx) {
     struct so_event *event = init_event();
     if (!event) return 0;
+    event->event_type = EV_PROC;
     __builtin_memcpy(event->syscall, "clone3", 7);
     submit(ctx, event);
     return 0;

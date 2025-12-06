@@ -36,6 +36,7 @@ type AuditEvent struct {
 	Filename         string `json:"filename"`
 	Fd               int64  `json:"fd"`
 	Ret              int64  `json:"ret"`
+	EventType        string `json:"event_type,omitempty"`
 	Error            string `json:"error,omitempty"`
 	ErrorCode        int64  `json:"error_code,omitempty"`
 
@@ -55,6 +56,16 @@ type AuditEvent struct {
 	BytesRW int64  `json:"bytes_rw,omitempty"`
 }
 
+// RuntimeMetrics tracks performance metrics
+type RuntimeMetrics struct {
+	EventsReceived   uint64
+	EventsIndexed    uint64
+	LostSamples      uint64
+	IndexingFailures uint64
+	ChannelDrops     uint64
+	mu               sync.Mutex
+}
+
 // EBPFCollector handles eBPF program loading and event processing
 type EBPFCollector struct {
 	cfg         Config
@@ -65,6 +76,9 @@ type EBPFCollector struct {
 	links       []link.Link
 	perfReader  *perf.Reader
 	stopChan    chan struct{}
+	eventsChan  chan AuditEvent
+	indexerWg   sync.WaitGroup
+	metrics     RuntimeMetrics
 }
 
 // NewEBPFCollector creates a new eBPF collector instance
@@ -74,6 +88,7 @@ func NewEBPFCollector(cfg Config, outputFile *os.File, bulkIndexer esutil.BulkIn
 		outputFile:  outputFile,
 		bulkIndexer: bulkIndexer,
 		stopChan:    make(chan struct{}),
+		eventsChan:  make(chan AuditEvent, 2048),
 	}
 
 	// Remove memlock limit
@@ -95,6 +110,11 @@ func NewEBPFCollector(cfg Config, outputFile *os.File, bulkIndexer esutil.BulkIn
 	// Populate whitelist rules
 	if err := collector.populateWhitelist(); err != nil {
 		log.Printf("[!] Warning: Failed to populate eBPF whitelist: %v", err)
+	}
+
+	// Populate ignored process names
+	if err := collector.populateIgnoredComms(); err != nil {
+		log.Printf("[!] Warning: Failed to populate ignored comms: %v", err)
 	}
 
 	// Create perf reader with larger buffer to prevent drops during high activity
@@ -157,6 +177,29 @@ func (ec *EBPFCollector) populateWhitelist() error {
 	return nil
 }
 
+// populateIgnoredComms populates the eBPF ignored_comms map with default process names to ignore
+func (ec *EBPFCollector) populateIgnoredComms() error {
+	// Default list of process names to ignore
+	ignoredComms := []string{
+		"ebpf-exporter",
+		"system-monitor",
+	}
+
+	for _, comm := range ignoredComms {
+		// Create key (64-byte array)
+		var key [64]byte
+		copy(key[:], comm)
+		value := uint8(1)
+
+		if err := ec.objs.IgnoredComms.Put(&key, &value); err != nil {
+			return fmt.Errorf("failed to add ignored comm %s: %v", comm, err)
+		}
+		fmt.Printf("[+] eBPF filter: Ignoring process '%s'\n", comm)
+	}
+
+	return nil
+}
+
 // attachTracepoints attaches all eBPF programs to kernel tracepoints
 func (ec *EBPFCollector) attachTracepoints() error {
 	attach := func(group, name string, prog *ebpf.Program) error {
@@ -174,41 +217,91 @@ func (ec *EBPFCollector) attachTracepoints() error {
 	}
 
 	// OPEN
-	attach("syscalls", "sys_enter_openat", ec.objs.SysEnterOpenat)
-	attach("syscalls", "sys_exit_openat", ec.objs.SysExitOpenat)
-	attach("syscalls", "sys_enter_openat2", ec.objs.SysEnterOpenat2)
-	attach("syscalls", "sys_exit_openat2", ec.objs.SysExitOpenat2)
+	if err := attach("syscalls", "sys_enter_openat", ec.objs.SysEnterOpenat); err != nil {
+		return err
+	}
+	if err := attach("syscalls", "sys_exit_openat", ec.objs.SysExitOpenat); err != nil {
+		return err
+	}
+	if err := attach("syscalls", "sys_enter_openat2", ec.objs.SysEnterOpenat2); err != nil {
+		return err
+	}
+	if err := attach("syscalls", "sys_exit_openat2", ec.objs.SysExitOpenat2); err != nil {
+		return err
+	}
 
 	// WRITE
-	attach("syscalls", "sys_enter_write", ec.objs.SysEnterWrite)
-	attach("syscalls", "sys_exit_write", ec.objs.SysExitWrite)
+	if err := attach("syscalls", "sys_enter_write", ec.objs.SysEnterWrite); err != nil {
+		return err
+	}
+	if err := attach("syscalls", "sys_exit_write", ec.objs.SysExitWrite); err != nil {
+		return err
+	}
 
 	// READ
-	attach("syscalls", "sys_enter_read", ec.objs.SysEnterRead)
-	attach("syscalls", "sys_exit_read", ec.objs.SysExitRead)
+	if err := attach("syscalls", "sys_enter_read", ec.objs.SysEnterRead); err != nil {
+		return err
+	}
+	if err := attach("syscalls", "sys_exit_read", ec.objs.SysExitRead); err != nil {
+		return err
+	}
 
 	// CLONE
-	attach("syscalls", "sys_enter_clone", ec.objs.SysEnterClone)
-	attach("syscalls", "sys_enter_clone3", ec.objs.SysEnterClone3)
+	if err := attach("syscalls", "sys_enter_clone", ec.objs.SysEnterClone); err != nil {
+		return err
+	}
+	if err := attach("syscalls", "sys_enter_clone3", ec.objs.SysEnterClone3); err != nil {
+		return err
+	}
 
 	// OTHERS
-	attach("syscalls", "sys_enter_unlinkat", ec.objs.SysEnterUnlinkat)
-	attach("syscalls", "sys_enter_vfork", ec.objs.SysEnterVfork)
+	if err := attach("syscalls", "sys_enter_unlinkat", ec.objs.SysEnterUnlinkat); err != nil {
+		return err
+	}
+	if err := attach("syscalls", "sys_enter_vfork", ec.objs.SysEnterVfork); err != nil {
+		return err
+	}
 
 	// NETWORK SYSCALLS (Enhanced)
-	attach("syscalls", "sys_enter_socket", ec.objs.SysEnterSocket)
-	attach("syscalls", "sys_enter_connect", ec.objs.SysEnterConnect)
-	attach("syscalls", "sys_exit_connect", ec.objs.SysExitConnect)
-	attach("syscalls", "sys_enter_bind", ec.objs.SysEnterBind)
-	attach("syscalls", "sys_enter_listen", ec.objs.SysEnterListen)
-	attach("syscalls", "sys_enter_accept", ec.objs.SysEnterAccept)
-	attach("syscalls", "sys_exit_accept", ec.objs.SysExitAccept)
-	attach("syscalls", "sys_enter_accept4", ec.objs.SysEnterAccept4)
-	attach("syscalls", "sys_exit_accept4", ec.objs.SysExitAccept4)
-	attach("syscalls", "sys_enter_sendto", ec.objs.SysEnterSendto)
-	attach("syscalls", "sys_exit_sendto", ec.objs.SysExitSendto)
-	attach("syscalls", "sys_enter_recvfrom", ec.objs.SysEnterRecvfrom)
-	attach("syscalls", "sys_exit_recvfrom", ec.objs.SysExitRecvfrom)
+	if err := attach("syscalls", "sys_enter_socket", ec.objs.SysEnterSocket); err != nil {
+		return err
+	}
+	if err := attach("syscalls", "sys_enter_connect", ec.objs.SysEnterConnect); err != nil {
+		return err
+	}
+	if err := attach("syscalls", "sys_exit_connect", ec.objs.SysExitConnect); err != nil {
+		return err
+	}
+	if err := attach("syscalls", "sys_enter_bind", ec.objs.SysEnterBind); err != nil {
+		return err
+	}
+	if err := attach("syscalls", "sys_enter_listen", ec.objs.SysEnterListen); err != nil {
+		return err
+	}
+	if err := attach("syscalls", "sys_enter_accept", ec.objs.SysEnterAccept); err != nil {
+		return err
+	}
+	if err := attach("syscalls", "sys_exit_accept", ec.objs.SysExitAccept); err != nil {
+		return err
+	}
+	if err := attach("syscalls", "sys_enter_accept4", ec.objs.SysEnterAccept4); err != nil {
+		return err
+	}
+	if err := attach("syscalls", "sys_exit_accept4", ec.objs.SysExitAccept4); err != nil {
+		return err
+	}
+	if err := attach("syscalls", "sys_enter_sendto", ec.objs.SysEnterSendto); err != nil {
+		return err
+	}
+	if err := attach("syscalls", "sys_exit_sendto", ec.objs.SysExitSendto); err != nil {
+		return err
+	}
+	if err := attach("syscalls", "sys_enter_recvfrom", ec.objs.SysEnterRecvfrom); err != nil {
+		return err
+	}
+	if err := attach("syscalls", "sys_exit_recvfrom", ec.objs.SysExitRecvfrom); err != nil {
+		return err
+	}
 
 	fmt.Printf("[+] eBPF monitoring started with %d probes active.\n", len(ec.links))
 	return nil
@@ -216,13 +309,25 @@ func (ec *EBPFCollector) attachTracepoints() error {
 
 // Start begins processing eBPF events
 func (ec *EBPFCollector) Start() error {
+	// Start indexer goroutine
+	ec.indexerWg.Add(1)
+	go ec.indexerWorker()
+
+	// Start metrics reporter
+	go ec.reportMetrics()
+
+	// Read from perf buffer and push to channel
 	for {
 		select {
 		case <-ec.stopChan:
+			close(ec.eventsChan)
+			ec.indexerWg.Wait()
 			return nil
 		default:
-			if err := ec.processEvent(); err != nil {
+			if err := ec.readPerfEvent(); err != nil {
 				if errors.Is(err, perf.ErrClosed) {
+					close(ec.eventsChan)
+					ec.indexerWg.Wait()
 					return nil
 				}
 				log.Printf("[!] eBPF event processing error: %v", err)
@@ -231,14 +336,79 @@ func (ec *EBPFCollector) Start() error {
 	}
 }
 
-// processEvent reads and processes a single event from the perf buffer
-func (ec *EBPFCollector) processEvent() error {
+// reportMetrics periodically logs runtime metrics
+func (ec *EBPFCollector) reportMetrics() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ec.stopChan:
+			return
+		case <-ticker.C:
+			ec.metrics.mu.Lock()
+			log.Printf("[*] Metrics: Received=%d Indexed=%d Lost=%d IndexFail=%d ChanDrops=%d",
+				ec.metrics.EventsReceived,
+				ec.metrics.EventsIndexed,
+				ec.metrics.LostSamples,
+				ec.metrics.IndexingFailures,
+				ec.metrics.ChannelDrops)
+			ec.metrics.mu.Unlock()
+		}
+	}
+}
+
+// indexerWorker consumes events from channel and indexes them
+func (ec *EBPFCollector) indexerWorker() {
+	defer ec.indexerWg.Done()
+
+	for evt := range ec.eventsChan {
+		// Write to file
+		if ec.cfg.EBPFConfig.FileLoggingEnabled && ec.outputFile != nil {
+			jsonBytes, _ := json.Marshal(evt)
+			ec.fileLock.Lock()
+			ec.outputFile.Write(jsonBytes)
+			ec.outputFile.WriteString("\n")
+			ec.fileLock.Unlock()
+		}
+
+		// Write to Elasticsearch
+		if ec.bulkIndexer != nil {
+			jsonBytes, _ := json.Marshal(evt)
+			err := ec.bulkIndexer.Add(context.Background(), esutil.BulkIndexerItem{
+				Action: "index",
+				Body:   bytes.NewReader(jsonBytes),
+				OnFailure: func(ctx context.Context, item esutil.BulkIndexerItem, res esutil.BulkIndexerResponseItem, err error) {
+					ec.metrics.mu.Lock()
+					ec.metrics.IndexingFailures++
+					ec.metrics.mu.Unlock()
+					if err != nil {
+						log.Printf("ES Index Error: %v", err)
+					} else {
+						log.Printf("ES Item Error: [%d] %s", res.Status, res.Error.Reason)
+					}
+				},
+			})
+			if err == nil {
+				ec.metrics.mu.Lock()
+				ec.metrics.EventsIndexed++
+				ec.metrics.mu.Unlock()
+			}
+		}
+	}
+}
+
+// readPerfEvent reads a single event from the perf buffer and pushes to channel
+func (ec *EBPFCollector) readPerfEvent() error {
 	record, err := ec.perfReader.Read()
 	if err != nil {
 		return err
 	}
 
 	if record.LostSamples > 0 {
+		ec.metrics.mu.Lock()
+		ec.metrics.LostSamples += record.LostSamples
+		ec.metrics.mu.Unlock()
 		log.Printf("[!] Buffer full: dropped %d events", record.LostSamples)
 		return nil
 	}
@@ -251,29 +421,18 @@ func (ec *EBPFCollector) processEvent() error {
 	raw := *(*bpfSoEvent)(unsafe.Pointer(&record.RawSample[0]))
 	evt := ec.parseEvent(&raw)
 
-	// Write to file
-	if ec.cfg.EBPFConfig.FileLoggingEnabled && ec.outputFile != nil {
-		jsonBytes, _ := json.Marshal(evt)
-		ec.fileLock.Lock()
-		ec.outputFile.Write(jsonBytes)
-		ec.outputFile.WriteString("\n")
-		ec.fileLock.Unlock()
-	}
+	ec.metrics.mu.Lock()
+	ec.metrics.EventsReceived++
+	ec.metrics.mu.Unlock()
 
-	// Write to Elasticsearch
-	if ec.bulkIndexer != nil {
-		jsonBytes, _ := json.Marshal(evt)
-		ec.bulkIndexer.Add(context.Background(), esutil.BulkIndexerItem{
-			Action: "index",
-			Body:   bytes.NewReader(jsonBytes),
-			OnFailure: func(ctx context.Context, item esutil.BulkIndexerItem, res esutil.BulkIndexerResponseItem, err error) {
-				if err != nil {
-					log.Printf("ES Index Error: %v", err)
-				} else {
-					log.Printf("ES Item Error: [%d] %s", res.Status, res.Error.Reason)
-				}
-			},
-		})
+	// Push to buffered channel (non-blocking)
+	select {
+	case ec.eventsChan <- evt:
+	default:
+		ec.metrics.mu.Lock()
+		ec.metrics.ChannelDrops++
+		ec.metrics.mu.Unlock()
+		log.Printf("[!] Event channel full, dropping event")
 	}
 
 	return nil
@@ -281,11 +440,17 @@ func (ec *EBPFCollector) processEvent() error {
 
 // parseEvent converts raw eBPF event to AuditEvent
 func (ec *EBPFCollector) parseEvent(raw *bpfSoEvent) AuditEvent {
+	// Use kernel monotonic timestamp (bpf_ktime_get_ns) as canonical event time
+	kernelTimeNs := int64(raw.Timestamp)
+
+	// For correlation, also capture userspace processing time
+	userspaceTime := time.Now()
+
 	evt := AuditEvent{
 		Hostname:         ec.cfg.Hostname,
-		TimestampNs:      int64(raw.Timestamp),
-		EpochTimestamp:   time.Now().UnixMilli(),
-		Datetime:         time.Now().UTC().Format(time.RFC3339Nano),
+		TimestampNs:      kernelTimeNs, // Canonical kernel event time
+		EpochTimestamp:   userspaceTime.UnixMilli(),
+		Datetime:         userspaceTime.UTC().Format(time.RFC3339Nano),
 		Pid:              raw.Pid,
 		Ppid:             raw.Ppid,
 		Uid:              raw.Uid,
@@ -297,6 +462,16 @@ func (ec *EBPFCollector) parseEvent(raw *bpfSoEvent) AuditEvent {
 		Ret:              raw.Ret,
 		Protocol:         raw.Protocol,
 		SocketType:       raw.SocketType,
+	}
+
+	// Set event type classification
+	switch raw.EventType {
+	case 1:
+		evt.EventType = "filesystem"
+	case 2:
+		evt.EventType = "network"
+	case 3:
+		evt.EventType = "process"
 	}
 
 	if raw.Ret < 0 {
@@ -334,9 +509,7 @@ func (ec *EBPFCollector) parseEvent(raw *bpfSoEvent) AuditEvent {
 	if evt.Syscall == "write" || evt.Syscall == "read" || evt.Syscall == "sendto" || evt.Syscall == "recvfrom" {
 		evt.Count = raw.Count
 		evt.BytesRW = raw.BytesRw
-		if evt.Fd == 0 {
-			evt.Fd = int64(raw.Flags)
-		}
+		// FD is now properly set from the BPF event, no hack needed
 	}
 
 	return evt
@@ -372,16 +545,26 @@ func int8ToStr(bs []int8) string {
 	return string(b)
 }
 
+// parseIPv4 converts a uint32 IP address to string in correct byte order
 func parseIPv4(ip uint32) string {
-	return fmt.Sprintf("%d.%d.%d.%d", byte(ip>>24), byte(ip>>16), byte(ip>>8), byte(ip))
+	// IP is stored in host byte order (big-endian network order)
+	return fmt.Sprintf("%d.%d.%d.%d",
+		byte(ip>>24),
+		byte(ip>>16),
+		byte(ip>>8),
+		byte(ip))
 }
 
+// parseIPv6 converts IPv6 address parts to formatted string
 func parseIPv6(parts [4]uint32) string {
 	buf := new(bytes.Buffer)
 	for _, p := range parts {
+		// Write in network byte order (big-endian)
 		binary.Write(buf, binary.BigEndian, p)
 	}
-	return net.IP(buf.Bytes()).String()
+	ip := net.IP(buf.Bytes())
+	// Use net.IP.String() for proper IPv6 formatting with :: compression
+	return ip.String()
 }
 
 func getErrno(ret int64) (string, int64) {
