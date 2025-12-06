@@ -88,7 +88,7 @@ func NewEBPFCollector(cfg Config, outputFile *os.File, bulkIndexer esutil.BulkIn
 		outputFile:  outputFile,
 		bulkIndexer: bulkIndexer,
 		stopChan:    make(chan struct{}),
-		eventsChan:  make(chan AuditEvent, 2048),
+		eventsChan:  make(chan AuditEvent, 50000),
 	}
 
 	// Remove memlock limit
@@ -309,9 +309,12 @@ func (ec *EBPFCollector) attachTracepoints() error {
 
 // Start begins processing eBPF events
 func (ec *EBPFCollector) Start() error {
-	// Start indexer goroutine
-	ec.indexerWg.Add(1)
-	go ec.indexerWorker()
+	// Start multiple indexer goroutines for parallel processing
+	numWorkers := 4
+	for i := 0; i < numWorkers; i++ {
+		ec.indexerWg.Add(1)
+		go ec.indexerWorker()
+	}
 
 	// Start metrics reporter
 	go ec.reportMetrics()
