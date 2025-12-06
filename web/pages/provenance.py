@@ -207,13 +207,17 @@ with tab1:
             "Select Analysis Strategy",
             options=[
                 "Standard",
-                "BEEP Edge Grouping"
+                "HOLMES Backward Slicing",
+                "BEEP Edge Grouping",
+                "Both HOLMES & BEEP"
             ],
             index=0,
             help="Select a research-based algorithm to reduce graph noise."
         )
 
+        use_holmes = "HOLMES" in analysis_mode
         use_beep = "BEEP" in analysis_mode
+        use_both = "Both" in analysis_mode
 
     if st.button("🔍 Analyze & Build Graph", type="primary", use_container_width=True):
         if not target_comm and not target_pid:
@@ -247,8 +251,15 @@ with tab1:
                         cmd.extend(["--prune", "--degree-threshold", str(5)])
                     if disable_filtering:
                         cmd.append("--no-filter")
+
+                    # Research algorithms
+                    if use_holmes:
+                        cmd.append("--holmes")
                     if use_beep:
                         cmd.append("--beep")
+                    if use_both:
+                        cmd.append("--both")
+
                     if target_pid:
                         cmd.extend(["--pid", target_pid])
                     elif target_comm:

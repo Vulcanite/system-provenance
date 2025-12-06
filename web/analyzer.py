@@ -172,6 +172,14 @@ SENSITIVE_FILE_PATTERNS = [
     r'.*/\.git/.*',
 ]
 
+# HOLMES-specific: Files that trigger alerts
+HOLMES_ALERT_PATTERNS = [
+    r'.*/secret/.*',
+    r'.*/attacker/.*',
+    r'.*/\.ssh/.*',
+    r'.*/\.aws/.*',
+]
+
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
@@ -1110,6 +1118,163 @@ class ProvenanceGraph:
 
         return graph
 
+    def compress_structural_nodes(self, graph):
+        """ProvGRP-style Structural Compression"""
+        print("Applying Structural Node Compression (ProvGRP)...")
+
+        changed = True
+        iteration = 0
+
+        while changed and iteration < 5:
+            changed = False
+            iteration += 1
+
+            signatures = defaultdict(list)
+
+            nodes_list = list(graph.nodes(data=True))
+            for node, attrs in nodes_list:
+                if attrs.get('beep_group'):
+                    continue
+
+                in_sig = []
+                for u, _, data in graph.in_edges(node, data=True):
+                    in_sig.append((u, data.get('label', '')))
+                in_sig.sort()
+
+                out_sig = []
+                for _, v, data in graph.out_edges(node, data=True):
+                    out_sig.append((data.get('label', ''), v))
+                out_sig.sort()
+
+                identity = attrs.get('comm') if attrs.get('type') == 'process' else safe_label(str(node))
+                identity_pattern = re.sub(r'\d+', '', identity)
+
+                sig = (attrs.get('type'), tuple(in_sig), tuple(out_sig), identity_pattern)
+                signatures[sig].append(node)
+
+            for sig, nodes in signatures.items():
+                if len(nodes) < 2:
+                    continue
+
+                keep_node = nodes[0]
+                remove_nodes = nodes[1:]
+
+                count = len(nodes)
+                old_label = graph.nodes[keep_node].get('label', str(keep_node))
+
+                node_names = [str(n) for n in nodes]
+                pattern_name = detect_file_pattern(node_names)
+
+                if pattern_name:
+                    new_label = f"{pattern_name}"
+                else:
+                    clean_label = old_label.split('\n')[0]
+                    new_label = f"{clean_label} [×{count}]"
+
+                graph.nodes[keep_node]['label'] = new_label
+                graph.nodes[keep_node]['count'] = count
+                graph.nodes[keep_node]['shape'] = 'folder'
+
+                graph.remove_nodes_from(remove_nodes)
+                changed = True
+
+        print(f"[+] Structural compression finished after {iteration} iterations")
+        return graph
+
+    def holmes_backward_slice(self, graph, enable_forward=True):
+        """HOLMES-style backward slicing"""
+        print(f"Applying HOLMES backward slicing (Enhanced)...")
+
+        if graph.number_of_nodes() == 0:
+            return graph
+
+        alert_nodes = set()
+
+        for node, attrs in graph.nodes(data=True):
+            node_type = attrs.get('type', '')
+
+            if node_type == 'process':
+                for successor in graph.successors(node):
+                    edge_data = graph.get_edge_data(node, successor)
+                    if isinstance(edge_data, dict):
+                        labels = [d.get('label') for d in edge_data.values()] if 0 in edge_data else [edge_data.get('label')]
+
+                        if 'deleted' in labels or 'unlink' in str(labels):
+                            alert_nodes.add(node)
+                            print(f"[!] Alert: {attrs.get('comm', node)} deleted a file (Cleanup detection)")
+
+            if node_type == 'file':
+                filepath = str(node)
+                for pattern in HOLMES_ALERT_PATTERNS:
+                    if re.search(pattern, filepath):
+                        for pred in graph.predecessors(node):
+                            if graph.nodes[pred].get('type') == 'process':
+                                alert_nodes.add(pred)
+                                print(f"[!] Alert: {graph.nodes[pred].get('comm', pred)} accessed {filepath}")
+
+            if node_type == 'network':
+                for pred in graph.predecessors(node):
+                    if graph.nodes[pred].get('type') == 'process':
+                        comm = graph.nodes[pred].get('comm', '')
+                        if comm not in ['nginx', 'apache2', 'httpd']:
+                            alert_nodes.add(pred)
+                            print(f"[!] Alert: {comm} made network connection")
+
+        if not alert_nodes:
+            print(f"[+] No sensitive operations detected, keeping full graph")
+            return graph
+
+        print(f"[+] Found {len(alert_nodes)} alert nodes")
+
+        causal_ancestors = set()
+        for alert in alert_nodes:
+            try:
+                ancestors = nx.ancestors(graph, alert)
+                causal_ancestors.update(ancestors)
+            except nx.NetworkXError:
+                pass
+
+        print(f"[+] Backward slice: {len(causal_ancestors)} ancestor nodes")
+
+        consequences = set()
+        if enable_forward:
+            for alert in alert_nodes:
+                try:
+                    descendants = nx.descendants(graph, alert)
+                    consequences.update(descendants)
+                except nx.NetworkXError:
+                    pass
+            print(f"[+] Forward slice: {len(consequences)} descendant nodes")
+
+        siblings = set()
+        for ancestor in causal_ancestors:
+            if graph.nodes[ancestor].get('type') == 'process':
+                children = graph.successors(ancestor)
+                siblings.update(children)
+
+        print(f"[+] Sibling expansion: Added {len(siblings)} context nodes")
+
+        keep_nodes = alert_nodes | causal_ancestors | consequences | siblings
+
+        for node, attrs in graph.nodes(data=True):
+            node_type = attrs.get('type', '')
+            if node_type == 'file':
+                filepath = str(node)
+                for pattern in HOLMES_ALERT_PATTERNS:
+                    if re.search(pattern, filepath):
+                        keep_nodes.add(node)
+            elif node_type == 'network':
+                keep_nodes.add(node)
+
+        all_nodes = set(graph.nodes())
+        remove_nodes = all_nodes - keep_nodes
+
+        if remove_nodes:
+            print(f"[-] HOLMES: Removing {len(remove_nodes)} non-causal nodes")
+            graph.remove_nodes_from(remove_nodes)
+
+        return graph
+
     def filter_temporal_window(self, graph, attack_start_time, window_hours=1):
         """Remove processes outside temporal window"""
         print(f"Filtering processes outside {window_hours}h window from attack start...")
@@ -1289,6 +1454,9 @@ def main():
     parser.add_argument("--beep-window", type=int, default=2000, help="BEEP time window in ms")
     parser.add_argument("--beep-threshold", type=int, default=3, help="BEEP minimum group size")
     parser.add_argument("--no-event-compression", action="store_true", help="Disable BEEP event-level compression")
+    parser.add_argument("--holmes", action="store_true", help="Enable HOLMES backward slicing")
+    parser.add_argument("--both", action="store_true", help="Uses both HOLMES backward slicing and BEEP edge grouping")
+    parser.add_argument("--holmes-forward", action="store_true", default=True, help="HOLMES: trace forward from alerts")
     parser.add_argument("--cli-only", action="store_true", help="CLI mode: display summary in terminal")
 
     args = parser.parse_args()
@@ -1358,17 +1526,36 @@ def main():
         attack_subgraph = analyzer.remove_low_value_nodes(attack_subgraph, [target_procs[0]])
         attack_subgraph = analyzer.filter_temporal_window(attack_subgraph, args.start, window_hours=1)
 
-        if args.prune:
-            attack_subgraph = analyzer.prune_high_degree_files(
+        if args.holmes:
+            attack_subgraph = analyzer.holmes_backward_slice(
                 attack_subgraph,
-                degree_threshold=args.degree_threshold
+                enable_forward=args.holmes_forward
             )
+            attack_subgraph = analyzer.compress_structural_nodes(attack_subgraph)
 
         if args.beep:
             attack_subgraph = analyzer.beep_edge_grouping(
                 attack_subgraph,
                 time_window_ms=args.beep_window,
                 min_group_size=args.beep_threshold
+            )
+
+        if args.both:
+            attack_subgraph = analyzer.holmes_backward_slice(
+                attack_subgraph,
+                enable_forward=args.holmes_forward
+            )
+            attack_subgraph = analyzer.compress_structural_nodes(attack_subgraph)
+            attack_subgraph = analyzer.beep_edge_grouping(
+                attack_subgraph,
+                time_window_ms=args.beep_window,
+                min_group_size=args.beep_threshold
+            )
+
+        if args.prune:
+            attack_subgraph = analyzer.prune_high_degree_files(
+                attack_subgraph,
+                degree_threshold=args.degree_threshold
             )
 
         attack_subgraph = analyzer.remove_benign_only_subgraphs(attack_subgraph)
