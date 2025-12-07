@@ -27,7 +27,7 @@ st.markdown("### Build Attack Provenance Graphs with AI-Powered Analysis")
 config = load_config()
 es_config = config.get("es_config", {})
 ebpf_index = es_config.get("ebpf_index", "ebpf-events")
-output_dir = config.get("output_dir", ".")
+output_dir = os.path.abspath(config.get("output_dir", "."))
 
 # Ensure output directory exists
 os.makedirs(output_dir, exist_ok=True)
@@ -37,73 +37,88 @@ es = connect_elasticsearch(es_config)
 
 ANALYZER_SCRIPT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "analyzer.py")
 
+def fetch_hostnames(es, index):
+    """Return list of unique hostnames from eBPF events."""
+    try:
+        body = {
+            "size": 0,
+            "aggs": {
+                "unique_hosts": {
+                    "terms": {
+                        "field": "hostname.keyword",
+                        "size": 1000
+                    }
+                }
+            }
+        }
+        result = es.search(index=index, body=body)
+        buckets = result["aggregations"]["unique_hosts"]["buckets"]
+        return [b["key"] for b in buckets]
+    except Exception as e:
+        st.error(f"Failed to fetch hostnames: {e}")
+        return []
+
 def create_interactive_graph(dot_file_path):
-    """Create interactive PyVis graph from DOT file"""
+    """Create interactive PyVis graph from DOT file using safe non-pydot parsing."""
     if not os.path.exists(dot_file_path):
+        st.error(f"DOT file not found: {dot_file_path}")
         return None
 
     try:
-        pydot_graphs = pydot.graph_from_dot_file(dot_file_path)
-        if not pydot_graphs:
-            return None
+        # ---- SAFE PARSING: networkx directly ----
+        graph = nx.drawing.nx_pydot.read_dot(dot_file_path)
+        graph = nx.DiGraph(graph)
 
-        graph = nx.DiGraph(nx.nx_pydot.from_pydot(pydot_graphs[0]))
-        net = Network(height="750px", width="100%", bgcolor="#222222", font_color="white", directed=True)
+        net = Network(
+            height="750px",
+            width="100%",
+            bgcolor="#222222",
+            font_color="white",
+            directed=True
+        )
+
         net.set_options("""
         {
           "nodes": {"font": {"size": 14}},
-          "edges": {"color": {"inherit": true}, "smooth": {"type": "continuous"}, "arrows": {"to": {"enabled": true, "scaleFactor": 0.5}}},
-          "physics": {"enabled": true, "stabilization": {"iterations": 200}, "barnesHut": {"gravitationalConstant": -8000, "centralGravity": 0.3, "springLength": 150, "springConstant": 0.04}},
-          "interaction": {"hover": true, "tooltipDelay": 100, "navigationButtons": true, "keyboard": true}
+          "edges": {"color": {"inherit": true},
+                    "smooth": {"type": "continuous"},
+                    "arrows": {"to": {"enabled": true, "scaleFactor": 0.5}}},
+          "physics": {"enabled": true,
+                      "stabilization": {"iterations": 200},
+                      "barnesHut": {"gravitationalConstant": -8000,
+                                    "centralGravity": 0.3,
+                                    "springLength": 150,
+                                    "springConstant": 0.04}},
+          "interaction": {"hover": true,
+                          "tooltipDelay": 100,
+                          "navigationButtons": true,
+                          "keyboard": true}
         }
         """)
 
-        for node_id in graph.nodes():
-            node_attrs = graph.nodes[node_id]
-
-            label = node_attrs.get('label', node_id).strip('"').replace('\\n', '\n')
-
-            fillcolor = node_attrs.get('fillcolor', 'lightblue').strip('"')
-            shape = node_attrs.get('shape', 'box').strip('"')
-
-            shape_map = {'box': 'box', 'note': 'box', 'diamond': 'diamond', 'ellipse': 'ellipse'}
-            pyvis_shape = shape_map.get(shape, 'box')
-
-            # Color mapping
-            color_map = {
-                'lightblue': '#40A8D1',    # Process (suspicious)
-                '#40A8D1': '#40A8D1',
-                '#AAAAAA': '#888888',      # Process (benign)
-                'red': '#D14040',          # Sensitive file
-                '#D14040': '#D14040',
-                'orange': '#D18C40',       # Downloads/tmp
-                '#D18C40': '#D18C40',
-                'yellow': '#D1D140',
-                '#D1D140': '#D1D140',
-                'lightgray': '#CCCCCC',    # Normal file
-                '#CCCCCC': '#CCCCCC',
-                'pink': '#FF69B4',         # Network
-                '#FF69B4': '#FF69B4',
-                '#A8D1A0': '#A8D1A0'       # Network (green)
-            }
-            color = color_map.get(fillcolor, fillcolor)
-
-            penwidth = node_attrs.get('penwidth', '1.0').strip('"')
-            is_focus = float(penwidth) > 2.0
-
-            tooltip = node_attrs.get('tooltip', label).strip('"').replace('\\n', '\n')
+        # ---- Add nodes ----
+        for node_id, attrs in graph.nodes(data=True):
+            label = str(attrs.get("label", node_id)).strip('"').replace("\\n", "\n")
+            tooltip = label
+            fillcolor = str(attrs.get("fillcolor", "#CCCCCC")).strip('"')
+            shape = attrs.get("shape", "box")
 
             net.add_node(
-                node_id, label=label, title=tooltip, color=color, shape=pyvis_shape,
-                size=30 if is_focus else 20, borderWidth=4 if is_focus else 2, borderWidthSelected=6
+                node_id,
+                label=label,
+                title=tooltip,
+                color=fillcolor,
+                shape=shape,
+                size=18
             )
 
-        for u, v in graph.edges():
-            edge_attrs = graph.edges[u, v]
-            edge_label = edge_attrs.get('label', '').strip('"')
-            edge_color = edge_attrs.get('color', 'gray').strip('"')
-            tooltip = edge_attrs.get('tooltip', edge_label).strip('"')
-            net.add_edge(u, v, label=edge_label, title=tooltip, color=edge_color)
+        # ---- Add edges ----
+        for u, v, attrs in graph.edges(data=True):
+            label = attrs.get("label", "").strip('"')
+            tooltip = label
+            color = attrs.get("color", "gray").strip('"')
+
+            net.add_edge(u, v, label=label, title=tooltip, color=color)
 
         return net
 
@@ -147,6 +162,75 @@ def parse_analyzer_stats(stdout_text):
 
     return stats
 
+
+def parse_mitre_from_summary(summary_text):
+    """Parse MITRE ATT&CK techniques from the text summary produced by analyzer.py.
+
+    Returns a list of dicts with keys: tid, tactic, name, description, evidence[]
+    """
+    if not summary_text:
+        return []
+
+    techniques = []
+    current = None
+    in_section = False
+
+    for raw_line in summary_text.splitlines():
+        line = raw_line.rstrip()
+
+        # Enter section
+        if line.startswith("=== MITRE ATT&CK TECHNIQUE INFERENCE"):
+            in_section = True
+            continue
+
+        if not in_section:
+            continue
+
+        # Section ends when chronological events start
+        if line.startswith("=== CHRONOLOGICAL EVENTS"):
+            break
+
+        if not line.strip():
+            continue
+
+        # Technique line: "- T1059 | Execution | Command and Scripting Interpreter"
+        if line.startswith("- "):
+            body = line[2:]
+            parts = [p.strip() for p in body.split("|")]
+            tid = parts[0] if len(parts) > 0 else ""
+            tactic = parts[1] if len(parts) > 1 else ""
+            name = parts[2] if len(parts) > 2 else ""
+
+            if current:
+                techniques.append(current)
+
+            current = {
+                "tid": tid,
+                "tactic": tactic,
+                "name": name,
+                "description": "",
+                "evidence": [],
+            }
+            continue
+
+        # Description line
+        if line.strip().startswith("Description:") and current:
+            current["description"] = line.split("Description:", 1)[1].strip()
+            continue
+
+        # Evidence lines: "    * something"
+        stripped = line.lstrip()
+        if current and (stripped.startswith("* ") or stripped.startswith("- ") or stripped.startswith("• ")):
+            ev = stripped[1:].strip() if stripped[1:].strip() else stripped.strip()
+            if ev:
+                current["evidence"].append(ev)
+
+    if current:
+        techniques.append(current)
+
+    return techniques
+
+
 # Sidebar - Time Range
 st.sidebar.header("📅 Time Range")
 preset = st.sidebar.selectbox("Quick Select", ["Last 1 Hour", "Last 24 Hours", "Today", "Custom"])
@@ -186,6 +270,20 @@ tab1, tab2 = st.tabs(["📊 Graph Generation", "🤖 AI Analysis"])
 with tab1:
     st.subheader("Build Attack Provenance Graph")
     st.caption("Generate focused provenance graphs with intelligent noise reduction")
+
+    # Fetch hostnames dynamically
+    host_list = fetch_hostnames(es, ebpf_index)
+
+    if not host_list:
+        st.warning("No hostname information found in Elasticsearch.")
+        selected_host = None
+    else:
+        selected_host = st.selectbox(
+            "Select Host / Agent",
+            options=host_list,
+            index=0,
+            help="Choose which agent's events to analyze"
+        )
 
     # Main controls
     col1, col2 = st.columns([1, 1])
@@ -247,6 +345,7 @@ with tab1:
                         "--depth", str(5)
                     ]
 
+                    print(cmd)
                     if prune_noise:
                         cmd.extend(["--prune", "--degree-threshold", str(5)])
                     if disable_filtering:
@@ -265,8 +364,12 @@ with tab1:
                     elif target_comm:
                         cmd.extend(["--comm", target_comm])
 
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                    if selected_host:
+                        cmd.extend(["--host", selected_host])
 
+                    print(cmd)
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                    print(result)
                     st.session_state['analyzer_stdout'] = result.stdout
                     st.session_state['analyzer_stderr'] = result.stderr
                     st.session_state['analyzer_stats'] = parse_analyzer_stats(result.stdout)
@@ -279,7 +382,10 @@ with tab1:
 
                     if os.path.exists(TXT_OUTPUT):
                         with open(TXT_OUTPUT, 'r') as f:
-                            st.session_state['text_summary'] = f.read()
+                            summary_text = f.read()
+                        st.session_state['text_summary'] = summary_text
+                        # Parse MITRE ATT&CK techniques for UI display
+                        st.session_state['mitre_techniques'] = parse_mitre_from_summary(summary_text)
 
                 except subprocess.TimeoutExpired:
                     st.error("⏱️ Analysis timed out (>5 minutes). Try reducing the time range or graph depth.")
@@ -312,6 +418,22 @@ with tab1:
         with col4:
             st.metric("Graph Edges", f"{stats['edges']}")
 
+        # MITRE ATT&CK inference summary
+        if st.session_state.get('mitre_techniques'):
+            st.markdown("### 🧬 MITRE ATT&CK Techniques Detected")
+            mitre_list = st.session_state['mitre_techniques']
+            for tech in mitre_list:
+                with st.expander(f"{tech['tid']} • {tech['tactic']} • {tech['name']}", expanded=False):
+                    if tech.get('description'):
+                        st.markdown(f"**Description:** {tech['description']}")
+                    if tech.get('evidence'):
+                        st.markdown("**Evidence:**")
+                        for ev in tech['evidence']:
+                            st.markdown(f"- {ev}")
+        else:
+            st.markdown("### 🧬 MITRE ATT&CK Techniques Detected")
+            st.caption("No strong MITRE ATT&CK patterns were identified in this graph.")
+
     # Display graph if available
     if st.session_state.get('dot_file_path'):
         st.markdown("---")
@@ -326,32 +448,57 @@ with tab1:
         dot_file = st.session_state['dot_file_path']
         interactive_graph = create_interactive_graph(dot_file)
         if interactive_graph:
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False) as f:
-                interactive_graph.save_graph(f.name)
-                with open(f.name, 'r', encoding='utf-8') as html_file:
-                    source_code = html_file.read()
-                components.html(source_code, height=800, scrolling=True)
-                os.unlink(f.name)
+            try:
+                # Always normalize the output directory
+                output_dir = os.path.abspath(output_dir)
+                os.makedirs(output_dir, exist_ok=True)
 
-            # PNG export option
+                # PyVis cannot write to a full path; must use simple filenames.
+                try:
+                    temp_html_name = "provenance_graph_temp.html"
+
+                    # Step 1: Write HTML to current working directory
+                    interactive_graph.write_html(temp_html_name)
+
+                    # Step 2: Move it to the correct output directory
+                    final_html_path = os.path.join(output_dir, "provenance_graph.html")
+                    final_html_path = os.path.abspath(final_html_path)
+                    os.makedirs(output_dir, exist_ok=True)
+
+                    os.replace(temp_html_name, final_html_path)
+
+                    # Step 3: Load into Streamlit
+                    with open(final_html_path, "r", encoding="utf-8") as f:
+                        components.html(f.read(), height=800, scrolling=True)
+
+                except Exception as e:
+                    st.error(f"Failed to render interactive graph: {e}")
+
+            except Exception as e:
+                st.error(f"Failed to render interactive graph: {e}")
+
+            # PNG EXPORT
             png_file = dot_file.replace(".dot", ".png")
             try:
                 if not os.path.exists(png_file):
-                    subprocess.run(["dot", "-Tpng", dot_file, "-o", png_file],
-                                    check=True, timeout=30, capture_output=True)
+                    subprocess.run(
+                        ["dot", "-Tpng", dot_file, "-o", png_file],
+                        check=True,
+                        timeout=60,
+                        capture_output=True
+                    )
 
                 if os.path.exists(png_file):
-                    with open(png_file, 'rb') as f:
+                    with open(png_file, "rb") as f:
                         st.download_button(
                             label="📥 Download PNG Image",
                             data=f.read(),
                             file_name=os.path.basename(png_file),
                             mime="image/png"
                         )
+
             except Exception as e:
                 st.warning(f"PNG generation unavailable: {e}")
-        else:
-            st.error("Failed to create interactive graph.")
 
         # Text summary
         if 'text_summary' in st.session_state:
@@ -467,6 +614,13 @@ Based on the logs, provide your analysis."""
                     st.metric("Nodes", stats['nodes'])
                 with col4:
                     st.metric("Edges", stats['edges'])
+
+            # MITRE ATT&CK techniques (parsed from summary)
+            if st.session_state.get('mitre_techniques'):
+                mitre_list = st.session_state['mitre_techniques']
+                st.markdown("#### 🧬 MITRE ATT&CK Techniques")
+                for tech in mitre_list:
+                    st.markdown(f"- **{tech['tid']}** ({tech['tactic']}) – {tech['name']}")
 
             if 'text_summary' in st.session_state:
                 summary = st.session_state['text_summary']

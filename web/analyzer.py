@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # analyzer.py - Enhanced Provenance Graph Analyzer with Generalized Context-Aware Filtering
-# Performs querying, building, filtering, and exporting provenance graphs from Elasticsearch-stored events.
+# Performs querying, building, filtering, ATT&CK inference, and exporting provenance graphs from Elasticsearch-stored events.
 
 import argparse
 import json
@@ -11,7 +11,7 @@ import networkx as nx
 from elasticsearch import Elasticsearch
 from datetime import datetime, timedelta
 import re
-from networkx.drawing.nx_pydot import write_dot
+import traceback
 
 TIME_WINDOW_MS = 2000  # 2 seconds for burst detection
 
@@ -33,7 +33,7 @@ NOISE_CATEGORIES = {
         'syscalls': ['connect'],
         'sensitivity': 'low',
     },
-    
+
     'system_logging': {
         'processes': [r'^systemd-journal.*', r'^rsyslog.*', r'^auditd.*'],
         'files': [
@@ -45,7 +45,7 @@ NOISE_CATEGORIES = {
         'syscalls': ['openat', 'read', 'write'],
         'sensitivity': 'low',
     },
-    
+
     'package_management': {
         'processes': [r'^dpkg.*', r'^apt.*', r'^yum.*', r'^dnf.*'],
         'files': [
@@ -55,7 +55,7 @@ NOISE_CATEGORIES = {
         ],
         'sensitivity': 'low',
     },
-    
+
     'shared_libraries': {
         'files': [
             r'^(/usr/lib|/lib|/usr/lib64|/lib64).*\.so(\.\d+)*$',
@@ -64,7 +64,7 @@ NOISE_CATEGORIES = {
         'syscalls': ['openat', 'read'],
         'sensitivity': 'medium',
     },
-    
+
     'locale_fonts': {
         'files': [
             r'^/usr/share/(locale|icons|themes|fonts)/.*',
@@ -73,7 +73,7 @@ NOISE_CATEGORIES = {
         ],
         'sensitivity': 'low',
     },
-    
+
     'temp_build_artifacts': {
         'files': [
             r'/tmp/cc.*\.(s|o|res|ld|le)$',
@@ -82,7 +82,7 @@ NOISE_CATEGORIES = {
         ],
         'sensitivity': 'low',
     },
-    
+
     'kernel_pseudo_fs': {
         'files': [
             r'^/proc/.*',
@@ -91,7 +91,7 @@ NOISE_CATEGORIES = {
         ],
         'sensitivity': 'low',
     },
-    
+
     'terminal_pager': {
         'processes': [r'^less$', r'^more$', r'^pager$'],
         'files': [
@@ -100,7 +100,7 @@ NOISE_CATEGORIES = {
         ],
         'sensitivity': 'low',
     },
-    
+
     'desktop_environment': {
         'processes': [r'^gnome-.*', r'^kde-.*', r'^update-.*'],
         'files': [
@@ -110,7 +110,7 @@ NOISE_CATEGORIES = {
         ],
         'sensitivity': 'low',
     },
-    
+
     'system_utilities': {
         'processes': [r'^systemctl$', r'^basename$', r'^sed$', r'^service$', r'^apport$'],
         'sensitivity': 'medium',
@@ -148,7 +148,7 @@ BENIGN_PROCESS_PATTERNS = [
     r'^migration.*',
     r'^ksoftirqd.*',
     r'^watchdog.*',
-    r'^cpuhp.*',
+    r'^cpuhp_.*',
     r'^kdevtmpfs.*',
     r'^netns.*',
     r'^kthreadd.*',
@@ -180,6 +180,76 @@ HOLMES_ALERT_PATTERNS = [
     r'.*/\.aws/.*',
 ]
 
+HOLMES_TTPS = {
+    "UNTRUSTED_EXEC": {
+        "name": "Untrusted Code Execution",
+        "stage": "Initial Compromise",
+        "severity": 3,
+        "description": "Execution of binaries/scripts from untrusted locations such as /tmp or user downloads."
+    },
+    "SENSITIVE_READ": {
+        "name": "Sensitive File Read",
+        "stage": "Complete Mission",
+        "severity": 3,
+        "description": "Process reads files that look sensitive (credentials, secrets, keys, etc.)."
+    },
+    "PRIV_ESC_WRITE": {
+        "name": "Privilege-Escalation Write",
+        "stage": "Privilege Escalation",
+        "severity": 4,
+        "description": "Process writes to critical auth/identity/boot files (sudoers, pam, cron, etc.)."
+    },
+    "C2_COMMUNICATION": {
+        "name": "Outbound C2/Command Channel",
+        "stage": "Establish Foothold",
+        "severity": 2,
+        "description": "Suspicious outbound network connection to non-local address."
+    },
+    "DATA_EXFIL": {
+        "name": "Sensitive Data Exfiltration",
+        "stage": "Exfiltration",
+        "severity": 5,
+        "description": "Combination of sensitive reads and outbound communication by the same process."
+    },
+}
+
+# ============================================================================
+# MITRE ATT&CK TECHNIQUE DEFINITIONS (high-level, heuristic)
+# ============================================================================
+
+MITRE_TECHNIQUES = {
+    "T1059": {
+        "name": "Command and Scripting Interpreter",
+        "tactic": "Execution",
+        "description": "Use of shells or scripting engines (bash, python, powershell, etc.) to execute commands."
+    },
+    "T1003": {
+        "name": "OS Credential Dumping",
+        "tactic": "Credential Access",
+        "description": "Access to sensitive credential stores like /etc/shadow or similar."
+    },
+    "T1053": {
+        "name": "Scheduled Task/Job",
+        "tactic": "Persistence",
+        "description": "Modifying cron or scheduled task configurations for persistence."
+    },
+    "T1037": {
+        "name": "Boot or Logon Initialization Scripts",
+        "tactic": "Persistence",
+        "description": "Writing to shell init scripts (e.g., .bashrc) or system init files."
+    },
+    "T1041": {
+        "name": "Exfiltration Over C2 Channel",
+        "tactic": "Exfiltration",
+        "description": "Sensitive data read followed by outbound network connections, potentially exfiltration."
+    },
+    "T1083": {
+        "name": "File and Directory Discovery",
+        "tactic": "Discovery",
+        "description": "Extensive file reads across many locations, indicative of discovery or staging."
+    }
+}
+
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
@@ -188,19 +258,19 @@ def canonicalize_filename(name: str) -> str:
     """Canonicalize filenames to detect patterns"""
     if not name:
         return name
-    
+
     basename = name.split('/')[-1]
-    
+
     if re.match(r'^program\d+$', basename):
         return "program<NUM>"
-    
+
     if re.match(r'^tmp\w+$', basename):
         return "tmp<TMP>"
-    
+
     m = re.match(r'^([A-Za-z_\-]+)\d+$', basename)
     if m:
         return f"{m.group(1)}<NUM>"
-    
+
     return basename
 
 
@@ -208,7 +278,7 @@ def beep_key(event):
     """Create grouping key for BEEP compression"""
     filename = event.get("filename", "")
     canonical = canonicalize_filename(filename)
-    
+
     return (
         event.get("ppid"),
         event.get("syscall"),
@@ -219,17 +289,17 @@ def beep_key(event):
 def beep_compress_events(events, time_window_ms=TIME_WINDOW_MS):
     """BEEP event-level compression with multi-burst handling"""
     print(f"[BEEP] Compressing events (window={time_window_ms}ms)...")
-    
+
     events_sorted = sorted(events, key=lambda e: e.get("timestamp_ms", 0))
     clusters = defaultdict(list)
-    
+
     for event in events_sorted:
         key = beep_key(event)
         ts = event.get("timestamp_ms", 0)
-        
+
         if clusters[key]:
             last_burst = clusters[key][-1]
-            
+
             if ts - last_burst["end"] <= time_window_ms:
                 last_burst["end"] = ts
                 last_burst["count"] += 1
@@ -248,12 +318,12 @@ def beep_compress_events(events, time_window_ms=TIME_WINDOW_MS):
                 "count": 1,
                 "events": [event]
             })
-    
+
     compressed_events = []
-    
+
     for key, bursts in clusters.items():
         ppid, syscall, canonical_target = key
-        
+
         for burst_idx, burst in enumerate(bursts):
             compressed_events.append({
                 "ppid": ppid,
@@ -265,14 +335,14 @@ def beep_compress_events(events, time_window_ms=TIME_WINDOW_MS):
                 "burst_id": burst_idx,
                 "events": burst["events"]
             })
-    
+
     original_count = len(events)
     compressed_count = len(compressed_events)
-    
+
     if original_count > 0:
-        reduction_pct = (1 - compressed_count/original_count) * 100
+        reduction_pct = (1 - compressed_count / original_count) * 100
         print(f"[+] Event compression: {original_count} → {compressed_count} events ({reduction_pct:.1f}% reduction)")
-    
+
     return compressed_events
 
 
@@ -343,29 +413,35 @@ def detect_file_pattern(filenames):
 class ProvenanceGraph:
     def __init__(self, es_config):
         self.graph = nx.DiGraph()
-        self.processes = {} 
-        self.process_comm = {}   
-        self.pid_start_time = {} 
-        self.fd_map = defaultdict(dict) 
+        self.processes = {}
+        self.process_comm = {}
+        self.pid_start_time = {}
+        self.fd_map = defaultdict(dict)
         self.es = self._connect_es(es_config)
         self.es_index = es_config.get('es_index', 'ebpf-events')
-        
+
         # Enhanced tracking
         self.file_access_count = Counter()
         self.process_file_bytes = defaultdict(lambda: defaultdict(int))
         self.filtered_events = 0
         self.total_events = 0
-        
+        self._path_factor_cache = {}
+
         # BEEP tracking
         self.beep_clusters = []
         self.event_compression_enabled = True
-        
+
         # Attack context (generalized)
         self.attack_context = {
             'suspicious_processes': set(),
             'sensitive_files': set(),
             'suspicious_ips': set(),
         }
+
+        # MITRE ATT&CK inference results
+        self.mitre_techniques = {}
+        self.holmes_hsg = None              # nx.DiGraph of TTP nodes
+        self.holmes_hsg_components = []
 
     def _connect_es(self, es_config):
         es_host = es_config.get("es_host", "localhost")
@@ -377,11 +453,11 @@ class ProvenanceGraph:
         host = f"http://{es_host}:{es_port}"
         if is_ssl_enabled:
             host = f"https://{es_host}:{es_port}"
-        
+
         es = Elasticsearch(
             [host],
             basic_auth=(es_user, es_pass),
-            verify_certs=False, ssl_show_warn=False, 
+            verify_certs=False, ssl_show_warn=False,
             request_timeout=30
         )
 
@@ -390,10 +466,22 @@ class ProvenanceGraph:
 
         return es
 
-    def load_events(self, start_ns, end_ns):
+    def load_events(self, start_ns, end_ns, hostname=None):
+        must_filters = [
+            {"range": {"epoch_timestamp": {"gte": start_ns, "lte": end_ns}}}
+        ]
+
+        # Hostname filter (if present)
+        if hostname:
+            must_filters.append({"term": {"hostname.keyword": hostname}})
+
         query = {
             "size": 10000,
-            "query": {"range": {"epoch_timestamp": {"gte": start_ns, "lte": end_ns}}},
+            "query": {
+                "bool": {
+                    "must": must_filters
+                }
+            },
             "sort": [{"timestamp_ns": {"order": "asc"}}]
         }
 
@@ -402,15 +490,15 @@ class ProvenanceGraph:
             sid = response['_scroll_id']
             scroll_size = len(response['hits']['hits'])
             events = [hit['_source'] for hit in response['hits']['hits']]
-            
+
             while scroll_size > 0:
                 response = self.es.scroll(scroll_id=sid, scroll='2m')
                 sid = response['_scroll_id']
                 scroll_size = len(response['hits']['hits'])
                 events.extend([hit['_source'] for hit in response['hits']['hits']])
-                if len(events) >= 50000: 
+                if len(events) >= 50000:
                     print("[!] Limit reached (50k events)")
-                    break 
+                    break
 
             self.es.clear_scroll(scroll_id=sid)
             print(f"[+] Loaded {len(events)} total events.")
@@ -420,13 +508,17 @@ class ProvenanceGraph:
             print(f"[!] ES Query Failed: {e}", file=sys.stderr)
             return []
 
+    # ------------------------------------------------------------------------
+    # ATTACK INDICATOR AND NOISE FILTERING
+    # ------------------------------------------------------------------------
+
     def detect_attack_indicators(self, events):
         """
         Automatically detect suspicious activity in the dataset.
         Runs BEFORE filtering to identify attack context.
         """
         print("Detecting attack indicators...")
-        
+
         # Track process behavior
         process_stats = defaultdict(lambda: {
             'file_ops': 0,
@@ -436,57 +528,57 @@ class ProvenanceGraph:
             'file_deletes': 0,
             'unique_files': set(),
         })
-        
+
         for event in events:
             pid = str(event['pid'])
             syscall = event['syscall']
-            
+
             if syscall in ['openat', 'read', 'write']:
                 process_stats[pid]['file_ops'] += 1
                 filename = event.get('filename', '')
                 if filename:
                     process_stats[pid]['unique_files'].add(filename)
-            
+
             if syscall == 'write':
                 process_stats[pid]['file_writes'] += 1
-            
+
             if syscall == 'unlinkat':
                 process_stats[pid]['file_deletes'] += 1
-            
+
             if syscall == 'connect':
                 process_stats[pid]['net_connections'] += 1
-            
+
             if syscall == 'execve':
                 ppid = str(event.get('ppid'))
                 process_stats[ppid]['child_processes'] += 1
-        
+
         # Mark suspicious processes based on behavior
         for pid, stats in process_stats.items():
             suspicious = False
-            
+
             # High file write activity
             if stats['file_writes'] > 5:
                 suspicious = True
-            
+
             # Multiple network connections
             if stats['net_connections'] > 3:
                 suspicious = True
-            
+
             # Spawns many children
             if stats['child_processes'] > 10:
                 suspicious = True
-            
+
             # File deletion activity
             if stats['file_deletes'] > 3:
                 suspicious = True
-            
+
             # Accesses many unique files
             if len(stats['unique_files']) > 20:
                 suspicious = True
-            
+
             if suspicious:
                 self.attack_context['suspicious_processes'].add(pid)
-        
+
         # Find files accessed by suspicious processes
         file_access = defaultdict(set)
         for event in events:
@@ -494,25 +586,25 @@ class ProvenanceGraph:
                 filename = event.get('filename', '')
                 if filename:
                     file_access[filename].add(str(event['pid']))
-        
+
         for filename, pids in file_access.items():
             if pids & self.attack_context['suspicious_processes']:
                 self.attack_context['sensitive_files'].add(filename)
-        
+
         # Detect suspicious network activity
         for event in events:
             if event['syscall'] == 'connect':
                 dest_ip = event.get('dest_ip', '')
                 dest_port = event.get('dest_port', 0)
-                
+
                 # Non-standard ports or external IPs
                 if dest_port not in [22, 80, 443, 0]:
                     self.attack_context['suspicious_ips'].add(f"{dest_ip}:{dest_port}")
-                
+
                 # Even standard ports if from suspicious process
                 if str(event['pid']) in self.attack_context['suspicious_processes']:
                     self.attack_context['suspicious_ips'].add(f"{dest_ip}:{dest_port}")
-        
+
         print(f"[+] Found {len(self.attack_context['suspicious_processes'])} suspicious processes")
         print(f"[+] Found {len(self.attack_context['sensitive_files'])} potentially sensitive files")
         print(f"[+] Found {len(self.attack_context['suspicious_ips'])} suspicious connections")
@@ -523,11 +615,11 @@ class ProvenanceGraph:
         filename = event.get('filename', '')
         comm = event.get('comm', '')
         pid = str(event['pid'])
-        
+
         for category, rules in NOISE_CATEGORIES.items():
             sensitivity = rules.get('sensitivity', 'medium')
             sensitivity_rules = SENSITIVITY_LEVELS[sensitivity]
-            
+
             # Check process patterns
             if 'processes' in rules:
                 for pattern in rules['processes']:
@@ -535,14 +627,14 @@ class ProvenanceGraph:
                         # Don't filter if process is in attack context
                         if pid in self.attack_context['suspicious_processes']:
                             return False
-                        
+
                         # Apply sensitivity rules
                         if syscall == 'read' and sensitivity_rules['filter_reads']:
                             return True
                         if syscall in ['openat', 'read'] and filename:
                             if any(re.match(fp, filename) for fp in rules.get('files', [])):
                                 return True
-            
+
             # Check file patterns
             if 'files' in rules and filename:
                 for pattern in rules['files']:
@@ -550,39 +642,43 @@ class ProvenanceGraph:
                         # Don't filter if file is in attack context
                         if filename in self.attack_context['sensitive_files']:
                             return False
-                        
+
                         # Apply sensitivity rules
                         if syscall == 'read' and sensitivity_rules['filter_reads']:
                             return True
                         if syscall == 'openat':
                             return True
-        
+
         return False
 
     def _should_filter_event(self, event):
         """Generalized event filtering using categories and context"""
         syscall = event['syscall']
         filename = event.get('filename', '')
-        
+
         # NEVER filter critical syscalls
         if syscall in ['execve', 'unlinkat']:
             return False
-        
+
         # NEVER filter writes (data exfiltration/modification indicator)
         if syscall == 'write':
             return False
-        
+
         # NEVER filter sensitive file access
         if filename:
             for pattern in SENSITIVE_FILE_PATTERNS:
                 if re.search(pattern, filename):
                     return False
-        
+
         # Check if event is in noise category
         if self.is_noise_category(event):
             return True
-        
+
         return False
+
+    # ------------------------------------------------------------------------
+    # GRAPH CONSTRUCTION
+    # ------------------------------------------------------------------------
 
     def _get_or_create_node(self, node_id, **attrs):
         if not self.graph.has_node(node_id):
@@ -595,24 +691,24 @@ class ProvenanceGraph:
             self.pid_start_time[pid] = timestamp_ms
             self.process_comm[pid] = comm
             self._get_or_create_node(
-                proc_node_id, 
-                label=f"{comm}\n(PID: {pid})", 
-                type="process", 
-                comm=comm, 
+                proc_node_id,
+                label=f"{comm}\n(PID: {pid})",
+                type="process",
+                comm=comm,
                 pid=pid,
                 benign=is_benign_process(comm)
             )
-            
+
             if ppid in self.processes:
                 parent_node_id = self.processes[ppid]
                 self.graph.add_edge(
-                    parent_node_id, 
-                    proc_node_id, 
-                    label="spawned", 
-                    time=datetime.fromtimestamp(timestamp_ms/1000).isoformat(),
+                    parent_node_id,
+                    proc_node_id,
+                    label="spawned",
+                    time=datetime.fromtimestamp(timestamp_ms / 1000).isoformat(),
                     edge_type="control"
                 )
-        
+
         proc_node_id = self.processes[pid]
         if self.process_comm.get(pid) != comm:
             self.process_comm[pid] = comm
@@ -628,42 +724,42 @@ class ProvenanceGraph:
                 found_procs.append(node_id)
         return found_procs
 
-    def build_graph(self, events, enable_filtering=True, enable_event_compression=True):
+    def build_graph(self, events, enable_filtering=True, enable_event_compression=False):
         print(f"Building provenance graph (filtering={'enabled' if enable_filtering else 'disabled'})...")
-        
+
         self.total_events = len(events)
         self.event_compression_enabled = enable_event_compression
-        
+
         # STEP 1: Detect attack context
         if enable_filtering:
             self.detect_attack_indicators(events)
-        
-        # STEP 2: Event compression
+
+        # STEP 2: Event compression (cluster metadata only)
         if enable_event_compression:
             self.beep_clusters = beep_compress_events(events, TIME_WINDOW_MS)
             print(f"Processing {len(self.beep_clusters)} event clusters...")
-        
+
         # STEP 3: Build graph with context-aware filtering
         for event in events:
             if enable_filtering and self._should_filter_event(event):
                 self.filtered_events += 1
                 continue
-            
+
             pid = str(event['pid'])
             ppid = str(event['ppid'])
             comm = event.get('comm', 'unknown').split('\x00', 1)[0].strip()
             syscall = event['syscall']
-            
+
             if 'timestamp_ns' in event:
                 timestamp_ms = event['timestamp_ns'] // 1000000
             else:
                 timestamp_ms = event.get('timestamp_ms', 0)
-            
+
             if syscall == 'execve' and event.get('filename'):
                 new_comm = event['filename'].split('/')[-1]
-                if new_comm: 
+                if new_comm:
                     comm = new_comm
-            
+
             proc_node_id = self._get_process_node(pid, ppid, comm, timestamp_ms)
 
             if syscall == 'execve':
@@ -685,7 +781,7 @@ class ProvenanceGraph:
                     time=event['datetime'],
                     edge_type="control"
                 )
-            
+
             elif syscall == 'openat':
                 fd = event.get('fd', -1)
                 if fd >= 0:
@@ -710,7 +806,7 @@ class ProvenanceGraph:
                         time=event['datetime'],
                         edge_type="data"
                     )
-            
+
             elif syscall == 'read':
                 fd = event.get('fd', -1)
                 if fd in self.fd_map[pid]:
@@ -718,16 +814,16 @@ class ProvenanceGraph:
                     ret_bytes = event.get('ret', 0)
                     if ret_bytes > 0:
                         self.process_file_bytes[pid][file_node] += ret_bytes
-                    
+
                     self.graph.add_edge(
-                        file_node, 
-                        proc_node_id, 
-                        label="read", 
+                        file_node,
+                        proc_node_id,
+                        label="read",
                         time=event['datetime'],
                         edge_type="data",
                         bytes=ret_bytes
                     )
-            
+
             elif syscall == 'write':
                 fd = event.get('fd', -1)
                 if fd in self.fd_map[pid]:
@@ -735,16 +831,16 @@ class ProvenanceGraph:
                     ret_bytes = event.get('ret', 0)
                     if ret_bytes > 0:
                         self.process_file_bytes[pid][file_node] += ret_bytes
-                    
+
                     self.graph.add_edge(
-                        proc_node_id, 
-                        file_node, 
-                        label="write", 
+                        proc_node_id,
+                        file_node,
+                        label="write",
                         time=event['datetime'],
                         edge_type="data",
                         bytes=ret_bytes
                     )
-            
+
             elif syscall == 'unlinkat':
                 file_node = event.get('filename', '')
                 if not file_node or not file_node.strip():
@@ -764,7 +860,7 @@ class ProvenanceGraph:
                     time=event['datetime'],
                     edge_type="data"
                 )
-            
+
             elif syscall == 'connect':
                 dest_ip = event.get('dest_ip', 'unknown_ip')
                 dest_port = event.get('dest_port', 0)
@@ -793,31 +889,190 @@ class ProvenanceGraph:
                     time=event['datetime'],
                     edge_type="network"
                 )
-        
+
         filtered_pct = (self.filtered_events / self.total_events * 100) if self.total_events > 0 else 0
         print(f"[+] Graph built: {self.graph.number_of_nodes()} nodes, {self.graph.number_of_edges()} edges")
         print(f"[+] Filtered {self.filtered_events}/{self.total_events} events ({filtered_pct:.1f}% reduction)")
 
-    def calculate_path_factor(self, source_node, target_node):
-        """Calculate path factor between nodes"""
+    # ------------------------------------------------------------------------
+    # ATT&CK TECHNIQUE INFERENCE
+    # ------------------------------------------------------------------------
+
+    def infer_mitre_techniques(self, graph):
+        """
+        Infer high-level MITRE ATT&CK techniques based on the final attack subgraph.
+        Heuristic, but good enough to guide the AI + human.
+        """
+        techniques = {tid: {"info": MITRE_TECHNIQUES[tid], "evidence": []}
+                      for tid in MITRE_TECHNIQUES.keys()}
+
+        # Helper to record evidence
+        def add_evidence(tid, text):
+            if tid in techniques:
+                techniques[tid]["evidence"].append(text)
+
+        # Precompute some lookup helpers
+        sensitive_files = []
+        for node, attrs in graph.nodes(data=True):
+            if attrs.get("type") == "file":
+                filepath = str(node)
+                for pat in SENSITIVE_FILE_PATTERNS:
+                    if re.search(pat, filepath):
+                        sensitive_files.append(node)
+                        break
+
+        # Map processes → whether they touch sensitive files and whether they talk to network
+        proc_sensitive = defaultdict(bool)
+        proc_network = defaultdict(bool)
+        proc_file_read_counts = defaultdict(int)
+
+        for u, v, data in graph.edges(data=True):
+            label = data.get("label", "")
+            u_type = graph.nodes[u].get("type", "")
+            v_type = graph.nodes[v].get("type", "")
+
+            # File reads and writes
+            if label == "read" and u_type == "file" and v_type == "process":
+                pid = graph.nodes[v].get("pid")
+                proc_file_read_counts[pid] += 1
+                if u in sensitive_files:
+                    proc_sensitive[pid] = True
+
+            if label == "connect" and u_type == "process" and v_type == "network":
+                pid = graph.nodes[u].get("pid")
+                proc_network[pid] = True
+
+        # 1) Process-based detections
+        for node, attrs in graph.nodes(data=True):
+            if attrs.get("type") != "process":
+                continue
+
+            comm = (attrs.get("comm") or "").lower()
+            label = attrs.get("label", str(node))
+            pid = attrs.get("pid")
+
+            # T1059: Command & Scripting Interpreter
+            if any(x in comm for x in ["bash", "sh", "zsh", "python", "perl", "pwsh", "powershell", "cmd.exe"]):
+                add_evidence(
+                    "T1059",
+                    f"Process {label} appears to be a scripting interpreter ({comm})."
+                )
+
+            # T1083: File and Directory Discovery (lots of reads across files)
+            if proc_file_read_counts.get(pid, 0) > 20:
+                add_evidence(
+                    "T1083",
+                    f"Process {label} performed more than 20 file read operations, suggesting discovery activity."
+                )
+
+        # 2) File-based detections
+        for node, attrs in graph.nodes(data=True):
+            if attrs.get("type") != "file":
+                continue
+
+            filepath = str(node)
+            label = attrs.get("label", safe_label(filepath))
+
+            # T1003: OS Credential Dumping
+            if re.search(r'/etc/shadow', filepath) or re.search(r'/etc/passwd', filepath):
+                # Check for any process that read this file
+                readers = []
+                for u, v, data in graph.edges(node, data=True):
+                    if data.get("label") == "read" and graph.nodes[v].get("type") == "process":
+                        readers.append(graph.nodes[v].get("label", v))
+                if readers:
+                    add_evidence(
+                        "T1003",
+                        f"Credential file {filepath} was read by: {', '.join(readers)}."
+                    )
+
+            # T1053 / T1037: cron/systemd/autostart/rc scripts
+            if re.search(r'/etc/cron\.', filepath) or \
+               re.search(r'/var/spool/cron', filepath) or \
+               re.search(r'/etc/systemd/system', filepath) or \
+               re.search(r'\.bashrc$', filepath) or \
+               re.search(r'\.profile$', filepath):
+                writers = []
+                for u, v, data in graph.in_edges(node, data=True):
+                    if data.get("label") == "write" and graph.nodes[u].get("type") == "process":
+                        writers.append(graph.nodes[u].get("label", u))
+
+                if writers:
+                    # cron/systemd
+                    if re.search(r'/etc/cron\.|/var/spool/cron|/etc/systemd/system', filepath):
+                        add_evidence(
+                            "T1053",
+                            f"File {filepath} (cron/systemd) was modified by: {', '.join(writers)}."
+                        )
+                    # shell init scripts
+                    if re.search(r'\.bashrc$|\.profile$', filepath):
+                        add_evidence(
+                            "T1037",
+                            f"Shell init file {filepath} was modified by: {', '.join(writers)}."
+                        )
+
+        # 3) Exfiltration: sensitive reads + network
+        for node, attrs in graph.nodes(data=True):
+            if attrs.get("type") != "process":
+                continue
+            pid = attrs.get("pid")
+            label = attrs.get("label", node)
+
+            if proc_sensitive.get(pid) and proc_network.get(pid):
+                add_evidence(
+                    "T1041",
+                    f"Process {label} both accessed sensitive files and made outbound network connections."
+                )
+
+        # Filter out techniques with no evidence
+        self.mitre_techniques = {
+            tid: {
+                "id": tid,
+                "name": t["info"]["name"],
+                "tactic": t["info"]["tactic"],
+                "description": t["info"]["description"],
+                "evidence": t["evidence"]
+            }
+            for tid, t in techniques.items()
+            if t["evidence"]
+        }
+
+        if self.mitre_techniques:
+            print("[+] MITRE ATT&CK inference results:")
+            for tid, info in self.mitre_techniques.items():
+                print(f"    - {tid} {info['tactic']} / {info['name']} ({len(info['evidence'])} evidence items)")
+        else:
+            print("[+] MITRE ATT&CK inference: no strong technique indicators detected in this graph")
+
+    # ------------------------------------------------------------------------
+    # SUBGRAPH & POST-PROCESSING
+    # ------------------------------------------------------------------------
+
+    def calculate_path_factor(self, src, dst):
+        key = (src, dst)
+        if key in self._path_factor_cache:
+            return self._path_factor_cache[key]
+
         try:
-            paths = list(nx.all_simple_paths(self.graph, source_node, target_node, cutoff=5))
-            if not paths:
-                return float('inf')
-            
-            min_cover_size = float('inf')
-            for path in paths:
-                ancestors = set()
-                for node in path:
-                    node_ancestors = nx.ancestors(self.graph, node)
-                    ancestors.update(node_ancestors)
-                
-                cover_size = len(ancestors)
-                min_cover_size = min(min_cover_size, cover_size)
-            
-            return min_cover_size
-        except:
-            return float('inf')
+            pf = nx.shortest_path_length(self.graph, src, dst)
+        except nx.NetworkXNoPath:
+            pf = float("inf")
+
+        self._path_factor_cache[key] = pf
+        return pf
+
+    def calculate_path_factor_subgraph(self, subgraph, src, dst):
+        key = ("sub", id(subgraph), src, dst)   # separate cache entries per-subgraph
+        if key in self._path_factor_cache:
+            return self._path_factor_cache[key]
+
+        try:
+            pf = nx.shortest_path_length(subgraph, src, dst)
+        except nx.NetworkXNoPath:
+            pf = float("inf")
+
+        self._path_factor_cache[key] = pf
+        return pf
 
     def find_processes_by_name(self, comm_name):
         """Find all process nodes matching the given command name"""
@@ -831,23 +1086,23 @@ class ProvenanceGraph:
         """Extract focused subgraph around target nodes"""
         if not target_nodes:
             return nx.DiGraph()
-            
+
         print(f"Extracting subgraph for {target_nodes}. Parents={include_parents}, Children={include_children}")
-        
+
         subgraph_nodes = set(target_nodes)
-        
+
         for node in target_nodes:
-            if not self.graph.has_node(node): 
+            if not self.graph.has_node(node):
                 continue
-            
+
             if include_parents:
                 ancestors = nx.bfs_tree(self.graph, node, reverse=True, depth_limit=max_depth)
                 subgraph_nodes.update(ancestors.nodes())
-            
+
             if include_children:
                 descendants = nx.bfs_tree(self.graph, node, reverse=False, depth_limit=max_depth)
                 subgraph_nodes.update(descendants.nodes())
-        
+
         subgraph = self.graph.subgraph(subgraph_nodes).copy()
         print(f"[+] Subgraph extracted: {subgraph.number_of_nodes()} nodes")
         return subgraph
@@ -858,26 +1113,26 @@ class ProvenanceGraph:
         Uses graph centrality and connectivity metrics.
         """
         print("Removing low-value nodes using graph analysis...")
-        
+
         # Calculate node importance
         try:
             pagerank = nx.pagerank(graph)
         except:
             pagerank = {node: 1.0 for node in graph.nodes()}
-        
+
         nodes_to_remove = []
-        
+
         for node, attrs in graph.nodes(data=True):
             # Never remove target nodes
             if node in target_nodes:
                 continue
-            
+
             node_type = attrs.get('type')
-            
+
             # Calculate importance score
             importance = pagerank.get(node, 0)
             degree = graph.in_degree(node) + graph.out_degree(node)
-            
+
             # Check if node is on path to target
             on_critical_path = False
             for target in target_nodes:
@@ -888,72 +1143,72 @@ class ProvenanceGraph:
                             break
                     except:
                         pass
-            
+
             # Decision criteria (generalized)
             should_remove = False
-            
+
             if node_type == 'file':
                 # Low importance file with low connectivity
                 if importance < 0.001 and degree == 1:
                     # Check if it's NOT a sensitive file
                     if not any(re.search(p, str(node)) for p in SENSITIVE_FILE_PATTERNS):
                         should_remove = True
-            
+
             elif node_type == 'process':
                 # Benign process not on critical path
                 if attrs.get('benign', False) and not on_critical_path:
                     if importance < 0.01 and degree < 3:
                         should_remove = True
-            
+
             elif node_type == 'network':
                 # Network connections on standard ports with low importance
                 dest_port = attrs.get('dest_port', 0)
                 if dest_port in [22, 80, 443] and importance < 0.005:
                     should_remove = True
-            
+
             if should_remove:
                 nodes_to_remove.append(node)
-        
+
         if nodes_to_remove:
             print(f"[-] Removing {len(nodes_to_remove)} low-value nodes")
             graph.remove_nodes_from(nodes_to_remove)
-        
+
         return graph
 
     def prune_high_degree_files(self, graph, degree_threshold=5):
         """Remove high-degree file nodes"""
         print(f"Pruning high-degree files (degree > {degree_threshold})...")
         nodes_to_remove = []
-        
+
         for node, attrs in graph.nodes(data=True):
             if attrs.get('type') == 'file':
                 total_degree = graph.in_degree(node) + graph.out_degree(node)
                 filepath = str(node)
-                
+
                 is_sensitive = any(re.search(p, filepath) for p in SENSITIVE_FILE_PATTERNS)
-                
+
                 if total_degree > degree_threshold and not is_sensitive:
                     nodes_to_remove.append(node)
-        
+
         if nodes_to_remove:
             print(f"[-] Removing {len(nodes_to_remove)} high-degree files")
             for node in nodes_to_remove[:5]:
                 degree = graph.in_degree(node) + graph.out_degree(node)
                 print(f"    - {node} (degree={degree})")
             graph.remove_nodes_from(nodes_to_remove)
-        
+
         return graph
 
     def remove_benign_only_subgraphs(self, graph):
         """Remove disconnected subgraphs with only benign processes"""
         print("Removing benign-only subgraphs...")
-        
+
         if graph.number_of_nodes() == 0:
             return graph
-        
+
         undirected = graph.to_undirected()
         components = list(nx.connected_components(undirected))
-        
+
         nodes_to_remove = []
         for component in components:
             has_malicious = False
@@ -965,14 +1220,14 @@ class ProvenanceGraph:
                 if attrs.get('type') == 'network':
                     has_malicious = True
                     break
-            
+
             if not has_malicious and len(component) < 10:
                 nodes_to_remove.extend(component)
-        
+
         if nodes_to_remove:
             print(f"[-] Removing {len(nodes_to_remove)} nodes from benign-only subgraphs")
             graph.remove_nodes_from(nodes_to_remove)
-        
+
         return graph
 
     def remove_isolated_nodes(self, graph):
@@ -1316,11 +1571,15 @@ class ProvenanceGraph:
             print(f"[!] Temporal filtering failed: {e}")
             return graph
 
+    # ------------------------------------------------------------------------
+    # EXPORTS
+    # ------------------------------------------------------------------------
+
     def export_text_summary(self, graph, filename):
-        """Export human-readable summary"""
-        if not graph: 
+        """Export human-readable summary including inferred ATT&CK techniques"""
+        if not graph:
             return
-        
+
         print(f"Exporting text summary to {filename}...")
         try:
             edges = sorted(graph.edges(data=True), key=lambda x: x[2].get('time', ''))
@@ -1328,113 +1587,152 @@ class ProvenanceGraph:
                 f.write("=== ATTACK PROVENANCE ANALYSIS ===\n\n")
                 f.write(f"Total Nodes: {graph.number_of_nodes()}\n")
                 f.write(f"Total Edges: {graph.number_of_edges()}\n\n")
-                
+
                 proc_count = sum(1 for _, d in graph.nodes(data=True) if d.get('type') == 'process')
                 file_count = sum(1 for _, d in graph.nodes(data=True) if d.get('type') == 'file')
                 net_count = sum(1 for _, d in graph.nodes(data=True) if d.get('type') == 'network')
-                
+
                 f.write(f"Processes: {proc_count}\n")
                 f.write(f"Files: {file_count}\n")
                 f.write(f"Network: {net_count}\n\n")
-                
+
                 if self.beep_clusters:
                     f.write(f"BEEP Event Clusters: {len(self.beep_clusters)}\n")
                     burst_count = sum(1 for c in self.beep_clusters if c['count'] > 1)
                     f.write(f"Multi-event Bursts: {burst_count}\n\n")
-                
+
+                # MITRE ATT&CK section
+                f.write("=== MITRE ATT&CK TECHNIQUE INFERENCE ===\n\n")
+                if self.mitre_techniques:
+                    for tid, info in self.mitre_techniques.items():
+                        f.write(f"- {tid} | {info['tactic']} | {info['name']}\n")
+                        f.write(f"  Description: {info['description']}\n")
+                        for ev in info['evidence']:
+                            f.write(f"    * {ev}\n")
+                        f.write("\n")
+                else:
+                    f.write("No strong MITRE ATT&CK patterns were identified in this graph.\n\n")
+
                 f.write("=== CHRONOLOGICAL EVENTS ===\n\n")
                 for u, v, data in edges:
                     src = graph.nodes[u].get('label', u).replace('\n', ' ')
                     dst = graph.nodes[v].get('label', v).replace('\n', ' ')
                     edge_label = data.get('label', '')
                     timestamp = data.get('time', 'N/A')
-                    
+
                     f.write(f"[{timestamp}] {src} --[{edge_label}]--> {dst}\n")
-            
+
             print(f"[+] Text summary saved")
         except Exception as e:
             print(f"[!] Text export failed: {e}")
 
     def export_to_dot(self, graph, filename, focus_nodes=None):
-        """Export graph to DOT format with visual styling and proper colon quoting"""
-        if not graph: 
-            return
-        
+        """Export cleaned graph to a Graphviz DOT file with SAFE attributes."""
+
         print(f"Exporting to DOT format...")
-        
-        def sanitize_value(val):
-            """Quote strings containing colons for DOT format"""
-            if isinstance(val, str) and ':' in val:
-                if not (val.startswith('"') and val.endswith('"')):
-                    return f'"{val}"'
-            return val
-        
-        export_graph = graph.copy()
-        
-        for node_id in export_graph.nodes():
-            data = export_graph.nodes[node_id]
 
-            if 'label' not in data or not str(data.get('label', '')).strip():
-                if data.get('type') == 'file':
-                    data['label'] = safe_label(str(node_id), 'unnamed_file')
-                else:
-                    data['label'] = str(node_id) if str(node_id).strip() else 'unnamed_node'
-            
-            if data.get('beep_group', False):
-                pass
-            elif data.get('type') == 'process':
-                data['shape'] = 'box'
-                data['style'] = 'filled,rounded'
-                if data.get('benign', False):
-                    data['fillcolor'] = '#AAAAAA'
-                else:
-                    data['fillcolor'] = '#40A8D1'
-            elif data.get('type') == 'network':
-                data['shape'] = 'diamond'
-                data['style'] = 'filled'
-                data['fillcolor'] = '#FF69B4'
-            elif data.get('type') == 'file':
-                data['shape'] = 'note'
-                data['style'] = 'filled'
-                filepath = str(node_id)
-                if any(re.search(p, filepath) for p in SENSITIVE_FILE_PATTERNS):
-                    data['fillcolor'] = '#D14040'
-                elif '/tmp/' in filepath or '/Downloads/' in filepath:
-                    data['fillcolor'] = '#D18C40'
-                else:
-                    data['fillcolor'] = '#CCCCCC'
+        # Allowed for Graphviz
+        GRAPHVIZ_ALLOWED_ATTRS = {
+            "label", "shape", "style", "fillcolor", "color", "penwidth", "tooltip"
+        }
 
-            if focus_nodes and node_id in focus_nodes:
-                data['penwidth'] = '4.0'
-                data['color'] = 'red'
-            else:
-                data['penwidth'] = '1.0'
-                data['color'] = 'black'
-            
-            data['tooltip'] = str(data).replace('"', "'")
-            
-            # Sanitize all node attributes
-            for key, value in list(data.items()):
-                data[key] = sanitize_value(value)
-        
-        # Sanitize all edge attributes
-        for u, v in export_graph.edges():
-            for key, value in list(export_graph.edges[u, v].items()):
-                export_graph.edges[u, v][key] = sanitize_value(value)
-        
-        export_graph.graph['graph'] = {'rankdir': 'LR'}
-        
+        def q(s):
+            """Quote + escape string for DOT."""
+            if s is None:
+                return "\"\""
+            s = str(s).replace('"', '\\"')
+            return f"\"{s}\""
+
         try:
-            write_dot(export_graph, filename)
-            print(f"[+] DOT file saved: {filename}")
-        except Exception as e:
-            print(f"[!] DOT export failed: {e}", file=sys.stderr)
-            raise
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write("digraph G {\n")
+                f.write("  rankdir=LR;\n")
+                f.write("  fontsize=12;\n")
+                f.write("  labelloc=\"top\";\n")
+                for node_id, attrs in graph.nodes(data=True):
+                    styled = {}
+                    ntype = attrs.get("type")
+                    if ntype == "process":
+                        styled["shape"] = "box"
+                        styled["style"] = "filled,rounded"
+                        styled["fillcolor"] = "#AAAAAA" if attrs.get("benign", False) else "#40A8D1"
 
+                    elif ntype == "file":
+                        styled["shape"] = "note"
+                        styled["style"] = "filled"
+                        path = str(node_id)
+                        if any(re.search(p, path) for p in SENSITIVE_FILE_PATTERNS):
+                            styled["fillcolor"] = "#D14040"      # sensitive
+                        elif "/tmp/" in path:
+                            styled["fillcolor"] = "#D18C40"      # tmp files
+                        else:
+                            styled["fillcolor"] = "#CCCCCC"      # normal file
+                    # ---- NETWORK NODES ----
+                    elif ntype == "network":
+                        styled["shape"] = "diamond"
+                        styled["style"] = "filled"
+                        styled["fillcolor"] = "#FF69B4"
+                    # ---- BEEP GROUP / AGGREGATED EVENTS ----
+                    elif attrs.get("beep_group", False):
+                        styled["shape"] = "box3d"
+                        styled["style"] = "filled,bold"
+                        styled["fillcolor"] = "#FFD700"
+                    # -----------------------
+                    # Highlight focus nodes
+                    # -----------------------
+                    if focus_nodes and node_id in focus_nodes:
+                        styled["color"] = "red"
+                        styled["penwidth"] = "4"
+                    else:
+                        styled["color"] = "black"
+                        styled["penwidth"] = "1"
+
+                    label = attrs.get("label", str(node_id))
+                    tooltip = label.replace('"', "'")
+
+                    styled["label"] = label
+                    styled["tooltip"] = tooltip
+
+                    dot_attrs = []
+                    for k, v in styled.items():
+                        if k in GRAPHVIZ_ALLOWED_ATTRS:
+                            dot_attrs.append(f'{k}={q(v)}')
+
+                    f.write(f'  {q(node_id)} [{", ".join(dot_attrs)}];\n')
+
+                for u, v, attrs in graph.edges(data=True):
+                    edge_attrs = {}
+
+                    # label if present
+                    if "label" in attrs:
+                        edge_attrs["label"] = attrs["label"]
+
+                    # tooltip (if timestamp or cause exists)
+                    if "time" in attrs:
+                        edge_attrs["tooltip"] = f"time: {attrs['time']}"
+
+                    # make edges visible
+                    edge_attrs["color"] = "gray"
+
+                    # write clean attributes
+                    dot_attrs = [f'{k}={q(v)}' for k, v in edge_attrs.items()]
+
+                    f.write(f'  {q(u)} -> {q(v)} [{", ".join(dot_attrs)}];\n')
+
+                # -----------------------
+                # FOOTER
+                # -----------------------
+                f.write("}\n")
+
+            print(f"[+] DOT file saved: {filename}")
+
+        except Exception as e:
+            print(f"[!] DOT export failed: {e}")
+            raise
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Enhanced Provenance Graph Analyzer with Generalized Context-Aware Filtering"
+        description="Enhanced Provenance Graph Analyzer with Generalized Context-Aware Filtering + MITRE ATT&CK inference"
     )
 
     parser.add_argument("--comm", type=str, help="Target process name")
@@ -1444,7 +1742,7 @@ def main():
     parser.add_argument("--depth", type=int, default=5, help="Max graph depth")
     parser.add_argument("--out", type=str, default="provenance_attack_0.dot", help="Output DOT file")
     parser.add_argument("--text-out", type=str, default="attack_summary.txt", help="Text summary file")
-    
+
     parser.add_argument("--no-parents", action="store_true", help="Disable ancestor tracing")
     parser.add_argument("--no-children", action="store_true", help="Disable descendant tracing")
     parser.add_argument("--prune", action="store_true", help="Enable high-degree pruning")
@@ -1458,11 +1756,11 @@ def main():
     parser.add_argument("--both", action="store_true", help="Uses both HOLMES backward slicing and BEEP edge grouping")
     parser.add_argument("--holmes-forward", action="store_true", default=True, help="HOLMES: trace forward from alerts")
     parser.add_argument("--cli-only", action="store_true", help="CLI mode: display summary in terminal")
+    parser.add_argument("--host", help="Filter by hostname of agent")
 
     args = parser.parse_args()
-
     try:
-        with open('/var/config.json', 'r') as f:
+        with open('/var/monitoring/config.json', 'r') as f:
             config = json.load(f)
 
     except FileNotFoundError:
@@ -1471,7 +1769,6 @@ def main():
 
     output_dir = config.get('output_dir', '.')
     os.makedirs(output_dir, exist_ok=True)
-
     for f in [args.out, args.out.replace('.dot', '.png'), args.text_out]:
         if os.path.exists(f):
             try:
@@ -1482,14 +1779,14 @@ def main():
     try:
         es_config = config.get("es_config", {})
         analyzer = ProvenanceGraph(es_config)
-        events = analyzer.load_events(args.start, args.end)
-        if not events: 
+        events = analyzer.load_events(args.start, args.end, hostname=args.host)
+        if not events:
             print("[!] No events found", file=sys.stderr)
             sys.exit(1)
-        
+
         # Build with context-aware filtering
         analyzer.build_graph(
-            events, 
+            events,
             enable_filtering=not args.no_filter,
             enable_event_compression=not args.no_event_compression
         )
@@ -1512,16 +1809,16 @@ def main():
         else:
             print("[!] You must specify either --comm or --pid", file=sys.stderr)
             sys.exit(1)
-        
+
         print(f"[+] Found {len(target_procs)} matching processes. Using the first one.")
-        
+
         attack_subgraph = analyzer.get_attack_subgraph(
-            [target_procs[0]], 
+            [target_procs[0]],
             max_depth=args.depth,
             include_parents=not args.no_parents,
             include_children=not args.no_children
         )
-        
+
         # Generalized filtering pipeline
         attack_subgraph = analyzer.remove_low_value_nodes(attack_subgraph, [target_procs[0]])
         attack_subgraph = analyzer.filter_temporal_window(attack_subgraph, args.start, window_hours=1)
@@ -1560,30 +1857,31 @@ def main():
 
         attack_subgraph = analyzer.remove_benign_only_subgraphs(attack_subgraph)
         attack_subgraph = analyzer.remove_isolated_nodes(attack_subgraph)
-        
+
         if attack_subgraph.number_of_nodes() > 0:
+            # Run MITRE ATT&CK inference on final graph
+            analyzer.infer_mitre_techniques(attack_subgraph)
             analyzer.export_to_dot(attack_subgraph, args.out, focus_nodes=[target_procs[0]])
             analyzer.export_text_summary(attack_subgraph, args.text_out)
             print(f"\n[✓] Analysis complete!")
             print(f"[✓] Final graph: {attack_subgraph.number_of_nodes()} nodes, {attack_subgraph.number_of_edges()} edges")
 
             if args.cli_only:
-                print("\n" + "="*80)
+                print("\n" + "=" * 80)
                 print("ATTACK SUMMARY")
-                print("="*80)
+                print("=" * 80)
                 with open(args.text_out, 'r') as f:
                     summary_text = f.read()
                     print(summary_text)
-                print("="*80)
+                print("=" * 80)
                 print(f"\n[i] Graph file: {args.out}")
                 print(f"[i] To visualize: dot -Tpng {args.out} -o graph.png && xdg-open graph.png")
         else:
             print("[!] No attack graph generated (all nodes filtered)")
             sys.exit(1)
-        
+
     except Exception as e:
         print(f"[!] Fatal error observed: {e}", file=sys.stderr)
-        import traceback
         traceback.print_exc()
         sys.exit(1)
 
