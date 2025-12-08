@@ -217,6 +217,10 @@ func (ec *EBPFCollector) attachTracepoints() error {
 		return err
 	}
 
+	if err := attach("syscalls", "sys_exit_execve", ec.objs.SysExitExecve); err != nil {
+		return err
+	}
+
 	// OPEN
 	if err := attach("syscalls", "sys_enter_openat", ec.objs.SysEnterOpenat); err != nil {
 		return err

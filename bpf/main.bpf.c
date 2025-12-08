@@ -143,6 +143,14 @@ struct {
     __type(value, struct socket_data_t);
 } socket_map SEC(".maps");
 
+// Map to track execve arguments between enter and exit
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, u64);
+    __type(value, struct enter_data_t);
+} exec_data SEC(".maps");
+
 // Whitelist rule structure (IP + Port combination)
 struct whitelist_rule {
     u32 ip;      // IPv4 address in network byte order
@@ -332,12 +340,35 @@ struct args_exit { struct trace_entry ent; long int id; long int ret; };
 
 SEC("tp/syscalls/sys_enter_execve")
 int sys_enter_execve(struct args_execve *ctx) {
-    struct so_event *event = init_event();
-    if (!event) return 0;
-    event->event_type = EV_PROC;
-    __builtin_memcpy(event->syscall, "execve", 7);
-    bpf_probe_read_user_str(&event->filename, sizeof(event->filename), ctx->filename);
-    submit(ctx, event);
+    u64 id = bpf_get_current_pid_tgid();
+    struct enter_data_t data = {};
+    
+    // Stash the filename for the exit probe
+    bpf_probe_read_user_str(&data.filename, sizeof(data.filename), ctx->filename);
+    
+    bpf_map_update_elem(&exec_data, &id, &data, BPF_ANY);
+    return 0;
+}
+
+SEC("tp/syscalls/sys_exit_execve")
+int sys_exit_execve(struct args_exit *ctx) {
+    u64 id = bpf_get_current_pid_tgid();
+    struct enter_data_t *data = bpf_map_lookup_elem(&exec_data, &id);
+    
+    if (!data) return 0;
+
+    if (ctx->ret == 0) {
+        struct so_event *event = init_event();
+        if (event) {
+            event->event_type = EV_PROC;
+            __builtin_memcpy(event->syscall, "execve", 7);
+            __builtin_memcpy(event->filename, data->filename, sizeof(event->filename));
+            event->ret = ctx->ret;
+            submit(ctx, event);
+        }
+    }
+
+    bpf_map_delete_elem(&exec_data, &id);
     return 0;
 }
 
