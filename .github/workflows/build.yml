@@ -56,7 +56,7 @@ jobs:
       - name: Upload deb package
         uses: actions/upload-artifact@v4
         with:
-          name: ebpf-monitor-deb
+          name: system-monitor-deb
           path: build/*.deb
           retention-days: 30
 
