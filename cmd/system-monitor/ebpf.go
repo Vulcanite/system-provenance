@@ -30,6 +30,7 @@ type AuditEvent struct {
 	Pid              uint32 `json:"pid"`
 	Ppid             uint32 `json:"ppid"`
 	Uid              uint32 `json:"uid"`
+	ParentStartTime  uint64 `json:"parent_start_time"`
 	ProcessStartTime uint64 `json:"process_start_time"`
 	Comm             string `json:"comm"`
 	Syscall          string `json:"syscall"`

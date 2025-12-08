@@ -72,6 +72,7 @@ struct so_event {
     u32 pid;
     u32 ppid;
     u32 uid;
+    u64 parent_start_time;
     u64 process_start_time;  // For correlation with PCAP
     char comm[64];
     char syscall[32];
@@ -240,8 +241,10 @@ static __always_inline struct so_event* init_event() {
     event->uid = bpf_get_current_uid_gid();
     event->timestamp = bpf_ktime_get_ns();
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    struct task_struct *parent = BPF_CORE_READ(task, real_parent);
     BPF_CORE_READ_INTO(&event->ppid, task, real_parent, tgid);
     BPF_CORE_READ_INTO(&event->process_start_time, task, start_time);
+    BPF_CORE_READ_INTO(&event->parent_start_time, parent, start_time);
 
     event->filename[0] = 0;
     event->event_type = 0;
