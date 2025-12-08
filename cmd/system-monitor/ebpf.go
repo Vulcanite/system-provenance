@@ -458,6 +458,7 @@ func (ec *EBPFCollector) parseEvent(raw *bpfSoEvent) AuditEvent {
 		Pid:              raw.Pid,
 		Ppid:             raw.Ppid,
 		Uid:              raw.Uid,
+		ParentStartTime:  raw.ParentStartTime,
 		ProcessStartTime: raw.ProcessStartTime,
 		Comm:             int8ToStr(raw.Comm[:]),
 		Syscall:          int8ToStr(raw.Syscall[:]),
