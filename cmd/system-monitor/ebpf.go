@@ -527,6 +527,15 @@ func (ec *EBPFCollector) parseEvent(raw *bpfSoEvent) AuditEvent {
 // Stop gracefully stops the eBPF collector
 func (ec *EBPFCollector) Stop() {
 	close(ec.stopChan)
+
+	// Wait until Start() closes eventsChan and all workers exit
+	ec.indexerWg.Wait()
+
+	// Only now it is safe to close the bulk indexer
+	if ec.bulkIndexer != nil {
+		ec.bulkIndexer.Close(context.Background())
+	}
+
 	ec.cleanup()
 }
 

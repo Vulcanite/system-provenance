@@ -218,22 +218,9 @@ func main() {
 				if pcapCollector != nil {
 					pcapCollector.Stop()
 				}
+
 				if ebpfCollector != nil {
 					ebpfCollector.Stop()
-				}
-
-				// Flush and close bulk indexers
-				fmt.Println("[+] Flushing Elasticsearch bulk indexers...")
-				if bulkIndexer != nil {
-					if err := bulkIndexer.Close(context.Background()); err != nil {
-						log.Printf("[!] Error closing eBPF bulk indexer: %v", err)
-					}
-				}
-
-				if pcapBulkIndexer != nil {
-					if err := pcapBulkIndexer.Close(context.Background()); err != nil {
-						log.Printf("[!] Error closing PCAP bulk indexer: %v", err)
-					}
 				}
 
 				fmt.Println("[+] Shutdown complete")
@@ -260,6 +247,5 @@ func main() {
 		fmt.Println("[+] eBPF monitoring disabled. Only PCAP collection active.")
 	}
 
-	// Block forever
 	select {}
 }

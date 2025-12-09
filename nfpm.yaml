@@ -13,7 +13,7 @@ contents:
     file_info:
       mode: 0755
 
-  - src: ./config/config.json
+  - src: ./config/monitor.json
     dst: /var/monitoring/config.json
     type: config
     file_info:

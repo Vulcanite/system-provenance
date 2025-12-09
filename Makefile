@@ -2,7 +2,7 @@ BINARY_NAME := system-monitor
 SERVICE_NAME := system-monitor
 INSTALL_BIN := /usr/bin/$(SERVICE_NAME)
 CONFIG_DIR := /var/monitoring/
-CONFIG_SRC := config/config.json
+CONFIG_SRC := config/monitor.json
 SYSTEMD_DIR := /lib/systemd/system
 SCRIPTS_DIR := scripts
 
