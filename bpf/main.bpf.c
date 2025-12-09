@@ -14,6 +14,11 @@ struct enter_data_t {
     u64 flags;
     u64 count;
     s64 fd;  // Explicit fd field for I/O syscalls
+    u64 addr_ptr;      // Store user-space pointer for recvfrom
+    u32 dest_ip;       // Store captured IP for sendto
+    u32 dest_ipv6[4];
+    u16 dest_port;
+    u16 sa_family;
 };
 
 // Network socket tracking data
@@ -738,6 +743,25 @@ int sys_enter_sendto(struct args_sendto *ctx) {
     struct enter_data_t data = {};
     data.fd = ctx->fd;
     data.count = ctx->len;
+
+    if (ctx->addr) {
+        u16 family = 0;
+        bpf_probe_read_user(&family, sizeof(family), ctx->addr);
+        data.sa_family = family;
+
+        if (family == 2) { // AF_INET
+            struct sockaddr_in addr = {};
+            bpf_probe_read_user(&addr, sizeof(addr), ctx->addr);
+            data.dest_ip = bpf_ntohl(addr.sin_addr.s_addr);
+            data.dest_port = bpf_ntohs(addr.sin_port);
+        } else if (family == 10) { // AF_INET6
+            struct sockaddr_in6 addr = {};
+            bpf_probe_read_user(&addr, sizeof(addr), ctx->addr);
+            data.dest_port = bpf_ntohs(addr.sin6_port);
+            bpf_probe_read_user(&data.dest_ipv6, sizeof(data.dest_ipv6), &addr.sin6_addr);
+        }
+    }
+
     bpf_map_update_elem(&write_data, &id, &data, BPF_ANY);
     return 0;
 }
@@ -765,6 +789,11 @@ int sys_exit_sendto(struct args_exit *ctx) {
             event->dest_ip = sock_data->dest_ip;
             event->dest_port = sock_data->dest_port;
             event->sa_family = sock_data->sa_family;
+        } else if (data->sa_family != 0) {
+            event->dest_ip = data->dest_ip;
+            event->dest_port = data->dest_port;
+            event->sa_family = data->sa_family;
+            __builtin_memcpy(event->dest_ipv6, data->dest_ipv6, sizeof(event->dest_ipv6));
         }
 
         submit(ctx, event);
@@ -779,6 +808,7 @@ int sys_enter_recvfrom(struct args_recvfrom *ctx) {
     struct enter_data_t data = {};
     data.fd = ctx->fd;
     data.count = ctx->size;
+    data.addr_ptr = (u64)ctx->addr;
     bpf_map_update_elem(&read_data, &id, &data, BPF_ANY);
     return 0;
 }
@@ -806,6 +836,23 @@ int sys_exit_recvfrom(struct args_exit *ctx) {
             event->src_ip = sock_data->src_ip;
             event->src_port = sock_data->src_port;
             event->sa_family = sock_data->sa_family;
+        } else if (data->addr_ptr != 0) {
+            void *addr_ptr = (void *)data->addr_ptr;
+            u16 family = 0;
+            bpf_probe_read_user(&family, sizeof(family), addr_ptr);
+            event->sa_family = family;
+
+            if (family == 2) { // AF_INET
+                struct sockaddr_in addr = {};
+                bpf_probe_read_user(&addr, sizeof(addr), addr_ptr);
+                event->src_ip = bpf_ntohl(addr.sin_addr.s_addr);
+                event->src_port = bpf_ntohs(addr.sin_port);
+            } else if (family == 10) { // AF_INET6
+                struct sockaddr_in6 addr = {};
+                bpf_probe_read_user(&addr, sizeof(addr), addr_ptr);
+                event->src_port = bpf_ntohs(addr.sin6_port);
+                bpf_probe_read_user(&event->src_ipv6, sizeof(event->src_ipv6), &addr.sin6_addr);
+            }
         }
 
         submit(ctx, event);
