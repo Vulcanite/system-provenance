@@ -568,105 +568,346 @@ class ProvenanceGraph:
 
         print(f"[+] Suspicious processes: {len(self.attack_context['suspicious_processes'])}")
 
-    def find_threat_leads(self, start_ns, end_ns, top_n=10):
+    def find_threat_leads(
+        self,
+        hostname,
+        start_ms,
+        end_ms,
+        top_n=10,
+        per_pid_event_limit=200
+    ):
         """
-        Queries Elasticsearch for suspicious behaviors to generate investigation leads.
-        Returns a list of dicts: {pid, comm, score, reasons, timestamp}
-        """
-        print("[*] Hunting for threat leads in the selected time range...")
+        Hybrid threat triage WITH HOSTNAME FILTER SUPPORT.
 
-        query = {
-            "size": 0,  
-            "query": {
-                "bool": {
-                    "must": [
-                        {"range": {"epoch_timestamp": {"gte": start_ns, "lte": end_ns}}}
-                    ],
-                    "should": [
-                         # Signal 1: Sensitive Files
-                        {"regexp": {"filename.keyword": ".*(/etc/shadow|/etc/passwd|\\.ssh/|\\.aws/).*"}},
-                         # Signal 2: Network Connects (Use .keyword for exact match)
-                        {"term": {"syscall.keyword": "connect"}},
-                         # Signal 3: Suspicious Executions
-                        {"bool": {
-                            "must": [
-                                {"term": {"syscall.keyword": "execve"}},
-                                {"regexp": {"filename.keyword": "(/tmp/|/dev/shm/).*"}}
-                            ]
-                        }}
-                    ],
-                    "minimum_should_match": 1
-                }
-            },
+        Steps:
+        1) ES aggregation per host to find suspicious PIDs.
+        2) For top candidates, fetch raw events (small window) → refine score.
+        3) Return threat leads with sample suspicious events.
+
+        Args:
+            start_ns: epoch ms start
+            end_ns: epoch ms end
+            top_n: top N threat leads to return
+            per_pid_event_limit: number of raw events to pull per PID for refinement
+            hostname: OPTIONAL → restrict threat hunting to a single host
+        """
+
+        print("[*] Running hybrid threat triage (agg + refinement) with hostname filter:", hostname)
+
+        # -----------------------
+        # Helper functions
+        # -----------------------
+        def normalize_name(path_or_name: str) -> str:
+            return path_or_name.split("/")[-1] if path_or_name else ""
+
+        def is_sensitive_file(name: str) -> bool:
+            if not name:
+                return False
+            # Path-level detection
+            if "/etc/shadow" in name or "/etc/passwd" in name:
+                return True
+            if ".ssh" in name or ".aws" in name:
+                return True
+            # Basename fallback
+            base = normalize_name(name)
+            if base in ("shadow", "passwd", "id_rsa", "id_ed25519", "authorized_keys"):
+                return True
+            return False
+
+        def is_tmp_or_shm(name: str) -> bool:
+            if not name:
+                return False
+            return name.startswith("/tmp/") or name.startswith("/dev/shm/")
+
+        def is_script_like(name: str) -> bool:
+            base = normalize_name(name)
+            for ext in (".sh", ".py", ".pl", ".rb", ".php"):
+                if base.endswith(ext):
+                    return True
+            return False
+
+        def is_external_ip(ip: str) -> bool:
+            if not ip:
+                return False
+            if ip.startswith(("127.", "10.", "192.168", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.3")):
+                return False
+            return True
+
+        # -----------------------
+        # 1) Build aggregation query WITH hostname filter
+        # -----------------------
+        must_filters = [
+            {"range": {"epoch_timestamp": {"gte": start_ms, "lte": end_ms}}}
+        ]
+
+        if hostname:
+            must_filters.append({"term": {"hostname.keyword": hostname}})
+
+        agg_query = {
+            "size": 0,
+            "query": {"bool": {"must": must_filters}},
             "aggs": {
-                "suspicious_pids": {
-                    "terms": {"field": "pid", "size": top_n * 2},
+                "pids": {
+                    "terms": {"field": "pid", "size": top_n * 5},
                     "aggs": {
-                        # ALL aggregation fields must use .keyword if they are strings
-                        "comm": {"terms": {"field": "comm.keyword", "size": 1}},
-                        "filenames": {"terms": {"field": "filename.keyword", "size": 3}},
-                        "syscalls": {"terms": {"field": "syscall.keyword", "size": 5}}, # <--- FIXED HERE
-                        "last_seen": {"max": {"field": "epoch_timestamp"}}
+                        "comms": {"terms": {"field": "comm.keyword", "size": 1}},
+                        "syscalls": {"terms": {"field": "syscall.keyword", "size": 20}},
+                        "files": {"terms": {"field": "filename.keyword", "size": 50}},
+                        "dest_ips": {"terms": {"field": "dest_ip.keyword", "size": 20}},
+                        "dest_ports": {"terms": {"field": "dest_port", "size": 20}},
+                        "last_seen": {"max": {"field": "epoch_timestamp"}},
+                        "event_count": {"value_count": {"field": "syscall.keyword"}}
                     }
                 }
             }
         }
 
         try:
-            response = self.es.search(index=self.es_index, body=query)
-            buckets = response['aggregations']['suspicious_pids']['buckets']
-            
-            leads = []
-            for b in buckets:
-                pid = b['key']
-                doc_count = b['doc_count']
-                
-                # Get Command Name safely
-                comm = "unknown"
-                if b['comm']['buckets']:
-                    comm = b['comm']['buckets'][0]['key']
-                
-                # Skip known benign system processes
-                if comm in ['systemd', 'dockerd', 'filebeat', 'node_exporter', 'elastic-agent']:
-                    continue
-
-                # Calculate Suspicion Score
-                score = 0
-                reasons = []
-                
-                syscalls = [s['key'] for s in b['syscalls']['buckets']]
-                filenames = [f['key'] for f in b['filenames']['buckets']]
-                
-                if 'connect' in syscalls:
-                    score += 30
-                    reasons.append("Network Activity")
-                
-                for f in filenames:
-                    if '/etc/shadow' in f or '.ssh' in f:
-                        score += 50
-                        reasons.append(f"Sensitive File: {f}")
-                        break
-                    if ('/tmp/' in f or '/dev/shm/' in f) and 'execve' in syscalls:
-                        score += 40
-                        reasons.append(f"Tmp Exec: {f}")
-                
-                if score > 0:
-                    leads.append({
-                        "pid": pid,
-                        "comm": comm,
-                        "score": score,
-                        "reasons": ", ".join(reasons),
-                        "event_count": doc_count,
-                        "timestamp": b['last_seen']['value']
-                    })
-            
-            # Sort by score descending
-            leads.sort(key=lambda x: x['score'], reverse=True)
-            return leads[:top_n]
-
+            resp = self.es.search(index=self.es_index, body=agg_query)
         except Exception as e:
-            print(f"[!] Threat hunting query failed: {e}")
+            print(f"[!] Threat triage aggregation failed: {e}")
             return []
+
+        buckets = resp["aggregations"]["pids"]["buckets"]
+
+        # -----------------------
+        # 2) Global syscall frequency (for rarity scoring)
+        # -----------------------
+        global_syscall_freq = Counter()
+        for b in buckets:
+            for s in b["syscalls"]["buckets"]:
+                global_syscall_freq[s["key"]] += s["doc_count"]
+        total_events = sum(global_syscall_freq.values()) + 1
+
+        # -----------------------
+        # 3) Coarse per-PID scoring
+        # -----------------------
+        coarse_candidates = []
+
+        for b in buckets:
+            pid = b["key"]
+            comm = b["comms"]["buckets"][0]["key"] if b["comms"]["buckets"] else "unknown"
+
+            if comm in ["systemd", "dockerd", "filebeat", "node_exporter"]:
+                continue
+
+            syscalls = [s["key"] for s in b["syscalls"]["buckets"]]
+            files = [f["key"] for f in b["files"]["buckets"]]
+            dest_ips = [d["key"] for d in b["dest_ips"]["buckets"]]
+            dest_ports = [p["key"] for p in b["dest_ports"]["buckets"]]
+
+            score = 0
+            reasons = []
+
+            # Sensitive file access
+            if any(is_sensitive_file(fn) for fn in files):
+                score += 60
+                reasons.append("Sensitive file access")
+
+            # High exec activity
+            exec_count = sum(s["doc_count"] for s in b["syscalls"]["buckets"] if s["key"] == "execve")
+            if exec_count >= 5:
+                score += 25
+                reasons.append("Burst of execve calls")
+
+            # Heavy writes
+            write_count = sum(s["doc_count"] for s in b["syscalls"]["buckets"] if s["key"] == "write")
+            if write_count > 40:
+                score += 20
+                reasons.append("High write volume")
+
+            # Deletions
+            unlink_count = sum(s["doc_count"] for s in b["syscalls"]["buckets"] if s["key"] == "unlinkat")
+            if unlink_count > 3:
+                score += 35
+                reasons.append("Multiple deletions")
+
+            # Network connections
+            if "connect" in syscalls:
+                score += 20
+                reasons.append("Network connections")
+                for port in dest_ports:
+                    if port not in (0, 22, 80, 443):
+                        score += 15
+                        reasons.append(f"Connection to unusual port {port}")
+                for ip in dest_ips:
+                    if is_external_ip(ip):
+                        score += 15
+                        reasons.append(f"External connection to {ip}")
+
+            # Tmp / shm suspicious file
+            if any(is_tmp_or_shm(fn) for fn in files) and "execve" in syscalls:
+                score += 35
+                reasons.append("Exec from /tmp or /dev/shm")
+
+            # Rare syscalls
+            rare_list = []
+            for s in syscalls:
+                freq = global_syscall_freq[s] / total_events
+                if freq < 0.002:
+                    rare_list.append(s)
+            if rare_list:
+                score += 5 * len(rare_list)
+                reasons.append("Rare syscall usage")
+
+            if score > 0:
+                coarse_candidates.append({
+                    "pid": pid,
+                    "comm": comm,
+                    "base_score": score,
+                    "base_reasons": list(reasons),
+                    "event_count": b["event_count"]["value"],
+                    "timestamp": b["last_seen"]["value"]
+                })
+
+        if not coarse_candidates:
+            print("[*] No candidate suspicious PIDs found for host:", hostname)
+            return []
+
+        # Rank and limit refinement set
+        coarse_candidates.sort(key=lambda x: x["base_score"], reverse=True)
+        refinement_candidates = coarse_candidates[: max(top_n * 3, top_n) ]
+
+        # -----------------------
+        # 4) Per-PID refinement (fetch raw events)
+        # -----------------------
+        refined = []
+
+        for c in refinement_candidates:
+            pid = c["pid"]
+            comm = c["comm"]
+
+            # Build filtered event query for this PID + hostname
+            must_filters_pid = [
+                {"term": {"pid": pid}},
+                {"range": {"epoch_timestamp": {"gte": start_ms, "lte": end_ms}}}
+            ]
+            if hostname:
+                must_filters_pid.append({"term": {"hostname.keyword": hostname}})
+
+            ev_query = {
+                "size": per_pid_event_limit,
+                "query": {"bool": {"must": must_filters_pid}},
+                "sort": [{"epoch_timestamp": {"order": "asc"}}]
+            }
+
+            try:
+                ev_resp = self.es.search(index=self.es_index, body=ev_query)
+                events = [hit["_source"] for hit in ev_resp["hits"]["hits"]]
+            except Exception as e:
+                print(f"[!] Failed to pull refinement events for PID {pid}: {e}")
+                events = []
+
+            extra_score = 0
+            extra_reasons = []
+            sample_events = []
+
+            seen_sensitive = False
+            seen_connect = False
+            seen_tmp_exec = False
+            seen_unlink = False
+
+            for ev in events:
+                sc = ev.get("syscall", "")
+                fn = ev.get("filename", "") or ""
+                dt = ev.get("datetime", "")
+                dip = ev.get("dest_ip", "")
+                dport = ev.get("dest_port", 0)
+
+                # Sensitive file use
+                if sc in ("openat", "read") and is_sensitive_file(fn):
+                    if not seen_sensitive:
+                        extra_score += 25
+                        extra_reasons.append("Direct sensitive file access (sequence)")
+                    seen_sensitive = True
+                    sample_events.append({
+                        "datetime": dt, "syscall": sc,
+                        "filename": fn, "dest_ip": dip,
+                        "dest_port": dport,
+                        "reason": "Sensitive file access"
+                    })
+
+                # Suspicious exec
+                if sc == "execve":
+                    if is_tmp_or_shm(fn) or is_script_like(fn):
+                        if not seen_tmp_exec:
+                            extra_score += 30
+                            extra_reasons.append("Suspicious script/tmp execution")
+                        seen_tmp_exec = True
+                        sample_events.append({
+                            "datetime": dt, "syscall": sc,
+                            "filename": fn, "dest_ip": dip,
+                            "dest_port": dport,
+                            "reason": "Suspicious exec"
+                        })
+
+                # Deletion
+                if sc == "unlinkat":
+                    if not seen_unlink:
+                        extra_score += 20
+                        extra_reasons.append("File deletion activity")
+                    seen_unlink = True
+                    sample_events.append({
+                        "datetime": dt, "syscall": sc,
+                        "filename": fn, "dest_ip": dip,
+                        "dest_port": dport,
+                        "reason": "Unlink (delete)"
+                    })
+
+                # Outbound connect
+                if sc == "connect":
+                    if not seen_connect:
+                        extra_score += 15
+                        extra_reasons.append("Outbound network activity (sequence)")
+                    seen_connect = True
+                    r = "Outbound connection"
+                    if is_external_ip(dip):
+                        extra_score += 10
+                        extra_reasons.append("Connects to external IP")
+                        r = "External connection"
+                    sample_events.append({
+                        "datetime": dt, "syscall": sc,
+                        "filename": fn, "dest_ip": dip,
+                        "dest_port": dport,
+                        "reason": r
+                    })
+
+                # Sensitive-read → external connect (EXFIL pattern)
+                if seen_sensitive and sc == "connect" and is_external_ip(dip):
+                    extra_score += 25
+                    extra_reasons.append("Sensitive read followed by external connect (possible exfiltration)")
+                    sample_events.append({
+                        "datetime": dt, "syscall": sc,
+                        "filename": fn, "dest_ip": dip,
+                        "dest_port": dport,
+                        "reason": "Possible exfiltration"
+                    })
+
+            # Merge reasons
+            all_reasons = c["base_reasons"] + extra_reasons
+            # Dedup
+            seen_set = set()
+            unique_reasons = []
+            for r in all_reasons:
+                if r not in seen_set:
+                    seen_set.add(r)
+                    unique_reasons.append(r)
+
+            total_score = c["base_score"] + extra_score
+
+            refined.append({
+                "pid": pid,
+                "comm": comm,
+                "score": total_score,
+                "reasons": ", ".join(unique_reasons),
+                "event_count": c["event_count"],
+                "timestamp": c["timestamp"],
+                "sample_events": sample_events[:10],
+                "hostname": hostname or "<all>"
+            })
+
+        refined.sort(key=lambda x: x["score"], reverse=True)
+        return refined[:top_n]
 
     def is_noise_category(self, event):
         """Check if event belongs to a noise category"""

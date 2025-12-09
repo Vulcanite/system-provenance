@@ -232,6 +232,17 @@ def parse_mitre_from_summary(summary_text):
 st.sidebar.header("📅 Time Range")
 preset = st.sidebar.selectbox("Quick Select", ["Last 1 Hour", "Last 6 Hours", "Last 12 Hours", "Last 24 Hours", "Today", "Custom"])
 
+host_list = fetch_hostnames(es, ebpf_index)
+if not host_list:
+    selected_host = None
+else:
+    selected_host = st.sidebar.selectbox(
+        "Select Host / Agent",
+        options=host_list,
+        index=0,
+        help="Choose which agent's events to analyze"
+    )
+
 if preset == "Last 1 Hour":
     end_dt = datetime.now()
     start_dt = end_dt - timedelta(hours=1)
@@ -280,7 +291,7 @@ with tab1:
             # Ensure es_config is loaded from your utils/config
             analyzer = ProvenanceGraph(es_config)
             # Run the threat hunting query (using the method we defined earlier)
-            leads = analyzer.find_threat_leads(start_ms, end_ms, top_n)
+            leads = analyzer.find_threat_leads(selected_host, start_ms, end_ms, top_n)
             st.session_state['threat_leads'] = leads
 
     if 'threat_leads' in st.session_state and st.session_state['threat_leads']:
@@ -308,24 +319,10 @@ with tab1:
 
     elif 'threat_leads' in st.session_state:
         st.info("✅ No high-confidence threats found in this window.")
-
+    
 with tab2:
     st.subheader("Build Attack Provenance Graph")
     st.caption("Generate focused provenance graphs with intelligent noise reduction")
-
-    # Fetch hostnames dynamically
-    host_list = fetch_hostnames(es, ebpf_index)
-
-    if not host_list:
-        st.warning("No hostname information found in Elasticsearch.")
-        selected_host = None
-    else:
-        selected_host = st.selectbox(
-            "Select Host / Agent",
-            options=host_list,
-            index=0,
-            help="Choose which agent's events to analyze"
-        )
 
     # Main controls
     col1, col2 = st.columns([1, 1])
