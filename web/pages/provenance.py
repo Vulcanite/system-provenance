@@ -296,12 +296,18 @@ with tab1:
 
     # Advanced filtering options
     with st.expander("⚙️ Advanced Filtering Options", expanded=True):
-        col1, col2 = st.columns(2)
-        with col1:
+        col5, col6 = st.columns([1, 1])
+        with col5:
+            max_depth = st.slider("Graph Depth", min_value=1, max_value=10, value=5, help="Maximum traversal depth in the process tree")
+        with col6:
+            provenance_window = st.slider("Process Scope Window (minutes)", min_value=1, max_value=60, value=5, help="Maximum traversal depth in the process tree")
+
+        col3, col4 = st.columns(2)
+        with col3:
             disable_filtering = st.checkbox("Disable Event Filtering", value=False, help="Show all events (not recommended for large datasets)")
 
-        with col2:
-            prune_noise = st.checkbox("Prune High-Degree Files", value=False, help="Remove files accessed by many processes (system noise)")
+        with col4:
+            prune_noise = st.checkbox("Prune High-Degree Files", value=True, help="Remove files accessed by many processes (system noise)")
 
         analysis_mode = st.selectbox(
             "Select Analysis Strategy",
@@ -344,7 +350,8 @@ with tab1:
                         "--end", str(end_ms),
                         "--out", DOT_FILE,
                         "--text-out", TXT_OUTPUT,
-                        "--depth", str(5)
+                        "--depth", str(max_depth),
+                        "--provenance-window", str(provenance_window)
                     ]
 
                     if prune_noise:
@@ -368,7 +375,6 @@ with tab1:
                     if selected_host:
                         cmd.extend(["--host", selected_host])
 
-                    print(cmd)
                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
                     st.session_state['analyzer_stdout'] = result.stdout

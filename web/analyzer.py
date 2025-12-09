@@ -479,10 +479,10 @@ class ProvenanceGraph:
 
         return es
 
-    def load_events(self, start_ns, end_ns, hostname=None):
-        print("Loading events from ES")
+    def load_events(self, start_ms, end_ms, hostname=None):
+        print("Loading events from ES from {} to {}...".format(datetime.fromtimestamp(int(start_ms) / 1000),datetime.fromtimestamp(int(end_ms) / 1000)))
         must_filters = [
-            {"range": {"epoch_timestamp": {"gte": start_ns, "lte": end_ns}}}
+            {"range": {"epoch_timestamp": {"gte": start_ms, "lte": end_ms}}}
         ]
 
         # Hostname filter (if present)
@@ -668,7 +668,6 @@ class ProvenanceGraph:
         # ------------------------------
         return False
 
-
     # ------------------------------------------------------------------------
     # GRAPH CONSTRUCTION
     # ------------------------------------------------------------------------
@@ -729,6 +728,60 @@ class ProvenanceGraph:
                 found_procs.append(node_id)
         return found_procs
 
+    def scout_activity_window(self, start_ms, end_ms, pid=None, comm=None, window_minutes=10, hostname=None):
+        """
+        Scouts for the specific PID or Command to find its active time range.
+        Returns a new (start_ms, end_ms) tuple centered on the activity with padding.
+        """
+        print(f"[*] Scouting for target (PID={pid}, Comm={comm}) in broad range...")
+
+        must_filters = [
+             {"range": {"epoch_timestamp": {"gte": start_ms, "lte": end_ms}}}
+        ]
+        
+        if hostname:
+            must_filters.append({"term": {"hostname.keyword": hostname}})
+
+        # Filter strictly by the target
+        if pid:
+            must_filters.append({"term": {"pid": pid}})
+        elif comm:
+            must_filters.append({"term": {"comm.keyword": comm}})
+        else:
+            return start_ms, end_ms  # No target specified, use original range
+
+        query = {
+            "size": 100,  # We only need a sample to find the time
+            "query": {"bool": {"must": must_filters}},
+            "sort": [{"timestamp_ns": {"order": "asc"}}]
+        }
+
+        try:
+            response = self.es.search(index=self.es_index, body=query)
+            hits = response['hits']['hits']
+
+            if not hits:
+                return None, None  # Target not found in this range
+
+            # Get the first and last time the target was seen
+            first_seen = hits[0]['_source']['epoch_timestamp']
+            last_seen = hits[-1]['_source']['epoch_timestamp']
+
+            print(f"[+] Target found active between {datetime.fromtimestamp(first_seen/1000)} and {datetime.fromtimestamp(last_seen/1000)}")
+
+            # Calculate padding in milliseconds
+            padding_ms = window_minutes * 60 * 1000
+
+            # Define new window
+            new_start = first_seen - padding_ms
+            new_end = last_seen + padding_ms
+
+            return new_start, new_end
+
+        except Exception as e:
+            print(f"[!] Scouting failed: {e}")
+            return None, None
+
     def build_graph(self, events, enable_filtering=True, enable_event_compression=False):
         print(f"Building provenance graph (filtering={'enabled' if enable_filtering else 'disabled'})...")
 
@@ -755,7 +808,9 @@ class ProvenanceGraph:
             comm = event.get('comm', 'unknown').split('\x00', 1)[0].strip()
             syscall = event['syscall']
 
-            if 'timestamp_ns' in event:
+            if 'epoch_timestamp' in event:
+                timestamp_ms = event['epoch_timestamp']
+            elif 'timestamp_ns' in event:
                 timestamp_ms = event['timestamp_ns'] // 1000000
             else:
                 timestamp_ms = event.get('timestamp_ms', 0)
@@ -902,6 +957,57 @@ class ProvenanceGraph:
     # ------------------------------------------------------------------------
     # ATT&CK TECHNIQUE INFERENCE
     # ------------------------------------------------------------------------
+    def collapse_sibling_processes(self, graph):
+        """
+        Aggressively merges sibling processes that share the same command name.
+        Example: 13 'sudo' processes spawned by 'run-attack.sh' become 'sudo [x13]'
+        """
+        print("Collapsing identical sibling processes...")
+        
+        # 1. Group nodes by (parent, command_name)
+        siblings_map = defaultdict(list)
+        for node, attrs in graph.nodes(data=True):
+            if attrs.get('type') == 'process':
+                preds = list(graph.predecessors(node))
+                if preds:
+                    parent = preds[0] # Assuming tree structure for process spawning
+                    comm = attrs.get('comm', 'unknown')
+                    # Create a signature: Parent + Command Name
+                    key = (parent, comm)
+                    siblings_map[key].append(node)
+
+        nodes_to_remove = []
+        
+        # 2. Merge groups larger than 1
+        for (parent, comm), nodes in siblings_map.items():
+            if len(nodes) < 2:
+                continue
+                
+            # Keep the first node as the "Representative"
+            survivor = nodes[0]
+            victims = nodes[1:]
+            count = len(nodes)
+            
+            # Update the survivor's label
+            new_label = f"{comm}\n[x{count} PIDs]"
+            graph.nodes[survivor]['label'] = new_label
+            graph.nodes[survivor]['style'] = 'filled,bold,dashed' # Distinct visual style
+            graph.nodes[survivor]['fillcolor'] = '#FFD700' # Gold color for clusters
+            
+            # Rewire edges from victims to survivor
+            for v in victims:
+                # Move outgoing edges (what the victim did) to the survivor
+                for _, target, data in graph.out_edges(v, data=True):
+                    if not graph.has_edge(survivor, target):
+                        graph.add_edge(survivor, target, **data)
+                
+                nodes_to_remove.append(v)
+
+        if nodes_to_remove:
+            graph.remove_nodes_from(nodes_to_remove)
+            print(f"[+] Collapsed {len(nodes_to_remove)} sibling processes into clusters")
+            
+        return graph
 
     def infer_mitre_techniques(self, graph):
         """
@@ -1774,6 +1880,7 @@ def main():
     parser.add_argument("--holmes-forward", action="store_true", default=True, help="HOLMES: trace forward from alerts")
     parser.add_argument("--cli-only", action="store_true", help="CLI mode: display summary in terminal")
     parser.add_argument("--host", help="Filter by hostname of agent")
+    parser.add_argument("--provenance-window", type=int, default=10, help="Minutes of context before/after the event")
 
     args = parser.parse_args()
     try:
@@ -1796,7 +1903,31 @@ def main():
     try:
         es_config = config.get("es_config", {})
         analyzer = ProvenanceGraph(es_config)
-        events = analyzer.load_events(args.start, args.end, hostname=args.host)
+
+        final_start = args.start
+        final_end = args.end
+
+        if args.pid or args.comm:
+            found_start, found_end = analyzer.scout_activity_window(
+                args.start, 
+                args.end, 
+                pid=args.pid, 
+                comm=args.comm, 
+                window_minutes=args.provenance_window,
+                hostname=args.host
+            )
+
+            if found_start and found_end:
+                print(f"[+] Adjusting analysis window to capture provenance context.")
+                print(f"    Original: {args.start} -> {args.end}")
+                print(f"    Focused:  {found_start} -> {found_end} (Target ± {args.provenance_window} min)")
+                final_start = str(found_start)
+                final_end = str(found_end)
+            else:
+                print(f"[!] Warning: Target not found in the original time range. Graph may be empty.")
+                sys.exit(1)
+
+        events = analyzer.load_events(final_start, final_end, hostname=args.host)
         if not events:
             print("[!] No events found", file=sys.stderr)
             sys.exit(1)
@@ -1877,6 +2008,7 @@ def main():
                 degree_threshold=args.degree_threshold
             )
 
+        attack_subgraph = analyzer.collapse_sibling_processes(attack_subgraph)
         attack_subgraph = analyzer.remove_benign_only_subgraphs(attack_subgraph)
         attack_subgraph = analyzer.remove_isolated_nodes(attack_subgraph)
 

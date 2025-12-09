@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """System Monitor with Provenance Analysis"""
 
+import urllib3
 import streamlit as st
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 
 st.set_page_config(
     page_title="System Monitor",
