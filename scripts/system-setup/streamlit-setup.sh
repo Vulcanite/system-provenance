@@ -31,7 +31,13 @@ WEBAPP_DIR="$PROJECT_DIR/web"
 cd "$WEBAPP_DIR"
 
 if [ -d "venv" ]; then
-    echo "[!] Virtual environment already exists, skipping creation."
+    if [ -f "venv/bin/activate" ]; then
+        echo "[!] Virtual environment already exists, skipping creation."
+    else
+        echo "[!] Virtual environment directory exists but is missing bin/activate; recreating..."
+        python3.12 -m venv --clear venv
+        echo "[+] Virtual environment recreated with Python 3.12."
+    fi
 else
     python3.12 -m venv venv
     echo "[+] Virtual environment created with Python 3.12."
@@ -41,11 +47,12 @@ echo "Activating virtual environment..."
 source venv/bin/activate
 
 echo "Installing Python requirements..."
-pip install --upgrade pip
-pip install -r requirements.txt
+VENV_BIN="$WEBAPP_DIR/venv/bin"
+"$VENV_BIN/pip" install --upgrade pip
+"$VENV_BIN/pip" install -r requirements.txt
 
 echo "Setting up config.json..."
-CONFIG_PATH="/var/config.json"
+CONFIG_PATH="/var/monitoring/config.json"
 if [ -f "$CONFIG_PATH" ]; then
     echo "[+] Config file already exists at $CONFIG_PATH"
 else
@@ -70,7 +77,7 @@ SERVICE_FILE="/lib/systemd/system/streamlit-webapp.service"
 echo "Generating service file at $SERVICE_FILE..."
 sudo tee "$SERVICE_FILE" > /dev/null <<EOF
 [Unit]
-Description=Forensice Web Application
+Description=Forensic Web Application
 After=network.target elasticsearch.service
 
 [Service]
@@ -82,6 +89,8 @@ RestartSec=5s
 User=root
 Group=root
 Environment="PATH=$WEBAPP_DIR/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="VIRTUAL_ENV=$WEBAPP_DIR/venv"
+EnvironmentFile=-/etc/default/streamlit-webapp
 
 [Install]
 WantedBy=multi-user.target
