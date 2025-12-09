@@ -12,6 +12,7 @@ import streamlit.components.v1 as components
 import time
 import re
 import ollama_agent
+from analyzer import ProvenanceGraph
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils import load_config, connect_elasticsearch, to_epoch_ms
@@ -267,9 +268,48 @@ if start_datetime >= end_datetime:
 st.markdown("---")
 
 # Create tabs
-tab1, tab2 = st.tabs(["📊 Graph Generation", "🤖 AI Analysis"])
-
+tab1, tab2, tab3= st.tabs(["🎯 Threat Hunting", "📊 Graph Generation", "🤖 AI Analysis"])
+# --- TAB 1: THREAT HUNTING ---
 with tab1:
+    st.subheader("🔍 Automated Threat Triage")
+    st.caption("Scan the selected time range for anomalies to find a starting point.")
+    top_n = st.slider("Max Threats", min_value=10, max_value=250, value=10, help="Maximum number of threat leads to return", step=10)
+    if st.button("🚀 Scan for Threats", type="primary"):
+        with st.spinner("Hunting for anomalies in Elasticsearch..."):
+            # Initialize analyzer just for this query
+            # Ensure es_config is loaded from your utils/config
+            analyzer = ProvenanceGraph(es_config)
+            # Run the threat hunting query (using the method we defined earlier)
+            leads = analyzer.find_threat_leads(start_ms, end_ms, top_n)
+            st.session_state['threat_leads'] = leads
+
+    if 'threat_leads' in st.session_state and st.session_state['threat_leads']:
+        leads = st.session_state['threat_leads']
+        st.markdown(f"### Found {len(leads)} Suspicious Leads")
+
+        for lead in leads:
+            score_color = "🔴" if lead['score'] >= 50 else "🟠"
+            
+            with st.expander(f"{score_color} Score {lead['score']}: {lead['comm']} (PID: {lead['pid']})"):
+                c1, c2, c3 = st.columns([2, 1, 1])
+                
+                with c1:
+                    st.markdown(f"**Reasons:** {lead['reasons']}")
+                    st.markdown(f"**Events:** {lead['event_count']}")
+                    st.caption(f"Last Seen: {datetime.fromtimestamp(lead['timestamp']/1000)}")
+
+                with c2:
+                    st.markdown("**Copy PID:**")
+                    st.code(str(lead['pid']), language="text")
+
+                with c3:
+                    st.markdown("**Copy Command:**")
+                    st.code(lead['comm'], language="bash")
+
+    elif 'threat_leads' in st.session_state:
+        st.info("✅ No high-confidence threats found in this window.")
+
+with tab2:
     st.subheader("Build Attack Provenance Graph")
     st.caption("Generate focused provenance graphs with intelligent noise reduction")
 
@@ -520,7 +560,7 @@ with tab1:
                     mime="text/plain"
                 )
 
-with tab2:
+with tab3:
     st.subheader("🤖 AI-Powered Attack Analysis")
 
     if 'chat_history' not in st.session_state:

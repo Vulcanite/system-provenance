@@ -510,7 +510,7 @@ class ProvenanceGraph:
                 sid = response['_scroll_id']
                 scroll_size = len(response['hits']['hits'])
                 events.extend([hit['_source'] for hit in response['hits']['hits']])
-                if len(events) >= 50000:
+                if len(events) >= 200000:
                     print("[!] Limit reached (50k events)")
                     break
 
@@ -568,6 +568,105 @@ class ProvenanceGraph:
 
         print(f"[+] Suspicious processes: {len(self.attack_context['suspicious_processes'])}")
 
+    def find_threat_leads(self, start_ns, end_ns, top_n=10):
+        """
+        Queries Elasticsearch for suspicious behaviors to generate investigation leads.
+        Returns a list of dicts: {pid, comm, score, reasons, timestamp}
+        """
+        print("[*] Hunting for threat leads in the selected time range...")
+
+        query = {
+            "size": 0,  
+            "query": {
+                "bool": {
+                    "must": [
+                        {"range": {"epoch_timestamp": {"gte": start_ns, "lte": end_ns}}}
+                    ],
+                    "should": [
+                         # Signal 1: Sensitive Files
+                        {"regexp": {"filename.keyword": ".*(/etc/shadow|/etc/passwd|\\.ssh/|\\.aws/).*"}},
+                         # Signal 2: Network Connects (Use .keyword for exact match)
+                        {"term": {"syscall.keyword": "connect"}},
+                         # Signal 3: Suspicious Executions
+                        {"bool": {
+                            "must": [
+                                {"term": {"syscall.keyword": "execve"}},
+                                {"regexp": {"filename.keyword": "(/tmp/|/dev/shm/).*"}}
+                            ]
+                        }}
+                    ],
+                    "minimum_should_match": 1
+                }
+            },
+            "aggs": {
+                "suspicious_pids": {
+                    "terms": {"field": "pid", "size": top_n * 2},
+                    "aggs": {
+                        # ALL aggregation fields must use .keyword if they are strings
+                        "comm": {"terms": {"field": "comm.keyword", "size": 1}},
+                        "filenames": {"terms": {"field": "filename.keyword", "size": 3}},
+                        "syscalls": {"terms": {"field": "syscall.keyword", "size": 5}}, # <--- FIXED HERE
+                        "last_seen": {"max": {"field": "epoch_timestamp"}}
+                    }
+                }
+            }
+        }
+
+        try:
+            response = self.es.search(index=self.es_index, body=query)
+            buckets = response['aggregations']['suspicious_pids']['buckets']
+            
+            leads = []
+            for b in buckets:
+                pid = b['key']
+                doc_count = b['doc_count']
+                
+                # Get Command Name safely
+                comm = "unknown"
+                if b['comm']['buckets']:
+                    comm = b['comm']['buckets'][0]['key']
+                
+                # Skip known benign system processes
+                if comm in ['systemd', 'dockerd', 'filebeat', 'node_exporter', 'elastic-agent']:
+                    continue
+
+                # Calculate Suspicion Score
+                score = 0
+                reasons = []
+                
+                syscalls = [s['key'] for s in b['syscalls']['buckets']]
+                filenames = [f['key'] for f in b['filenames']['buckets']]
+                
+                if 'connect' in syscalls:
+                    score += 30
+                    reasons.append("Network Activity")
+                
+                for f in filenames:
+                    if '/etc/shadow' in f or '.ssh' in f:
+                        score += 50
+                        reasons.append(f"Sensitive File: {f}")
+                        break
+                    if ('/tmp/' in f or '/dev/shm/' in f) and 'execve' in syscalls:
+                        score += 40
+                        reasons.append(f"Tmp Exec: {f}")
+                
+                if score > 0:
+                    leads.append({
+                        "pid": pid,
+                        "comm": comm,
+                        "score": score,
+                        "reasons": ", ".join(reasons),
+                        "event_count": doc_count,
+                        "timestamp": b['last_seen']['value']
+                    })
+            
+            # Sort by score descending
+            leads.sort(key=lambda x: x['score'], reverse=True)
+            return leads[:top_n]
+
+        except Exception as e:
+            print(f"[!] Threat hunting query failed: {e}")
+            return []
 
     def is_noise_category(self, event):
         """Check if event belongs to a noise category"""
@@ -576,7 +675,7 @@ class ProvenanceGraph:
         comm = event.get('comm', '')
         pid = str(event['pid'])
 
-        for category, rules in NOISE_CATEGORIES.items():
+        for _, rules in NOISE_CATEGORIES.items():
             sensitivity = rules.get('sensitivity', 'medium')
             sensitivity_rules = SENSITIVITY_LEVELS[sensitivity]
 
@@ -746,7 +845,14 @@ class ProvenanceGraph:
         if pid:
             must_filters.append({"term": {"pid": pid}})
         elif comm:
-            must_filters.append({"term": {"comm.keyword": comm}})
+            truncated_comm = comm[:15]
+            should_conditions = [
+                {"term": {"comm.keyword": comm}},            # Exact match (short commands)
+                {"term": {"comm.keyword": truncated_comm}},  # Truncated match
+                {"term": {"filename.keyword": comm}},        # Full filename match (from execve)
+                {"term": {"filename.keyword": "./" + comm}}  # Handle relative path case
+            ]
+            must_filters.append({"bool": {"should": should_conditions, "minimum_should_match": 1}})
         else:
             return start_ms, end_ms  # No target specified, use original range
 
