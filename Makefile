@@ -83,6 +83,7 @@ uninstall:
 # 6. Build Debian Package
 package: build
 	@echo "Building Debian package with nfpm (version: $(VERSION))..."
+	rm -rf build/
 	@mkdir -p build
 	@which nfpm > /dev/null || (echo "[!] nfpm not found. Install it first." && exit 1)
 	@sed 's/version: .*/version: "$(VERSION)"/' nfpm.yaml > build/nfpm.yaml.tmp
