@@ -1,18 +1,18 @@
 {
   "es_config": {
-    "es_host": "139.59.247.254",
+    "es_host": "localhost",
     "es_port": 9200,
     "es_user": "elastic",
-    "es_password": "HUor6PC1eO3=q2-A9Fr2",
+    "es_password": "changeme",
     "ebpf_index": "ebpf-events",
     "pcap_index": "pcap-flows",
     "batch_size": 1000,
     "secure": true
   },
   "neo4j_config": {
-    "neo4j_uri": "bolt://139.59.247.254:7687",
+    "neo4j_uri": "bolt://localhost:7687",
     "neo4j_user": "neo4j",
-    "neo4j_password": "HUor6PC1eO3=q2-A9Fr2",
+    "neo4j_password": "changme",
     "database": "neo4j"
   }
 }

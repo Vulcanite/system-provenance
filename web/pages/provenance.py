@@ -3,16 +3,12 @@
 
 import streamlit as st
 from datetime import datetime, timedelta
-import pandas as pd
-import json
 import sys
 import os
 import subprocess
 import networkx as nx
 from pyvis.network import Network
 import streamlit.components.v1 as components
-import tempfile
-import pydot
 import time
 import re
 import ollama_agent
@@ -233,11 +229,17 @@ def parse_mitre_from_summary(summary_text):
 
 # Sidebar - Time Range
 st.sidebar.header("📅 Time Range")
-preset = st.sidebar.selectbox("Quick Select", ["Last 1 Hour", "Last 24 Hours", "Today", "Custom"])
+preset = st.sidebar.selectbox("Quick Select", ["Last 1 Hour", "Last 6 Hours", "Last 12 Hours", "Last 24 Hours", "Today", "Custom"])
 
 if preset == "Last 1 Hour":
     end_dt = datetime.now()
     start_dt = end_dt - timedelta(hours=1)
+elif preset == "Last 6 Hours":
+    end_dt = datetime.now()
+    start_dt = end_dt - timedelta(hours=6)
+elif preset == "Last 12 Hours":
+    end_dt = datetime.now()
+    start_dt = end_dt - timedelta(hours=12)
 elif preset == "Last 24 Hours":
     end_dt = datetime.now()
     start_dt = end_dt - timedelta(hours=24)
@@ -345,7 +347,6 @@ with tab1:
                         "--depth", str(5)
                     ]
 
-                    print(cmd)
                     if prune_noise:
                         cmd.extend(["--prune", "--degree-threshold", str(5)])
                     if disable_filtering:
@@ -369,7 +370,7 @@ with tab1:
 
                     print(cmd)
                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-                    print(result)
+
                     st.session_state['analyzer_stdout'] = result.stdout
                     st.session_state['analyzer_stderr'] = result.stderr
                     st.session_state['analyzer_stats'] = parse_analyzer_stats(result.stdout)
