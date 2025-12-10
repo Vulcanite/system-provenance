@@ -19,19 +19,38 @@ import (
 )
 
 type ESConfig struct {
-	Host       string `json:"es_host"`
-	Port       int    `json:"es_port"`
-	User       string `json:"es_user"`
-	Password   string `json:"es_password"`
-	EBPFIndex  string `json:"ebpf_index"`
-	PCAPIndex  string `json:"pcap_index"`
-	BatchSize  int    `json:"batch_size"`
-	SslEnabled bool   `json:"secure"`
+	Host        string `json:"es_host"`
+	Port        int    `json:"es_port"`
+	User        string `json:"es_user"`
+	Password    string `json:"es_password"`
+	AuditdIndex string `json:"auditd_index"`
+	EBPFIndex   string `json:"ebpf_index"`
+	PCAPIndex   string `json:"pcap_index"`
+	BatchSize   int    `json:"batch_size"`
+	SslEnabled  bool   `json:"secure"`
 }
 
 type EBPFConfig struct {
 	Enabled            bool `json:"enabled"`
 	FileLoggingEnabled bool `json:"file_logging_enabled"`
+}
+
+type AuditdConfig struct {
+	Enabled            bool        `json:"enabled"`
+	FileLoggingEnabled bool        `json:"file_logging_enabled"`
+	Rules              []AuditRule `json:"rules"`
+}
+
+type AuditRule struct {
+	Type        string   `json:"type"`        // "watch" or "syscall"
+	Path        string   `json:"path"`        // For watch rules
+	Permissions string   `json:"permissions"` // For watch rules: "r", "w", "x", "a"
+	Key         string   `json:"key"`         // Rule key/tag
+	Action      string   `json:"action"`      // For syscall rules: "always", "never"
+	List        string   `json:"list"`        // For syscall rules: "exit", "task"
+	Arch        string   `json:"arch"`        // For syscall rules: "b64", "b32"
+	Syscalls    []string `json:"syscalls"`    // For syscall rules
+	Filters     []string `json:"filters"`     // Additional filters like "auid!=-1"
 }
 
 type PCAPConfig struct {
@@ -45,21 +64,23 @@ type PCAPConfig struct {
 }
 
 type Config struct {
-	Hostname    string     `json:"hostname"`
-	EventsDir   string     `json:"events_dir"`
-	OutputDir   string     `json:"output_dir"`
-	StorageType string     `json:"storage_type"`
-	ESConfig    ESConfig   `json:"es_config"`
-	EBPFConfig  EBPFConfig `json:"ebpf_config"`
-	PCAPConfig  PCAPConfig `json:"pcap_config"`
+	Hostname     string       `json:"hostname"`
+	EventsDir    string       `json:"events_dir"`
+	OutputDir    string       `json:"output_dir"`
+	StorageType  string       `json:"storage_type"`
+	ESConfig     ESConfig     `json:"es_config"`
+	AuditdConfig AuditdConfig `json:"auditd_config"`
+	EBPFConfig   EBPFConfig   `json:"ebpf_config"`
+	PCAPConfig   PCAPConfig   `json:"pcap_config"`
 }
 
 var (
-	outputFile      *os.File
-	fileLock        sync.Mutex
-	bulkIndexer     esutil.BulkIndexer
-	pcapBulkIndexer esutil.BulkIndexer
-	cfg             Config
+	outputFile       *os.File
+	fileLock         sync.Mutex
+	bulkIndexer      esutil.BulkIndexer
+	pcapBulkIndexer  esutil.BulkIndexer
+	auditBulkIndexer esutil.BulkIndexer
+	cfg              Config
 )
 
 func setupLogging() {
@@ -154,6 +175,25 @@ func setupES() {
 			fmt.Println("[+] PCAP Bulk Indexer Ready")
 		}
 	}
+
+	if cfg.AuditdConfig.Enabled {
+		auditBI, err := esutil.NewBulkIndexer(esutil.BulkIndexerConfig{
+			Client:        es,
+			Index:         cfg.ESConfig.AuditdIndex,
+			FlushBytes:    1000000,
+			FlushInterval: 1 * time.Second,
+			OnError: func(ctx context.Context, err error) {
+				log.Printf("[!] Auditd Bulk Indexer Error: %v", err)
+			},
+		})
+
+		if err != nil {
+			log.Printf("[!] Auditd Bulk Indexer Init Failed: %v", err)
+		} else {
+			auditBulkIndexer = auditBI
+			fmt.Println("[+] Auditd Bulk Indexer Ready")
+		}
+	}
 }
 
 func main() {
@@ -191,6 +231,16 @@ func main() {
 		go func() {
 			if err := pcapCollector.Start(); err != nil {
 				log.Printf("[!] PCAP collector error: %v", err)
+			}
+		}()
+	}
+
+	var auditCollector *AuditdCollector
+	if cfg.AuditdConfig.Enabled {
+		auditCollector = NewAuditdCollector(cfg, auditBulkIndexer)
+		go func() {
+			if err := auditCollector.Start(); err != nil {
+				log.Printf("[!] Auditd collector error: %v", err)
 			}
 		}()
 	}
@@ -244,8 +294,6 @@ func main() {
 			}
 		}()
 	} else {
-		fmt.Println("[+] eBPF monitoring disabled. Only PCAP collection active.")
+		select {}
 	}
-
-	select {}
 }

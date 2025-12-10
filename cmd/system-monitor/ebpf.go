@@ -21,11 +21,11 @@ import (
 	"github.com/elastic/go-elasticsearch/v8/esutil"
 )
 
-// AuditEvent represents a syscall event captured by eBPF
-type AuditEvent struct {
+// eBPFEvent represents a syscall event captured by eBPF
+type eBPFEvent struct {
 	Hostname         string `json:"hostname"`
 	TimestampNs      int64  `json:"timestamp_ns"`
-	EpochTimestamp   int64  `json:"epoch_timestamp"`
+	EpochTimestamp   int64  `json:"timestamp"`
 	Datetime         string `json:"datetime"`
 	Pid              uint32 `json:"pid"`
 	Ppid             uint32 `json:"ppid"`
@@ -77,7 +77,7 @@ type EBPFCollector struct {
 	links       []link.Link
 	perfReader  *perf.Reader
 	stopChan    chan struct{}
-	eventsChan  chan AuditEvent
+	eventsChan  chan eBPFEvent
 	indexerWg   sync.WaitGroup
 	metrics     RuntimeMetrics
 }
@@ -89,7 +89,7 @@ func NewEBPFCollector(cfg Config, outputFile *os.File, bulkIndexer esutil.BulkIn
 		outputFile:  outputFile,
 		bulkIndexer: bulkIndexer,
 		stopChan:    make(chan struct{}),
-		eventsChan:  make(chan AuditEvent, 50000),
+		eventsChan:  make(chan eBPFEvent, 50000),
 	}
 
 	// Remove memlock limit
@@ -446,15 +446,15 @@ func (ec *EBPFCollector) readPerfEvent() error {
 	return nil
 }
 
-// parseEvent converts raw eBPF event to AuditEvent
-func (ec *EBPFCollector) parseEvent(raw *bpfSoEvent) AuditEvent {
+// parseEvent converts raw eBPF event to eBPFEvent
+func (ec *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 	// Use kernel monotonic timestamp (bpf_ktime_get_ns) as canonical event time
 	kernelTimeNs := int64(raw.Timestamp)
 
 	// For correlation, also capture userspace processing time
 	userspaceTime := time.Now()
 
-	evt := AuditEvent{
+	evt := eBPFEvent{
 		Hostname:         ec.cfg.Hostname,
 		TimestampNs:      kernelTimeNs, // Canonical kernel event time
 		EpochTimestamp:   userspaceTime.UnixMilli(),
