@@ -31,6 +31,7 @@ struct socket_data_t {
     u16 dest_port;
     u16 sa_family;
     u8 protocol;  // IPPROTO_TCP, IPPROTO_UDP
+    s64 fd;       // File descriptor for socket correlation
 };
 
 // Accept args storage (replaces raw pointer)
@@ -120,6 +121,13 @@ struct {
 } event_heap SEC(".maps");
 
 struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct enter_data_t);
+} enter_data_heap SEC(".maps");
+
+struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 10240);
     __type(key, u64);
@@ -139,6 +147,21 @@ struct {
     __type(key, u64);
     __type(value, struct enter_data_t);
 } read_data SEC(".maps");
+
+// Network I/O maps (separate from file I/O to prevent collisions)
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, u64);
+    __type(value, struct enter_data_t);
+} sendto_data SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, u64);
+    __type(value, struct enter_data_t);
+} recvfrom_data SEC(".maps");
 
 // Map to track socket FD to network info (for correlation)
 struct {
@@ -196,6 +219,15 @@ struct {
     __type(value, struct accept_args_t);
 } active_accepts SEC(".maps");
 
+// --- MAP FOR FD → FILENAME MAPPING ---
+// Stores FD to filename mapping for write/read events
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, u64);  // pid_tgid << 32 | fd
+    __type(value, char[256]);  // filename
+} fd_to_filename SEC(".maps");
+
 // -------------------------------------------------------------------------
 // OPTIMIZED FILTERING LOGIC
 // -------------------------------------------------------------------------
@@ -208,8 +240,7 @@ static __always_inline int should_drop_comm(char *c) {
         return 1;
     }
 
-    // Smart kworker filter - Only drop if it is ACTUALLY a kernel thread (PF_KTHREAD).
-    // Keeps malware named "kworker".
+    // Smart kworker filter
     if (c[0]=='k' && c[1]=='w' && c[2]=='o' && c[3]=='r' && c[4]=='k') {
         struct task_struct *task = (struct task_struct *)bpf_get_current_task();
         u32 flags = 0;
@@ -289,7 +320,6 @@ static __always_inline bool is_whitelisted_network(u32 ip, u16 port) {
 
 // Check if this is the system-monitor process (collector itself)
 static __always_inline bool is_collector_process(char *comm) {
-    // Check for "system-monitor"
     if (comm[0]=='s' && comm[1]=='y' && comm[2]=='s' && comm[3]=='t' && comm[4]=='e' && comm[5]=='m' &&
         comm[6]=='-' && comm[7]=='m' && comm[8]=='o' && comm[9]=='n' && comm[10]=='i' && comm[11]=='t' &&
         comm[12]=='o' && comm[13]=='r') {
@@ -301,7 +331,6 @@ static __always_inline bool is_collector_process(char *comm) {
 // Check if event should be dropped due to whitelist
 // Only applies whitelist to the collector process itself to prevent attacker evasion
 static __always_inline bool should_drop_network(struct so_event *event) {
-    // Only apply whitelist if this is the collector process
     if (!is_collector_process(event->comm)) {
         return false;
     }
@@ -339,6 +368,7 @@ struct args_listen { struct trace_entry ent; long int id; long int fd; int backl
 struct args_socket { struct trace_entry ent; long int id; int family; int type; int protocol; };
 struct args_sendto { struct trace_entry ent; long int id; long int fd; void * buff; size_t len; unsigned int flags; struct sockaddr * addr; int addr_len; };
 struct args_recvfrom { struct trace_entry ent; long int id; long int fd; void * ubuf; size_t size; unsigned int flags; struct sockaddr * addr; int * addr_len; };
+struct args_close { struct trace_entry ent; long int id; long int fd; };
 struct args_exit { struct trace_entry ent; long int id; long int ret; };
 
 // --- PROBES ---
@@ -346,12 +376,17 @@ struct args_exit { struct trace_entry ent; long int id; long int ret; };
 SEC("tp/syscalls/sys_enter_execve")
 int sys_enter_execve(struct args_execve *ctx) {
     u64 id = bpf_get_current_pid_tgid();
-    struct enter_data_t data = {};
+    
+    // Fix: Use map instead of stack
+    u32 zero = 0;
+    struct enter_data_t *data = bpf_map_lookup_elem(&enter_data_heap, &zero);
+    if (!data) return 0;
+    __builtin_memset(data, 0, sizeof(*data));
     
     // Stash the filename for the exit probe
-    bpf_probe_read_user_str(&data.filename, sizeof(data.filename), ctx->filename);
+    bpf_probe_read_user_str(data->filename, sizeof(data->filename), ctx->filename);
     
-    bpf_map_update_elem(&exec_data, &id, &data, BPF_ANY);
+    bpf_map_update_elem(&exec_data, &id, data, BPF_ANY);
     return 0;
 }
 
@@ -380,22 +415,34 @@ int sys_exit_execve(struct args_exit *ctx) {
 SEC("tp/syscalls/sys_enter_openat")
 int sys_enter_openat(struct args_openat *ctx) {
     u64 id = bpf_get_current_pid_tgid();
-    struct enter_data_t data = {};
-    bpf_probe_read_user_str(&data.filename, sizeof(data.filename), ctx->filename);
-    data.flags = ctx->flags;
-    bpf_map_update_elem(&open_data, &id, &data, BPF_ANY);
+    
+    // Fix: Use map instead of stack
+    u32 zero = 0;
+    struct enter_data_t *data = bpf_map_lookup_elem(&enter_data_heap, &zero);
+    if (!data) return 0;
+    __builtin_memset(data, 0, sizeof(*data));
+
+    bpf_probe_read_user_str(data->filename, sizeof(data->filename), ctx->filename);
+    data->flags = ctx->flags;
+    bpf_map_update_elem(&open_data, &id, data, BPF_ANY);
     return 0;
 }
 
 SEC("tp/syscalls/sys_enter_openat2")
 int sys_enter_openat2(struct args_openat2 *ctx) {
     u64 id = bpf_get_current_pid_tgid();
-    struct enter_data_t data = {};
+    
+    // Fix: Use map instead of stack
+    u32 zero = 0;
+    struct enter_data_t *data = bpf_map_lookup_elem(&enter_data_heap, &zero);
+    if (!data) return 0;
+    __builtin_memset(data, 0, sizeof(*data));
+
     struct open_how_local how = {};
-    bpf_probe_read_user_str(&data.filename, sizeof(data.filename), ctx->filename);
+    bpf_probe_read_user_str(data->filename, sizeof(data->filename), ctx->filename);
     bpf_probe_read_user(&how, sizeof(struct open_how_local), ctx->how);
-    data.flags = how.flags;
-    bpf_map_update_elem(&open_data, &id, &data, BPF_ANY);
+    data->flags = how.flags;
+    bpf_map_update_elem(&open_data, &id, data, BPF_ANY);
     return 0;
 }
 
@@ -413,6 +460,12 @@ int sys_exit_openat(struct args_exit *ctx) {
         event->ret = ctx->ret;
         submit(ctx, event);
     }
+
+    if (ctx->ret >= 0) {
+        u64 fd_key = (id & 0xFFFFFFFF00000000ULL) | (u32)ctx->ret;
+        bpf_map_update_elem(&fd_to_filename, &fd_key, data->filename, BPF_ANY);
+    }
+
     bpf_map_delete_elem(&open_data, &id);
     return 0;
 }
@@ -431,6 +484,12 @@ int sys_exit_openat2(struct args_exit *ctx) {
         event->ret = ctx->ret;
         submit(ctx, event);
     }
+
+    if (ctx->ret >= 0) {
+        u64 fd_key = (id & 0xFFFFFFFF00000000ULL) | (u32)ctx->ret;
+        bpf_map_update_elem(&fd_to_filename, &fd_key, data->filename, BPF_ANY);
+    }
+
     bpf_map_delete_elem(&open_data, &id);
     return 0;
 }
@@ -438,10 +497,23 @@ int sys_exit_openat2(struct args_exit *ctx) {
 SEC("tp/syscalls/sys_enter_write")
 int sys_enter_write(struct args_write *ctx) {
     u64 id = bpf_get_current_pid_tgid();
-    struct enter_data_t data = {};
-    data.fd = ctx->fd;
-    data.count = ctx->count;
-    bpf_map_update_elem(&write_data, &id, &data, BPF_ANY);
+    
+    // Fix: Use map instead of stack to avoid BPF stack limit
+    u32 zero = 0;
+    struct enter_data_t *data = bpf_map_lookup_elem(&enter_data_heap, &zero);
+    if (!data) return 0;
+    __builtin_memset(data, 0, sizeof(*data));
+
+    data->fd = ctx->fd;
+    data->count = ctx->count;
+
+    u64 fd_key = (id & 0xFFFFFFFF00000000ULL) | (u32)ctx->fd;
+    char *filename = bpf_map_lookup_elem(&fd_to_filename, &fd_key);
+    if (filename) {
+        __builtin_memcpy(data->filename, filename, sizeof(data->filename));
+    }
+
+    bpf_map_update_elem(&write_data, &id, data, BPF_ANY);
     return 0;
 }
 
@@ -455,6 +527,7 @@ int sys_exit_write(struct args_exit *ctx) {
     if (event) {
         event->event_type = EV_FS;
         __builtin_memcpy(event->syscall, "write", 6);
+        __builtin_memcpy(event->filename, data->filename, sizeof(event->filename));
         event->fd = data->fd;
         event->count = data->count;
         event->bytes_rw = ctx->ret;
@@ -468,10 +541,23 @@ int sys_exit_write(struct args_exit *ctx) {
 SEC("tp/syscalls/sys_enter_read")
 int sys_enter_read(struct args_read *ctx) {
     u64 id = bpf_get_current_pid_tgid();
-    struct enter_data_t data = {};
-    data.fd = ctx->fd;
-    data.count = ctx->count;
-    bpf_map_update_elem(&read_data, &id, &data, BPF_ANY);
+    
+    // Fix: Use map instead of stack
+    u32 zero = 0;
+    struct enter_data_t *data = bpf_map_lookup_elem(&enter_data_heap, &zero);
+    if (!data) return 0;
+    __builtin_memset(data, 0, sizeof(*data));
+
+    data->fd = ctx->fd;
+    data->count = ctx->count;
+
+    u64 fd_key = (id & 0xFFFFFFFF00000000ULL) | (u32)ctx->fd;
+    char *filename = bpf_map_lookup_elem(&fd_to_filename, &fd_key);
+    if (filename) {
+        __builtin_memcpy(data->filename, filename, sizeof(data->filename));
+    }
+
+    bpf_map_update_elem(&read_data, &id, data, BPF_ANY);
     return 0;
 }
 
@@ -485,6 +571,7 @@ int sys_exit_read(struct args_exit *ctx) {
     if (event) {
         event->event_type = EV_FS;
         __builtin_memcpy(event->syscall, "read", 5);
+        __builtin_memcpy(event->filename, data->filename, sizeof(event->filename));
         event->fd = data->fd;
         event->count = data->count;
         event->bytes_rw = ctx->ret;
@@ -492,6 +579,14 @@ int sys_exit_read(struct args_exit *ctx) {
         submit(ctx, event);
     }
     bpf_map_delete_elem(&read_data, &id);
+    return 0;
+}
+
+SEC("tp/syscalls/sys_enter_close")
+int sys_enter_close(struct args_close *ctx) {
+    u64 id = bpf_get_current_pid_tgid();
+    u64 fd_key = (id & 0xFFFFFFFF00000000ULL) | (u32)ctx->fd;
+    bpf_map_delete_elem(&fd_to_filename, &fd_key);
     return 0;
 }
 
@@ -536,6 +631,8 @@ int sys_enter_connect(struct args_connect *ctx) {
     u64 id = bpf_get_current_pid_tgid();
     struct socket_data_t sock_data = {};
 
+    sock_data.fd = ctx->fd;
+
     u16 family = 0;
     bpf_probe_read_user(&family, sizeof(family), ctx->uservaddr);
     sock_data.sa_family = family;
@@ -574,7 +671,7 @@ int sys_exit_connect(struct args_exit *ctx) {
 
         // If connect successful, store socket info for later correlation
         if (ctx->ret >= 0) {
-            u64 sock_key = (id & 0xFFFFFFFF00000000ULL) | (u32)ctx->ret;
+            u64 sock_key = (id & 0xFFFFFFFF00000000ULL) | (u32)sock_data->fd;
             bpf_map_update_elem(&socket_map, &sock_key, sock_data, BPF_ANY);
         }
 
@@ -695,10 +792,7 @@ static __always_inline int process_exit_accept(struct args_exit *ctx, const char
     event->event_type = EV_NET;
     __builtin_memcpy(event->syscall, syscall_name, sys_len);
     event->ret = ctx->ret;
-    // New File Descriptor
     event->fd = ctx->ret;
-
-    // Use copied sockaddr data
     event->sa_family = args->sa_family;
 
     struct socket_data_t sock_data = {};
@@ -707,18 +801,15 @@ static __always_inline int process_exit_accept(struct args_exit *ctx, const char
     if (args->sa_family == 2) { // AF_INET
         event->src_ip = args->ipv4;
         event->src_port = args->port;
-
         sock_data.dest_ip = args->ipv4;
         sock_data.dest_port = args->port;
     } else if (args->sa_family == 10) { // AF_INET6
         event->src_port = args->port;
         __builtin_memcpy(event->src_ipv6, args->ipv6, sizeof(event->src_ipv6));
-
         sock_data.dest_port = args->port;
         __builtin_memcpy(sock_data.dest_ipv6, args->ipv6, sizeof(sock_data.dest_ipv6));
     }
 
-    // Update socket_map with the NEW FD (ctx->ret) so future I/O is correlated
     u64 sock_key = (id & 0xFFFFFFFF00000000ULL) | (u32)ctx->ret;
     bpf_map_update_elem(&socket_map, &sock_key, &sock_data, BPF_ANY);
 
@@ -740,38 +831,44 @@ int sys_exit_accept4(struct args_exit *ctx) {
 SEC("tp/syscalls/sys_enter_sendto")
 int sys_enter_sendto(struct args_sendto *ctx) {
     u64 id = bpf_get_current_pid_tgid();
-    struct enter_data_t data = {};
-    data.fd = ctx->fd;
-    data.count = ctx->len;
+    
+    // Fix: Use map instead of stack
+    u32 zero = 0;
+    struct enter_data_t *data = bpf_map_lookup_elem(&enter_data_heap, &zero);
+    if (!data) return 0;
+    __builtin_memset(data, 0, sizeof(*data));
+
+    data->fd = ctx->fd;
+    data->count = ctx->len;
 
     if (ctx->addr) {
         u16 family = 0;
         bpf_probe_read_user(&family, sizeof(family), ctx->addr);
-        data.sa_family = family;
+        data->sa_family = family;
 
         if (family == 2) { // AF_INET
             struct sockaddr_in addr = {};
             bpf_probe_read_user(&addr, sizeof(addr), ctx->addr);
-            data.dest_ip = bpf_ntohl(addr.sin_addr.s_addr);
-            data.dest_port = bpf_ntohs(addr.sin_port);
+            data->dest_ip = bpf_ntohl(addr.sin_addr.s_addr);
+            data->dest_port = bpf_ntohs(addr.sin_port);
         } else if (family == 10) { // AF_INET6
             struct sockaddr_in6 addr = {};
             bpf_probe_read_user(&addr, sizeof(addr), ctx->addr);
-            data.dest_port = bpf_ntohs(addr.sin6_port);
-            bpf_probe_read_user(&data.dest_ipv6, sizeof(data.dest_ipv6), &addr.sin6_addr);
+            data->dest_port = bpf_ntohs(addr.sin6_port);
+            bpf_probe_read_user(&data->dest_ipv6, sizeof(data->dest_ipv6), &addr.sin6_addr);
         }
     }
 
-    bpf_map_update_elem(&write_data, &id, &data, BPF_ANY);
+    bpf_map_update_elem(&sendto_data, &id, data, BPF_ANY);
     return 0;
 }
 
 SEC("tp/syscalls/sys_exit_sendto")
 int sys_exit_sendto(struct args_exit *ctx) {
     u64 id = bpf_get_current_pid_tgid();
-    struct enter_data_t *data = bpf_map_lookup_elem(&write_data, &id);
+    struct enter_data_t *data = bpf_map_lookup_elem(&sendto_data, &id);
     if (!data) return 0;
-    if (ctx->ret < 0) { bpf_map_delete_elem(&write_data, &id); return 0; }
+    if (ctx->ret < 0) { bpf_map_delete_elem(&sendto_data, &id); return 0; }
 
     struct so_event *event = init_event();
     if (event) {
@@ -782,7 +879,6 @@ int sys_exit_sendto(struct args_exit *ctx) {
         event->bytes_rw = ctx->ret;
         event->ret = ctx->ret;
 
-        // Try to get socket info if available
         u64 sock_key = (id & 0xFFFFFFFF00000000ULL) | (u32)event->fd;
         struct socket_data_t *sock_data = bpf_map_lookup_elem(&socket_map, &sock_key);
         if (sock_data) {
@@ -798,27 +894,33 @@ int sys_exit_sendto(struct args_exit *ctx) {
 
         submit(ctx, event);
     }
-    bpf_map_delete_elem(&write_data, &id);
+    bpf_map_delete_elem(&sendto_data, &id);
     return 0;
 }
 
 SEC("tp/syscalls/sys_enter_recvfrom")
 int sys_enter_recvfrom(struct args_recvfrom *ctx) {
     u64 id = bpf_get_current_pid_tgid();
-    struct enter_data_t data = {};
-    data.fd = ctx->fd;
-    data.count = ctx->size;
-    data.addr_ptr = (u64)ctx->addr;
-    bpf_map_update_elem(&read_data, &id, &data, BPF_ANY);
+    
+    // Fix: Use map instead of stack
+    u32 zero = 0;
+    struct enter_data_t *data = bpf_map_lookup_elem(&enter_data_heap, &zero);
+    if (!data) return 0;
+    __builtin_memset(data, 0, sizeof(*data));
+
+    data->fd = ctx->fd;
+    data->count = ctx->size;
+    data->addr_ptr = (u64)ctx->addr;
+    bpf_map_update_elem(&recvfrom_data, &id, data, BPF_ANY);
     return 0;
 }
 
 SEC("tp/syscalls/sys_exit_recvfrom")
 int sys_exit_recvfrom(struct args_exit *ctx) {
     u64 id = bpf_get_current_pid_tgid();
-    struct enter_data_t *data = bpf_map_lookup_elem(&read_data, &id);
+    struct enter_data_t *data = bpf_map_lookup_elem(&recvfrom_data, &id);
     if (!data) return 0;
-    if (ctx->ret < 4) { bpf_map_delete_elem(&read_data, &id); return 0; }
+    if (ctx->ret < 4) { bpf_map_delete_elem(&recvfrom_data, &id); return 0; }
 
     struct so_event *event = init_event();
     if (event) {
@@ -829,7 +931,6 @@ int sys_exit_recvfrom(struct args_exit *ctx) {
         event->bytes_rw = ctx->ret;
         event->ret = ctx->ret;
 
-        // Try to get socket info if available
         u64 sock_key = (id & 0xFFFFFFFF00000000ULL) | (u32)event->fd;
         struct socket_data_t *sock_data = bpf_map_lookup_elem(&socket_map, &sock_key);
         if (sock_data) {
@@ -857,7 +958,7 @@ int sys_exit_recvfrom(struct args_exit *ctx) {
 
         submit(ctx, event);
     }
-    bpf_map_delete_elem(&read_data, &id);
+    bpf_map_delete_elem(&recvfrom_data, &id);
     return 0;
 }
 

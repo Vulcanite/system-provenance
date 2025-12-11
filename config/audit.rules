@@ -1,0 +1,52 @@
+#----------------------------------------
+# 1. Core Executions (The most high-value log)
+#----------------------------------------
+-a always,exit -F arch=b64 -S execve,execveat -k audit_exec
+
+#----------------------------------------
+# 2. Suspicious file writes (Persistence)
+#----------------------------------------
+# Watch specific critical files for tampering
+-w /etc/passwd -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/sudoers -p wa -k identity
+-w /etc/ssh/ -p wa -k ssh-config
+
+# Watch for changes in persistence areas (Cron, Systemd)
+-w /etc/cron.d/ -p wa -k persistence
+-w /etc/cron.daily/ -p wa -k persistence
+-w /etc/systemd/system/ -p wa -k persistence
+
+#----------------------------------------
+# 3. Exfiltration Tools (Execution only)
+#----------------------------------------
+# We rely on 'execve' above to capture arguments, but we tag specific dangerous tools
+# Note: We rely on the path. If they move the binary, execve catches the syscall,
+# but this tag helps quick searching.
+-w /usr/bin/wget -p x -k network-tool
+-w /usr/bin/curl -p x -k network-tool
+-w /usr/bin/nc -p x -k network-tool
+-w /usr/bin/scp -p x -k network-tool
+-w /usr/bin/rsync -p x -k network-tool
+
+#----------------------------------------
+# 4. Privilege Escalation / User Emulation
+#----------------------------------------
+-w /usr/bin/sudo -p x -k priv-esc
+-w /usr/bin/su -p x -k priv-esc
+
+#----------------------------------------
+# 5. External Media (Mounts)
+#----------------------------------------
+# 64-bit mount operations
+-a always,exit -F arch=b64 -S mount -F auid!=-1 -k external-media
+# Monitor the media directory for writes (Careful if heavy file copying happens)
+-w /media/ -p wa -k media-write
+
+#----------------------------------------
+# 6. Anti-Forensics (Deleting logs)
+#----------------------------------------
+-w /var/log/audit/ -p wa -k audit-log-tamper
+-w /var/log/auth.log -p wa -k auth-log-tamper
+
+-e 2

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha1"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -19,17 +21,23 @@ import (
 )
 
 type ESConfig struct {
-	Host       string `json:"es_host"`
-	Port       int    `json:"es_port"`
-	User       string `json:"es_user"`
-	Password   string `json:"es_password"`
-	EBPFIndex  string `json:"ebpf_index"`
-	PCAPIndex  string `json:"pcap_index"`
-	BatchSize  int    `json:"batch_size"`
-	SslEnabled bool   `json:"secure"`
+	Host        string `json:"es_host"`
+	Port        int    `json:"es_port"`
+	User        string `json:"es_user"`
+	Password    string `json:"es_password"`
+	AuditdIndex string `json:"auditd_index"`
+	EBPFIndex   string `json:"ebpf_index"`
+	PCAPIndex   string `json:"pcap_index"`
+	BatchSize   int    `json:"batch_size"`
+	SslEnabled  bool   `json:"secure"`
 }
 
 type EBPFConfig struct {
+	Enabled            bool `json:"enabled"`
+	FileLoggingEnabled bool `json:"file_logging_enabled"`
+}
+
+type AuditdConfig struct {
 	Enabled            bool `json:"enabled"`
 	FileLoggingEnabled bool `json:"file_logging_enabled"`
 }
@@ -45,22 +53,62 @@ type PCAPConfig struct {
 }
 
 type Config struct {
-	Hostname    string     `json:"hostname"`
-	EventsDir   string     `json:"events_dir"`
-	OutputDir   string     `json:"output_dir"`
-	StorageType string     `json:"storage_type"`
-	ESConfig    ESConfig   `json:"es_config"`
-	EBPFConfig  EBPFConfig `json:"ebpf_config"`
-	PCAPConfig  PCAPConfig `json:"pcap_config"`
+	Hostname     string       `json:"hostname"`
+	EventsDir    string       `json:"events_dir"`
+	OutputDir    string       `json:"output_dir"`
+	StorageType  string       `json:"storage_type"`
+	ESConfig     ESConfig     `json:"es_config"`
+	AuditdConfig AuditdConfig `json:"auditd_config"`
+	EBPFConfig   EBPFConfig   `json:"ebpf_config"`
+	PCAPConfig   PCAPConfig   `json:"pcap_config"`
 }
 
 var (
-	outputFile      *os.File
-	fileLock        sync.Mutex
-	bulkIndexer     esutil.BulkIndexer
-	pcapBulkIndexer esutil.BulkIndexer
-	cfg             Config
+	outputFile       *os.File
+	fileLock         sync.Mutex
+	bulkIndexer      esutil.BulkIndexer
+	pcapBulkIndexer  esutil.BulkIndexer
+	auditBulkIndexer esutil.BulkIndexer
+	cfg              Config
 )
+
+// GenerateFlowID creates a Community ID hash for flow correlation
+// Based on sorted 4-tuple (srcIP, dstIP, srcPort, dstPort, protocol)
+func GenerateFlowID(srcIP, dstIP string, srcPort, dstPort uint16, protocol string) string {
+	// Normalize protocol to uppercase
+	proto := strings.ToUpper(protocol)
+
+	// Sort the tuple to ensure consistent hashing regardless of direction
+	var lowIP, highIP string
+	var lowPort, highPort uint16
+
+	if srcIP < dstIP {
+		lowIP, highIP = srcIP, dstIP
+		lowPort, highPort = srcPort, dstPort
+	} else if srcIP > dstIP {
+		lowIP, highIP = dstIP, srcIP
+		lowPort, highPort = dstPort, srcPort
+	} else {
+		// IPs are equal, sort by port
+		lowIP, highIP = srcIP, dstIP
+		if srcPort < dstPort {
+			lowPort, highPort = srcPort, dstPort
+		} else {
+			lowPort, highPort = dstPort, srcPort
+		}
+	}
+
+	// Create the tuple string for hashing
+	tuple := fmt.Sprintf("%s:%d-%s:%d-%s", lowIP, lowPort, highIP, highPort, proto)
+
+	// Generate SHA1 hash
+	h := sha1.New()
+	h.Write([]byte(tuple))
+	hash := h.Sum(nil)
+
+	// Return as hex string
+	return hex.EncodeToString(hash)
+}
 
 func setupLogging() {
 	if cfg.EventsDir == "" {
@@ -154,6 +202,25 @@ func setupES() {
 			fmt.Println("[+] PCAP Bulk Indexer Ready")
 		}
 	}
+
+	if cfg.AuditdConfig.Enabled {
+		auditBI, err := esutil.NewBulkIndexer(esutil.BulkIndexerConfig{
+			Client:        es,
+			Index:         cfg.ESConfig.AuditdIndex,
+			FlushBytes:    1000000,
+			FlushInterval: 1 * time.Second,
+			OnError: func(ctx context.Context, err error) {
+				log.Printf("[!] Auditd Bulk Indexer Error: %v", err)
+			},
+		})
+
+		if err != nil {
+			log.Printf("[!] Auditd Bulk Indexer Init Failed: %v", err)
+		} else {
+			auditBulkIndexer = auditBI
+			fmt.Println("[+] Auditd Bulk Indexer Ready")
+		}
+	}
 }
 
 func main() {
@@ -191,6 +258,16 @@ func main() {
 		go func() {
 			if err := pcapCollector.Start(); err != nil {
 				log.Printf("[!] PCAP collector error: %v", err)
+			}
+		}()
+	}
+
+	var auditCollector *AuditdCollector
+	if cfg.AuditdConfig.Enabled {
+		auditCollector = NewAuditdCollector(cfg, auditBulkIndexer)
+		go func() {
+			if err := auditCollector.Start(); err != nil {
+				log.Printf("[!] Auditd collector error: %v", err)
 			}
 		}()
 	}
@@ -243,8 +320,6 @@ func main() {
 				log.Printf("[!] eBPF collector error: %v", err)
 			}
 		}()
-	} else {
-		fmt.Println("[+] eBPF monitoring disabled. Only PCAP collection active.")
 	}
 
 	select {}

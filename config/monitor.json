@@ -10,6 +10,7 @@
     "es_password": "changeme",
     "ebpf_index": "ebpf-events",
     "pcap_index": "pcap-flows",
+    "auditd_index": "auditd-events",
     "batch_size": 1000,
     "secure": true
   },
@@ -17,9 +18,13 @@
     "enabled": true,
     "file_logging_enabled": false
   },
+  "auditd_config": {
+    "enabled": true,
+    "file_logging_enabled": false
+  },
   "pcap_config": {
     "enabled": true,
-    "file_logging_enabled": true,
+    "file_logging_enabled": false,
     "interface": "eth0",
     "bpf_filter": "tcp or udp",
     "flow_timeout": 300,
