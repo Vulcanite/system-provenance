@@ -19,6 +19,7 @@ import (
 	"github.com/cilium/ebpf/perf"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/elastic/go-elasticsearch/v8/esutil"
+	"golang.org/x/sys/unix"
 )
 
 // eBPFEvent represents a syscall event captured by eBPF
@@ -43,14 +44,15 @@ type eBPFEvent struct {
 
 	// Enhanced network fields
 	SrcIP      string `json:"src_ip,omitempty"`
-	DestIP     string `json:"dest_ip,omitempty"`
+	DestIP     string `json:"dst_ip,omitempty"`
 	SrcIPv6    string `json:"src_ipv6,omitempty"`
-	DestIPv6   string `json:"dest_ipv6,omitempty"`
+	DestIPv6   string `json:"dst_ipv6,omitempty"`
 	SrcPort    uint16 `json:"src_port,omitempty"`
 	DestPort   uint16 `json:"dest_port,omitempty"`
 	SaFamily   string `json:"sa_family,omitempty"`
 	Protocol   uint8  `json:"protocol,omitempty"`
 	SocketType uint8  `json:"socket_type,omitempty"`
+	FlowID     string `json:"flow_id,omitempty"`
 
 	// I/O fields
 	Count   uint64 `json:"count,omitempty"`
@@ -80,17 +82,30 @@ type EBPFCollector struct {
 	eventsChan  chan eBPFEvent
 	indexerWg   sync.WaitGroup
 	metrics     RuntimeMetrics
+	bootTime    time.Time // Boot time offset for accurate timestamp correlation
 }
 
 // NewEBPFCollector creates a new eBPF collector instance
 func NewEBPFCollector(cfg Config, outputFile *os.File, bulkIndexer esutil.BulkIndexer) (*EBPFCollector, error) {
+	realtimeNow := time.Now()
+
+	var mono unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &mono); err != nil {
+		return nil, fmt.Errorf("failed to get monotonic time: %v", err)
+	}
+
+	monotonicNow := time.Duration(mono.Sec)*time.Second + time.Duration(mono.Nsec)*time.Nanosecond
+	bootTime := realtimeNow.Add(-monotonicNow)
+
 	collector := &EBPFCollector{
 		cfg:         cfg,
 		outputFile:  outputFile,
 		bulkIndexer: bulkIndexer,
 		stopChan:    make(chan struct{}),
 		eventsChan:  make(chan eBPFEvent, 50000),
+		bootTime:    bootTime,
 	}
+	log.Printf("[+] Boot time calculated: %s (for timestamp correlation)", bootTime.Format(time.RFC3339Nano))
 
 	// Remove memlock limit
 	if err := rlimit.RemoveMemlock(); err != nil {
@@ -250,6 +265,12 @@ func (ec *EBPFCollector) attachTracepoints() error {
 	if err := attach("syscalls", "sys_exit_read", ec.objs.SysExitRead); err != nil {
 		return err
 	}
+
+	// CLOSE (for FD cleanup)
+	// NOTE: Requires `go generate` to be run after updating main.bpf.c
+	// if err := attach("syscalls", "sys_enter_close", ec.objs.SysEnterClose); err != nil {
+	// 	return err
+	// }
 
 	// CLONE
 	if err := attach("syscalls", "sys_enter_clone", ec.objs.SysEnterClone); err != nil {
@@ -451,14 +472,15 @@ func (ec *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 	// Use kernel monotonic timestamp (bpf_ktime_get_ns) as canonical event time
 	kernelTimeNs := int64(raw.Timestamp)
 
-	// For correlation, also capture userspace processing time
-	userspaceTime := time.Now()
+	// Convert kernel monotonic time to wall-clock time using boot time offset
+	// event_wallclock = BOOT_TIME + bpf_ktime_get_ns()
+	eventWallclock := ec.bootTime.Add(time.Duration(kernelTimeNs))
 
 	evt := eBPFEvent{
 		Hostname:         ec.cfg.Hostname,
-		TimestampNs:      kernelTimeNs, // Canonical kernel event time
-		EpochTimestamp:   userspaceTime.UnixMilli(),
-		Datetime:         userspaceTime.UTC().Format(time.RFC3339Nano),
+		TimestampNs:      kernelTimeNs, // Canonical kernel event time (monotonic)
+		EpochTimestamp:   eventWallclock.UnixMilli(),
+		Datetime:         eventWallclock.UTC().Format(time.RFC3339Nano),
 		Pid:              raw.Pid,
 		Ppid:             raw.Ppid,
 		Uid:              raw.Uid,
@@ -512,6 +534,28 @@ func (ec *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 
 		evt.SrcPort = raw.SrcPort
 		evt.DestPort = raw.DestPort
+
+		// Generate Flow ID for network events with complete 5-tuple
+		if raw.Protocol == 6 || raw.Protocol == 17 { // TCP or UDP
+			var srcIP, destIP string
+			if evt.SrcIP != "" {
+				srcIP = evt.SrcIP
+			}
+			if evt.DestIP != "" {
+				destIP = evt.DestIP
+			}
+			if evt.SrcIPv6 != "" {
+				srcIP = evt.SrcIPv6
+			}
+			if evt.DestIPv6 != "" {
+				destIP = evt.DestIPv6
+			}
+
+			if srcIP != "" && destIP != "" {
+				proto := map[uint8]string{6: "TCP", 17: "UDP"}[raw.Protocol]
+				evt.FlowID = GenerateFlowID(srcIP, destIP, evt.SrcPort, evt.DestPort, proto)
+			}
+		}
 	}
 
 	// Parse I/O fields
@@ -565,24 +609,18 @@ func int8ToStr(bs []int8) string {
 
 // parseIPv4 converts a uint32 IP address to string in correct byte order
 func parseIPv4(ip uint32) string {
-	// IP is stored in host byte order (big-endian network order)
-	return fmt.Sprintf("%d.%d.%d.%d",
-		byte(ip>>24),
-		byte(ip>>16),
-		byte(ip>>8),
-		byte(ip))
+	b := make([]byte, 4)
+	binary.BigEndian.PutUint32(b, ip)
+	return net.IP(b).String()
 }
 
 // parseIPv6 converts IPv6 address parts to formatted string
 func parseIPv6(parts [4]uint32) string {
-	buf := new(bytes.Buffer)
-	for _, p := range parts {
-		// Write in network byte order (big-endian)
-		binary.Write(buf, binary.BigEndian, p)
+	buf := make([]byte, 16)
+	for i := 0; i < 4; i++ {
+		binary.BigEndian.PutUint32(buf[i*4:], parts[i])
 	}
-	ip := net.IP(buf.Bytes())
-	// Use net.IP.String() for proper IPv6 formatting with :: compression
-	return ip.String()
+	return net.IP(buf).String()
 }
 
 func getErrno(ret int64) (string, int64) {

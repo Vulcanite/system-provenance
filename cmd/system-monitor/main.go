@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha1"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -36,21 +38,8 @@ type EBPFConfig struct {
 }
 
 type AuditdConfig struct {
-	Enabled            bool        `json:"enabled"`
-	FileLoggingEnabled bool        `json:"file_logging_enabled"`
-	Rules              []AuditRule `json:"rules"`
-}
-
-type AuditRule struct {
-	Type        string   `json:"type"`        // "watch" or "syscall"
-	Path        string   `json:"path"`        // For watch rules
-	Permissions string   `json:"permissions"` // For watch rules: "r", "w", "x", "a"
-	Key         string   `json:"key"`         // Rule key/tag
-	Action      string   `json:"action"`      // For syscall rules: "always", "never"
-	List        string   `json:"list"`        // For syscall rules: "exit", "task"
-	Arch        string   `json:"arch"`        // For syscall rules: "b64", "b32"
-	Syscalls    []string `json:"syscalls"`    // For syscall rules
-	Filters     []string `json:"filters"`     // Additional filters like "auid!=-1"
+	Enabled            bool `json:"enabled"`
+	FileLoggingEnabled bool `json:"file_logging_enabled"`
 }
 
 type PCAPConfig struct {
@@ -82,6 +71,44 @@ var (
 	auditBulkIndexer esutil.BulkIndexer
 	cfg              Config
 )
+
+// GenerateFlowID creates a Community ID hash for flow correlation
+// Based on sorted 4-tuple (srcIP, dstIP, srcPort, dstPort, protocol)
+func GenerateFlowID(srcIP, dstIP string, srcPort, dstPort uint16, protocol string) string {
+	// Normalize protocol to uppercase
+	proto := strings.ToUpper(protocol)
+
+	// Sort the tuple to ensure consistent hashing regardless of direction
+	var lowIP, highIP string
+	var lowPort, highPort uint16
+
+	if srcIP < dstIP {
+		lowIP, highIP = srcIP, dstIP
+		lowPort, highPort = srcPort, dstPort
+	} else if srcIP > dstIP {
+		lowIP, highIP = dstIP, srcIP
+		lowPort, highPort = dstPort, srcPort
+	} else {
+		// IPs are equal, sort by port
+		lowIP, highIP = srcIP, dstIP
+		if srcPort < dstPort {
+			lowPort, highPort = srcPort, dstPort
+		} else {
+			lowPort, highPort = dstPort, srcPort
+		}
+	}
+
+	// Create the tuple string for hashing
+	tuple := fmt.Sprintf("%s:%d-%s:%d-%s", lowIP, lowPort, highIP, highPort, proto)
+
+	// Generate SHA1 hash
+	h := sha1.New()
+	h.Write([]byte(tuple))
+	hash := h.Sum(nil)
+
+	// Return as hex string
+	return hex.EncodeToString(hash)
+}
 
 func setupLogging() {
 	if cfg.EventsDir == "" {
@@ -293,7 +320,7 @@ func main() {
 				log.Printf("[!] eBPF collector error: %v", err)
 			}
 		}()
-	} else {
-		select {}
 	}
+
+	select {}
 }

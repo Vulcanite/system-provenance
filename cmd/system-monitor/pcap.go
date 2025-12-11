@@ -27,19 +27,20 @@ type FlowKey struct {
 
 // FlowStats tracks statistics for a network flow
 type FlowStats struct {
-	Hostname     string    `json:"hostname"`
+	Hostname string `json:"hostname"`
 	FlowKey
-	PacketCount  uint64    `json:"packet_count"`
-	ByteCount    uint64    `json:"byte_count"`
-	FirstSeen    time.Time `json:"first_seen"`
-	LastSeen     time.Time `json:"last_seen"`
-	TCPFlags     []string  `json:"tcp_flags,omitempty"`
-	DomainName   string    `json:"domain_name,omitempty"`
-	DNSResolved  bool      `json:"dns_resolved"`
-	EpochFirst   int64     `json:"epoch_first"`
-	EpochLast    int64     `json:"epoch_last"`
-	DatetimeFirst string   `json:"datetime_first"`
-	DatetimeLast  string   `json:"datetime_last"`
+	FlowID        string    `json:"flow_id"`
+	PacketCount   uint64    `json:"packet_count"`
+	ByteCount     uint64    `json:"byte_count"`
+	FirstSeen     time.Time `json:"first_seen"`
+	LastSeen      time.Time `json:"last_seen"`
+	TCPFlags      []string  `json:"tcp_flags,omitempty"`
+	DomainName    string    `json:"domain_name,omitempty"`
+	DNSResolved   bool      `json:"dns_resolved"`
+	EpochFirst    int64     `json:"epoch_first"`
+	EpochLast     int64     `json:"epoch_last"`
+	DatetimeFirst string    `json:"datetime_first"`
+	DatetimeLast  string    `json:"datetime_last"`
 }
 
 // DNSCacheEntry represents a cached DNS resolution
@@ -56,17 +57,17 @@ type WhitelistRule struct {
 
 // PCAPCollector handles packet capture and flow aggregation
 type PCAPCollector struct {
-	cfg               Config
-	flows             map[FlowKey]*FlowStats
-	flowsMutex        sync.RWMutex
-	dnsCache          map[string]*DNSCacheEntry
-	dnsCacheMutex     sync.RWMutex
-	bulkIndexer       esutil.BulkIndexer
-	outputFile        *os.File
-	fileLock          sync.Mutex
-	stopChan          chan struct{}
-	whitelistRules    []WhitelistRule  // Combined IP+Port rules to exclude
-	whitelistIPs      map[string]bool  // IPs to exclude (for localhost only)
+	cfg            Config
+	flows          map[FlowKey]*FlowStats
+	flowsMutex     sync.RWMutex
+	dnsCache       map[string]*DNSCacheEntry
+	dnsCacheMutex  sync.RWMutex
+	bulkIndexer    esutil.BulkIndexer
+	outputFile     *os.File
+	fileLock       sync.Mutex
+	stopChan       chan struct{}
+	whitelistRules []WhitelistRule // Combined IP+Port rules to exclude
+	whitelistIPs   map[string]bool // IPs to exclude (for localhost only)
 }
 
 // NewPCAPCollector creates a new PCAP collector instance
@@ -143,8 +144,8 @@ func (pc *PCAPCollector) Start() error {
 	// Open network interface
 	handle, err := pcap.OpenLive(
 		pc.cfg.PCAPConfig.Interface,
-		1600,  // snapshot length
-		true,  // promiscuous mode
+		1600, // snapshot length
+		true, // promiscuous mode
 		pcap.BlockForever,
 	)
 	if err != nil {
@@ -176,6 +177,9 @@ func (pc *PCAPCollector) Start() error {
 			pc.flushFlows()
 			return nil
 		case packet := <-packetSource.Packets():
+			if packet == nil {
+				continue
+			}
 			pc.processPacket(packet)
 		}
 	}
@@ -299,10 +303,12 @@ func (pc *PCAPCollector) updateFlow(key FlowKey, packetLen int, tcpFlags []strin
 	flow, exists := pc.flows[key]
 
 	if !exists {
-		// Create new flow
+		// Create new flow with Flow ID for correlation
+		flowID := GenerateFlowID(key.SrcIP, key.DstIP, key.SrcPort, key.DstPort, key.Protocol)
 		flow = &FlowStats{
 			Hostname:      pc.cfg.Hostname,
 			FlowKey:       key,
+			FlowID:        flowID,
 			PacketCount:   1,
 			ByteCount:     uint64(packetLen),
 			FirstSeen:     now,
