@@ -27,14 +27,27 @@ type AuditdCollector struct {
 }
 
 type AuditEvent struct {
-	Timestamp int64                  `json:"timestamp"`
-	Type      string                 `json:"type"`
-	Hostname  string                 `json:"hostname"`
-	Sequence  uint32                 `json:"sequence"`
-	Category  string                 `json:"category"`
-	Summary   string                 `json:"summary"`
-	RawData   map[string]interface{} `json:"raw_data"`
-	Tags      []string               `json:"tags"`
+	// ECS: Base fields
+	Module   string `json:"event.module"`
+	Hostname string `json:"hostname"`
+
+	// ECS: Event fields
+	Timestamp int64  `json:"timestamp"`
+	Type      string `json:"event.category"`
+	Sequence  uint32 `json:"event.sequence"`
+	Summary   string `json:"message"`
+
+	// ECS: Process fields (ADDED)
+	ProcessPID  string `json:"process.pid,omitempty"`
+	ProcessPPID string `json:"process.parent.pid,omitempty"`
+	ProcessName string `json:"process.name,omitempty"`
+	ProcessExe  string `json:"process.executable,omitempty"`
+	UserAUID    string `json:"user.id,omitempty"` // Audit User ID (login uid)
+
+	// Additional fields
+	Category string                 `json:"category"`
+	RawData  map[string]interface{} `json:"raw_data"`
+	Tags     []string               `json:"tags"`
 }
 
 func NewAuditdCollector(cfg Config, bi esutil.BulkIndexer) *AuditdCollector {
@@ -178,6 +191,7 @@ func (h *auditStreamHandler) ReassemblyComplete(msgs []*auparse.AuditMessage) {
 	aucoalesce.ResolveIDs(event)
 
 	output := AuditEvent{
+		Module:    "auditd",
 		Timestamp: event.Timestamp.UnixMilli(),
 		Type:      event.Type.String(),
 		Hostname:  h.collector.cfg.Hostname,
@@ -202,7 +216,27 @@ func (h *auditStreamHandler) ReassemblyComplete(msgs []*auparse.AuditMessage) {
 		if err == nil {
 			for k, v := range data {
 				output.RawData[k] = v
+				switch k {
+				case "pid":
+					output.ProcessPID = v
+				case "ppid":
+					output.ProcessPPID = v
+				case "exe":
+					output.ProcessExe = v
+				case "comm":
+					// Remove quotes usually found in audit logs (e.g. "cat")
+					output.ProcessName = strings.Trim(v, "\"")
+				case "auid":
+					output.UserAUID = v
+				}
 			}
+		}
+	}
+
+	if output.ProcessName == "" && output.ProcessExe != "" {
+		parts := strings.Split(output.ProcessExe, "/")
+		if len(parts) > 0 {
+			output.ProcessName = parts[len(parts)-1]
 		}
 	}
 

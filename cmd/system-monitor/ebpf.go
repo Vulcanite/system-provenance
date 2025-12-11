@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -24,56 +25,65 @@ import (
 
 // eBPFEvent represents a syscall event captured by eBPF
 type eBPFEvent struct {
-	Hostname         string `json:"hostname"`
-	TimestampNs      int64  `json:"timestamp_ns"`
-	EpochTimestamp   int64  `json:"timestamp"`
-	Datetime         string `json:"datetime"`
-	Pid              uint32 `json:"pid"`
-	Ppid             uint32 `json:"ppid"`
-	Uid              uint32 `json:"uid"`
+	// ECS: Base fields
+	Hostname string `json:"hostname"`
+	Module   string `json:"event.module"`
+
+	// ECS: @timestamp fields
+	TimestampNs    int64  `json:"timestamp_ns"`
+	EpochTimestamp int64  `json:"timestamp"`
+	Datetime       string `json:"datetime"`
+
+	// ECS: Process fields
+	Pid              uint32 `json:"process.pid"`
+	Ppid             uint32 `json:"process.parent.pid"`
+	Uid              uint32 `json:"user.id"`
 	ParentStartTime  uint64 `json:"parent_start_time"`
 	ProcessStartTime uint64 `json:"process_start_time"`
-	Comm             string `json:"comm"`
+	Comm             string `json:"process.name"`
 	Syscall          string `json:"syscall"`
-	Filename         string `json:"filename"`
+	Filename         string `json:"file.path,omitempty"`
 	Fd               int64  `json:"fd"`
 	Ret              int64  `json:"ret"`
-	EventType        string `json:"event_type,omitempty"`
-	Error            string `json:"error,omitempty"`
-	ErrorCode        int64  `json:"error_code,omitempty"`
+	EventType        string `json:"event.type,omitempty"`
+	Error            string `json:"error.message,omitempty"`
+	ErrorCode        int64  `json:"error.code,omitempty"`
 
-	// Enhanced network fields
-	SrcIP      string `json:"src_ip,omitempty"`
-	DestIP     string `json:"dst_ip,omitempty"`
-	SrcIPv6    string `json:"src_ipv6,omitempty"`
-	DestIPv6   string `json:"dst_ipv6,omitempty"`
-	SrcPort    uint16 `json:"src_port,omitempty"`
-	DestPort   uint16 `json:"dest_port,omitempty"`
-	SaFamily   string `json:"sa_family,omitempty"`
-	Protocol   uint8  `json:"protocol,omitempty"`
+	// ECS: Network fields
+	SourceIP   string `json:"source.ip,omitempty"`
+	DestIP     string `json:"destination.ip,omitempty"`
+	SourceIPv6 string `json:"source.ipv6,omitempty"`
+	DestIPv6   string `json:"destination.ipv6,omitempty"`
+	SourcePort uint16 `json:"source.port,omitempty"`
+	DestPort   uint16 `json:"destination.port,omitempty"`
+	SaFamily   string `json:"network.type,omitempty"`
+	Protocol   uint8  `json:"network.iana_number,omitempty"`
 	SocketType uint8  `json:"socket_type,omitempty"`
-	FlowID     string `json:"flow_id,omitempty"`
+	FlowID     string `json:"flow.id,omitempty"`
 
 	// I/O fields
 	Count   uint64 `json:"count,omitempty"`
 	BytesRW int64  `json:"bytes_rw,omitempty"`
+
+	// Process correlation fields
+	ProcessUUID string `json:"process.entity_id,omitempty"`
+	ParentUUID  string `json:"process.parent.entity_id,omitempty"`
 }
 
 // RuntimeMetrics tracks performance metrics
 type RuntimeMetrics struct {
 	EventsReceived   uint64
 	EventsIndexed    uint64
+	EventsFiltered   uint64
 	LostSamples      uint64
 	IndexingFailures uint64
 	ChannelDrops     uint64
-	mu               sync.Mutex
 }
 
 // EBPFCollector handles eBPF program loading and event processing
 type EBPFCollector struct {
 	cfg         Config
 	outputFile  *os.File
-	fileLock    sync.Mutex
 	bulkIndexer esutil.BulkIndexer
 	objs        bpfObjects
 	links       []link.Link
@@ -82,7 +92,9 @@ type EBPFCollector struct {
 	eventsChan  chan eBPFEvent
 	indexerWg   sync.WaitGroup
 	metrics     RuntimeMetrics
-	bootTime    time.Time // Boot time offset for accurate timestamp correlation
+	bootTime    time.Time          // Boot time offset for accurate timestamp correlation
+	fileWriter  *BatchedFileWriter // Replace outputFile
+	denoiser    *Denoiser
 }
 
 // NewEBPFCollector creates a new eBPF collector instance
@@ -106,6 +118,17 @@ func NewEBPFCollector(cfg Config, outputFile *os.File, bulkIndexer esutil.BulkIn
 		bootTime:    bootTime,
 	}
 	log.Printf("[+] Boot time calculated: %s (for timestamp correlation)", bootTime.Format(time.RFC3339Nano))
+
+	if cfg.EBPFConfig.FileLoggingEnabled {
+		path := fmt.Sprintf("%s/ebpf-events.jsonl", cfg.EventsDir)
+		bw, err := NewBatchedFileWriter(path, 64*1024, 5*time.Second)
+		if err != nil {
+			log.Printf("[!] Warning: Failed to create batched writer: %v", err)
+		} else {
+			collector.fileWriter = bw
+			log.Printf("[+] Batched file writer enabled: %s (64KB buffer, 5s flush)", path)
+		}
+	}
 
 	// Remove memlock limit
 	if err := rlimit.RemoveMemlock(); err != nil {
@@ -142,6 +165,7 @@ func NewEBPFCollector(cfg Config, outputFile *os.File, bulkIndexer esutil.BulkIn
 	}
 	collector.perfReader = rd
 
+	collector.denoiser = NewDenoiser(DefaultDenoiseConfig())
 	return collector, nil
 }
 
@@ -365,52 +389,33 @@ func (ec *EBPFCollector) Start() error {
 	}
 }
 
-// reportMetrics periodically logs runtime metrics
-func (ec *EBPFCollector) reportMetrics() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ec.stopChan:
-			return
-		case <-ticker.C:
-			ec.metrics.mu.Lock()
-			log.Printf("[*] Metrics: Received=%d Indexed=%d Lost=%d IndexFail=%d ChanDrops=%d",
-				ec.metrics.EventsReceived,
-				ec.metrics.EventsIndexed,
-				ec.metrics.LostSamples,
-				ec.metrics.IndexingFailures,
-				ec.metrics.ChannelDrops)
-			ec.metrics.mu.Unlock()
-		}
-	}
-}
-
 // indexerWorker consumes events from channel and indexes them
 func (ec *EBPFCollector) indexerWorker() {
 	defer ec.indexerWg.Done()
 
 	for evt := range ec.eventsChan {
-		// Write to file
-		if ec.cfg.EBPFConfig.FileLoggingEnabled && ec.outputFile != nil {
-			jsonBytes, _ := json.Marshal(evt)
-			ec.fileLock.Lock()
-			ec.outputFile.Write(jsonBytes)
-			ec.outputFile.WriteString("\n")
-			ec.fileLock.Unlock()
+		if ec.denoiser != nil {
+			if ec.denoiser.ShouldFilter(evt.EventType, evt.Comm, evt.Syscall, evt.Filename) {
+				atomic.AddUint64(&ec.metrics.EventsFiltered, 1)
+				continue // Skip this event
+			}
 		}
 
-		// Write to Elasticsearch
+		jsonBytes, err := json.Marshal(evt)
+		if err != nil {
+			continue
+		}
+
+		if ec.fileWriter != nil {
+			ec.fileWriter.Write(jsonBytes)
+		}
+
 		if ec.bulkIndexer != nil {
-			jsonBytes, _ := json.Marshal(evt)
 			err := ec.bulkIndexer.Add(context.Background(), esutil.BulkIndexerItem{
 				Action: "index",
 				Body:   bytes.NewReader(jsonBytes),
 				OnFailure: func(ctx context.Context, item esutil.BulkIndexerItem, res esutil.BulkIndexerResponseItem, err error) {
-					ec.metrics.mu.Lock()
-					ec.metrics.IndexingFailures++
-					ec.metrics.mu.Unlock()
+					atomic.AddUint64(&ec.metrics.IndexingFailures, 1)
 					if err != nil {
 						log.Printf("ES Index Error: %v", err)
 					} else {
@@ -418,10 +423,9 @@ func (ec *EBPFCollector) indexerWorker() {
 					}
 				},
 			})
+
 			if err == nil {
-				ec.metrics.mu.Lock()
-				ec.metrics.EventsIndexed++
-				ec.metrics.mu.Unlock()
+				atomic.AddUint64(&ec.metrics.EventsIndexed, 1)
 			}
 		}
 	}
@@ -435,9 +439,7 @@ func (ec *EBPFCollector) readPerfEvent() error {
 	}
 
 	if record.LostSamples > 0 {
-		ec.metrics.mu.Lock()
-		ec.metrics.LostSamples += record.LostSamples
-		ec.metrics.mu.Unlock()
+		atomic.AddUint64(&ec.metrics.LostSamples, record.LostSamples)
 		log.Printf("[!] Buffer full: dropped %d events", record.LostSamples)
 		return nil
 	}
@@ -450,17 +452,14 @@ func (ec *EBPFCollector) readPerfEvent() error {
 	raw := *(*bpfSoEvent)(unsafe.Pointer(&record.RawSample[0]))
 	evt := ec.parseEvent(&raw)
 
-	ec.metrics.mu.Lock()
-	ec.metrics.EventsReceived++
-	ec.metrics.mu.Unlock()
+	atomic.AddUint64(&ec.metrics.EventsReceived, 1)
 
 	// Push to buffered channel (non-blocking)
 	select {
 	case ec.eventsChan <- evt:
 	default:
-		ec.metrics.mu.Lock()
 		ec.metrics.ChannelDrops++
-		ec.metrics.mu.Unlock()
+		atomic.AddUint64(&ec.metrics.ChannelDrops, 1)
 		log.Printf("[!] Event channel full, dropping event")
 	}
 
@@ -472,12 +471,11 @@ func (ec *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 	// Use kernel monotonic timestamp (bpf_ktime_get_ns) as canonical event time
 	kernelTimeNs := int64(raw.Timestamp)
 
-	// Convert kernel monotonic time to wall-clock time using boot time offset
-	// event_wallclock = BOOT_TIME + bpf_ktime_get_ns()
 	eventWallclock := ec.bootTime.Add(time.Duration(kernelTimeNs))
 
 	evt := eBPFEvent{
 		Hostname:         ec.cfg.Hostname,
+		Module:           "ebpf",
 		TimestampNs:      kernelTimeNs, // Canonical kernel event time (monotonic)
 		EpochTimestamp:   eventWallclock.UnixMilli(),
 		Datetime:         eventWallclock.UTC().Format(time.RFC3339Nano),
@@ -513,17 +511,17 @@ func (ec *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 	if raw.SaFamily > 0 {
 		switch raw.SaFamily {
 		case 2: // AF_INET
-			evt.SaFamily = "IPv4"
+			evt.SaFamily = "ipv4"
 			if raw.SrcIp > 0 {
-				evt.SrcIP = parseIPv4(raw.SrcIp)
+				evt.SourceIP = parseIPv4(raw.SrcIp)
 			}
 			if raw.DestIp > 0 {
 				evt.DestIP = parseIPv4(raw.DestIp)
 			}
 		case 10: // AF_INET6
-			evt.SaFamily = "IPv6"
+			evt.SaFamily = "ipv6"
 			if raw.SrcIpv6[0] > 0 || raw.SrcIpv6[1] > 0 || raw.SrcIpv6[2] > 0 || raw.SrcIpv6[3] > 0 {
-				evt.SrcIPv6 = parseIPv6(raw.SrcIpv6)
+				evt.SourceIPv6 = parseIPv6(raw.SrcIpv6)
 			}
 			if raw.DestIpv6[0] > 0 || raw.DestIpv6[1] > 0 || raw.DestIpv6[2] > 0 || raw.DestIpv6[3] > 0 {
 				evt.DestIPv6 = parseIPv6(raw.DestIpv6)
@@ -532,20 +530,20 @@ func (ec *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 			evt.SaFamily = fmt.Sprintf("AF_%d", raw.SaFamily)
 		}
 
-		evt.SrcPort = raw.SrcPort
+		evt.SourcePort = raw.SrcPort
 		evt.DestPort = raw.DestPort
 
 		// Generate Flow ID for network events with complete 5-tuple
 		if raw.Protocol == 6 || raw.Protocol == 17 { // TCP or UDP
 			var srcIP, destIP string
-			if evt.SrcIP != "" {
-				srcIP = evt.SrcIP
+			if evt.SourceIP != "" {
+				srcIP = evt.SourceIP
 			}
 			if evt.DestIP != "" {
 				destIP = evt.DestIP
 			}
-			if evt.SrcIPv6 != "" {
-				srcIP = evt.SrcIPv6
+			if evt.SourceIPv6 != "" {
+				srcIP = evt.SourceIPv6
 			}
 			if evt.DestIPv6 != "" {
 				destIP = evt.DestIPv6
@@ -553,7 +551,7 @@ func (ec *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 
 			if srcIP != "" && destIP != "" {
 				proto := map[uint8]string{6: "TCP", 17: "UDP"}[raw.Protocol]
-				evt.FlowID = GenerateFlowID(srcIP, destIP, evt.SrcPort, evt.DestPort, proto)
+				evt.FlowID = GenerateFlowID(srcIP, destIP, evt.SourcePort, evt.DestPort, proto)
 			}
 		}
 	}
@@ -565,7 +563,44 @@ func (ec *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 		// FD is now properly set from the BPF event, no hack needed
 	}
 
+	evt.ProcessUUID = GenerateProcessUUID(ec.cfg.Hostname, raw.Pid, raw.ProcessStartTime)
+	evt.ParentUUID = GenerateParentUUID(ec.cfg.Hostname, raw.Ppid, raw.ParentStartTime)
 	return evt
+}
+
+func (ec *EBPFCollector) reportMetrics() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ec.stopChan:
+			return
+		case <-ticker.C:
+			// No mutex needed - use atomic loads
+			received := atomic.LoadUint64(&ec.metrics.EventsReceived)
+			indexed := atomic.LoadUint64(&ec.metrics.EventsIndexed)
+			filtered := atomic.LoadUint64(&ec.metrics.EventsFiltered)
+			lost := atomic.LoadUint64(&ec.metrics.LostSamples)
+			indexFail := atomic.LoadUint64(&ec.metrics.IndexingFailures)
+			chanDrops := atomic.LoadUint64(&ec.metrics.ChannelDrops)
+
+			log.Printf("[*] eBPF Metrics: recv=%d indexed=%d filtered=%d lost=%d fail=%d drops=%d",
+				received, indexed, filtered, lost, indexFail, chanDrops)
+
+			// Log denoiser stats
+			if ec.denoiser != nil {
+				total, filt, ratio := ec.denoiser.GetStats()
+				log.Printf("[*] Denoiser: total=%d filtered=%d ratio=%.1f%%", total, filt, ratio)
+			}
+
+			// Log file writer stats
+			if ec.fileWriter != nil {
+				bytes, flushes, events := ec.fileWriter.GetStats()
+				log.Printf("[*] FileWriter: bytes=%d flushes=%d events=%d", bytes, flushes, events)
+			}
+		}
+	}
 }
 
 // Stop gracefully stops the eBPF collector
@@ -578,6 +613,14 @@ func (ec *EBPFCollector) Stop() {
 	// Only now it is safe to close the bulk indexer
 	if ec.bulkIndexer != nil {
 		ec.bulkIndexer.Close(context.Background())
+	}
+
+	if ec.fileWriter != nil {
+		ec.fileWriter.Close()
+	}
+
+	if ec.denoiser != nil {
+		ec.denoiser.Close()
 	}
 
 	ec.cleanup()

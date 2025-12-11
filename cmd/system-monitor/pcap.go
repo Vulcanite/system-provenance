@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"sync"
 	"time"
@@ -18,29 +19,36 @@ import (
 
 // FlowKey represents a 5-tuple identifier for a network flow
 type FlowKey struct {
-	SrcIP    string `json:"src_ip"`
-	DstIP    string `json:"dst_ip"`
-	SrcPort  uint16 `json:"src_port"`
-	DstPort  uint16 `json:"dst_port"`
-	Protocol string `json:"protocol"`
+	SrcIP    string `json:"source.ip"`
+	DstIP    string `json:"destination.ip"`
+	SrcPort  uint16 `json:"source.port"`
+	DstPort  uint16 `json:"destination.port"`
+	Protocol string `json:"network.transport"`
 }
 
 // FlowStats tracks statistics for a network flow
 type FlowStats struct {
+	// ECS: Base fields
 	Hostname string `json:"hostname"`
+	Module   string `json:"event.module"`
 	FlowKey
-	FlowID        string    `json:"flow_id"`
-	PacketCount   uint64    `json:"packet_count"`
-	ByteCount     uint64    `json:"byte_count"`
+	FlowID      string `json:"flow.id"`
+	PacketCount uint64 `json:"network.packets"`
+	ByteCount   uint64 `json:"network.bytes"`
+
+	// Time fields
 	FirstSeen     time.Time `json:"first_seen"`
 	LastSeen      time.Time `json:"last_seen"`
-	TCPFlags      []string  `json:"tcp_flags,omitempty"`
-	DomainName    string    `json:"domain_name,omitempty"`
-	DNSResolved   bool      `json:"dns_resolved"`
 	EpochFirst    int64     `json:"epoch_first"`
 	EpochLast     int64     `json:"epoch_last"`
 	DatetimeFirst string    `json:"datetime_first"`
 	DatetimeLast  string    `json:"datetime_last"`
+
+	// Additional fields
+	Direction   string   `json:"network.direction,omitempty"`
+	TCPFlags    []string `json:"network.tcp_flags,omitempty"`
+	DomainName  string   `json:"destination.domain,omitempty"`
+	DNSResolved bool     `json:"dns_resolved"`
 }
 
 // DNSCacheEntry represents a cached DNS resolution
@@ -68,6 +76,7 @@ type PCAPCollector struct {
 	stopChan       chan struct{}
 	whitelistRules []WhitelistRule // Combined IP+Port rules to exclude
 	whitelistIPs   map[string]bool // IPs to exclude (for localhost only)
+	localIPs       map[string]bool // Local IP addresses for direction inference
 }
 
 // NewPCAPCollector creates a new PCAP collector instance
@@ -80,12 +89,65 @@ func NewPCAPCollector(cfg Config, bi esutil.BulkIndexer) *PCAPCollector {
 		stopChan:       make(chan struct{}),
 		whitelistRules: make([]WhitelistRule, 0),
 		whitelistIPs:   make(map[string]bool),
+		localIPs:       make(map[string]bool),
 	}
 
 	// Build whitelist from Elasticsearch config
 	pc.buildWhitelist()
 
+	// Detect local IP addresses for direction inference
+	pc.detectLocalIPs()
+
 	return pc
+}
+
+// detectLocalIPs detects local IP addresses for direction inference
+func (pc *PCAPCollector) detectLocalIPs() {
+	// Get all network interfaces
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		log.Printf("[!] Failed to get network interfaces: %v", err)
+		return
+	}
+
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+
+			if ip != nil && !ip.IsLoopback() {
+				ipStr := ip.String()
+				pc.localIPs[ipStr] = true
+				fmt.Printf("[+] PCAP detected local IP: %s (for direction inference)\n", ipStr)
+			}
+		}
+	}
+}
+
+// inferDirection determines if a flow is inbound or outbound based on local IPs
+func (pc *PCAPCollector) inferDirection(srcIP, dstIP string) string {
+	srcIsLocal := pc.localIPs[srcIP]
+	dstIsLocal := pc.localIPs[dstIP]
+
+	if srcIsLocal && !dstIsLocal {
+		return "outbound"
+	} else if !srcIsLocal && dstIsLocal {
+		return "inbound"
+	} else if srcIsLocal && dstIsLocal {
+		return "internal"
+	}
+	// If neither is local, we can't determine (external traffic being routed through)
+	return "unknown"
 }
 
 // buildWhitelist creates whitelist of IPs and ports to exclude from capture
@@ -305,10 +367,13 @@ func (pc *PCAPCollector) updateFlow(key FlowKey, packetLen int, tcpFlags []strin
 	if !exists {
 		// Create new flow with Flow ID for correlation
 		flowID := GenerateFlowID(key.SrcIP, key.DstIP, key.SrcPort, key.DstPort, key.Protocol)
+		direction := pc.inferDirection(key.SrcIP, key.DstIP)
 		flow = &FlowStats{
 			Hostname:      pc.cfg.Hostname,
+			Module:        "pcap",
 			FlowKey:       key,
 			FlowID:        flowID,
+			Direction:     direction,
 			PacketCount:   1,
 			ByteCount:     uint64(packetLen),
 			FirstSeen:     now,
