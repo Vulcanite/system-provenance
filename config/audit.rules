@@ -48,3 +48,5 @@
 #----------------------------------------
 -w /var/log/audit/ -p wa -k audit-log-tamper
 -w /var/log/auth.log -p wa -k auth-log-tamper
+
+-e 2

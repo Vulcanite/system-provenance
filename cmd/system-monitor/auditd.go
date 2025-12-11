@@ -14,7 +14,6 @@ import (
 	"github.com/elastic/go-libaudit/v2"
 	"github.com/elastic/go-libaudit/v2/aucoalesce"
 	"github.com/elastic/go-libaudit/v2/auparse"
-	"github.com/elastic/go-libaudit/v2/rule"
 )
 
 type AuditdCollector struct {
@@ -46,174 +45,23 @@ func NewAuditdCollector(cfg Config, bi esutil.BulkIndexer) *AuditdCollector {
 	}
 }
 
-func (ac *AuditdCollector) loadAuditRules() error {
-	// Clear any existing audit rules first
-	deleted, err := ac.client.DeleteRules()
-	if err != nil {
-		log.Printf("[!] Warning: Failed to clear existing audit rules: %v", err)
-	} else if deleted > 0 {
-		log.Printf("[*] Cleared %d existing audit rules", deleted)
-	}
-
-	// Small delay to ensure the delete operation completes
-	time.Sleep(100 * time.Millisecond)
-
-	ruleCount := 0
-
-	for i, auditRule := range ac.cfg.AuditdConfig.Rules {
-		var err error
-
-		switch auditRule.Type {
-		case "watch":
-			log.Printf("[*] Adding watch rule %d/%d: %s (key=%s)", i+1, len(ac.cfg.AuditdConfig.Rules), auditRule.Path, auditRule.Key)
-			err = ac.applyWatchRule(auditRule)
-		case "syscall":
-			log.Printf("[*] Adding syscall rule %d/%d: %v (key=%s)", i+1, len(ac.cfg.AuditdConfig.Rules), auditRule.Syscalls, auditRule.Key)
-			err = ac.applySyscallRule(auditRule)
-		default:
-			log.Printf("[!] Warning: Unknown rule type '%s', skipping", auditRule.Type)
-			continue
-		}
-
-		if err != nil {
-			log.Printf("[!] Warning: Failed to apply %s rule (key=%s): %v", auditRule.Type, auditRule.Key, err)
-			continue
-		}
-
-		// Small delay between rules to allow kernel to process ACKs
-		time.Sleep(50 * time.Millisecond)
-		ruleCount++
-	}
-
-	log.Printf("[+] Successfully loaded %d audit rules", ruleCount)
-	return nil
-}
-
-func (ac *AuditdCollector) applyWatchRule(auditRule AuditRule) error {
-	if auditRule.Path == "" {
-		return fmt.Errorf("watch rule requires path")
-	}
-
-	// Build the watch rule
-	r := &rule.FileWatchRule{
-		Type: rule.FileWatchRuleType,
-		Path: auditRule.Path,
-	}
-
-	// Convert permissions
-	if strings.Contains(auditRule.Permissions, "r") {
-		r.Permissions = append(r.Permissions, rule.ReadAccessType)
-	}
-	if strings.Contains(auditRule.Permissions, "w") {
-		r.Permissions = append(r.Permissions, rule.WriteAccessType)
-	}
-	if strings.Contains(auditRule.Permissions, "x") {
-		r.Permissions = append(r.Permissions, rule.ExecuteAccessType)
-	}
-	if strings.Contains(auditRule.Permissions, "a") {
-		r.Permissions = append(r.Permissions, rule.AttributeChangeAccessType)
-	}
-
-	if auditRule.Key != "" {
-		r.Keys = []string{auditRule.Key}
-	}
-
-	// Convert to wire format and add
-	ruleData, err := rule.Build(r)
-	if err != nil {
-		return fmt.Errorf("failed to build watch rule: %v", err)
-	}
-
-	if err := ac.client.AddRule(ruleData); err != nil {
-		return fmt.Errorf("failed to add watch rule: %v", err)
-	}
-
-	return nil
-}
-
-func (ac *AuditdCollector) applySyscallRule(auditRule AuditRule) error {
-	if auditRule.Action == "" || auditRule.List == "" {
-		return fmt.Errorf("syscall rule requires action and list")
-	}
-
-	r := &rule.SyscallRule{
-		Type:     rule.AppendSyscallRuleType,
-		Action:   auditRule.Action,
-		List:     auditRule.List,
-		Syscalls: auditRule.Syscalls,
-	}
-
-	// Add arch filter if specified
-	if auditRule.Arch != "" {
-		r.Filters = append(r.Filters, rule.FilterSpec{
-			Type:       rule.ValueFilterType,
-			LHS:        "arch",
-			Comparator: "=",
-			RHS:        auditRule.Arch,
-		})
-	}
-
-	// Parse and add additional filters
-	for _, filter := range auditRule.Filters {
-		// Parse filter into LHS, operator, RHS
-		var lhs, comparator, rhs string
-		if strings.Contains(filter, "!=") {
-			parts := strings.Split(filter, "!=")
-			lhs = parts[0]
-			comparator = "!="
-			rhs = parts[1]
-		} else if strings.Contains(filter, "=") {
-			parts := strings.Split(filter, "=")
-			lhs = parts[0]
-			comparator = "="
-			rhs = parts[1]
-		}
-
-		if lhs != "" {
-			r.Filters = append(r.Filters, rule.FilterSpec{
-				Type:       rule.ValueFilterType,
-				LHS:        lhs,
-				Comparator: comparator,
-				RHS:        rhs,
-			})
-		}
-	}
-
-	if auditRule.Key != "" {
-		r.Keys = []string{auditRule.Key}
-	}
-
-	// Build and add the rule
-	ruleData, err := rule.Build(r)
-	if err != nil {
-		return fmt.Errorf("failed to build syscall rule: %v", err)
-	}
-
-	if err := ac.client.AddRule(ruleData); err != nil {
-		return fmt.Errorf("failed to add syscall rule: %v", err)
-	}
-
-	return nil
-}
-
 func (ac *AuditdCollector) Start() error {
 	if err := ac.setupLogging(); err != nil {
 		log.Printf("[!] Warning: Failed to setup Auditd file logging: %v", err)
 	}
 
 	var err error
-	// Note: NewAuditClient requires root privileges (sudo)
 	ac.client, err = libaudit.NewAuditClient(nil)
 	if err != nil {
 		return fmt.Errorf("failed to create audit client (requires root): %v", err)
 	}
-	defer ac.client.Close()
 
 	status, err := ac.client.GetStatus()
 	if err != nil {
 		return fmt.Errorf("failed to get audit status: %v", err)
 	}
 
+	log.Printf("[*] Current Audit Status: Enabled=%d, PID=%d, Backlog=%d", status.Enabled, status.PID, status.BacklogLimit)
 	if status.Enabled == 0 {
 		log.Println("[*] Enabling kernel auditing...")
 		if err := ac.client.SetEnabled(true, libaudit.WaitForReply); err != nil {
@@ -226,9 +74,8 @@ func (ac *AuditdCollector) Start() error {
 		log.Printf("[!] Warning: Failed to increase backlog limit: %v", err)
 	}
 
-	// Load audit rules from config
-	if err := ac.loadAuditRules(); err != nil {
-		log.Printf("[!] Warning: Failed to load audit rules: %v", err)
+	if err := ac.client.SetPID(libaudit.NoWait); err != nil {
+		log.Printf("[!] Warning: Failed to set audit PID: %v", err)
 	}
 
 	ac.reassembler, err = libaudit.NewReassembler(5, 2*time.Second, &auditStreamHandler{collector: ac})
@@ -253,8 +100,6 @@ func (ac *AuditdCollector) Start() error {
 	}()
 
 	fmt.Printf("[+] Auditd Collector Running (PID: %d)\n", status.PID)
-
-	// Main Event Loop
 	for {
 		select {
 		case <-ac.stopChan:
@@ -271,10 +116,9 @@ func (ac *AuditdCollector) Start() error {
 				continue
 			}
 
-			// Push to reassembler -> triggers ReassemblyComplete
 			// Filter out non-audit messages (type < 1000 are system control messages)
-			if msg != nil && msg.Type >= 1000 {
-				ac.reassembler.Push(msg.Type, msg.Data)
+			if err := ac.reassembler.Push(msg.Type, msg.Data); err != nil {
+				log.Printf("[!] Reassembler Push Error: %v (dropping raw message)", err)
 			}
 		}
 	}
@@ -284,6 +128,13 @@ func (ac *AuditdCollector) Stop() {
 	close(ac.stopChan)
 	if ac.outputFile != nil {
 		ac.outputFile.Close()
+	}
+
+	if ac.client != nil {
+		log.Println("[*] Stopping audit client and unregistering...")
+		if err := ac.client.Close(); err != nil {
+			log.Printf("[!] Error closing audit client: %v", err)
+		}
 	}
 }
 
@@ -320,7 +171,6 @@ func (h *auditStreamHandler) ReassemblyComplete(msgs []*auparse.AuditMessage) {
 	// Simplify the raw kernel messages into a high-level event
 	event, err := aucoalesce.CoalesceMessages(msgs)
 	if err != nil {
-		log.Printf("[!] DEBUG: Coalesce Failed (dropping event): %v", err)
 		return
 	}
 
@@ -347,7 +197,6 @@ func (h *auditStreamHandler) ReassemblyComplete(msgs []*auparse.AuditMessage) {
 	}
 	output.RawData["result"] = event.Result
 
-	// Capture all raw key-values from the kernel
 	for _, msg := range msgs {
 		data, err := msg.Data()
 		if err == nil {
@@ -364,7 +213,6 @@ func (h *auditStreamHandler) ReassemblyComplete(msgs []*auparse.AuditMessage) {
 		return
 	}
 
-	fmt.Printf("[+] Writing event: %s\n", event.Summary.Action)
 	if h.collector.outputFile != nil {
 		h.collector.fileMutex.Lock()
 		if _, err := h.collector.outputFile.Write(data); err != nil {
