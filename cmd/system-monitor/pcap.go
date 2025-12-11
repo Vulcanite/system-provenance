@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
 	"sync"
 	"time"
 
@@ -71,12 +70,11 @@ type PCAPCollector struct {
 	dnsCache       map[string]*DNSCacheEntry
 	dnsCacheMutex  sync.RWMutex
 	bulkIndexer    esutil.BulkIndexer
-	outputFile     *os.File
-	fileLock       sync.Mutex
 	stopChan       chan struct{}
 	whitelistRules []WhitelistRule // Combined IP+Port rules to exclude
 	whitelistIPs   map[string]bool // IPs to exclude (for localhost only)
 	localIPs       map[string]bool // Local IP addresses for direction inference
+	fileWriter     *BatchedFileWriter
 }
 
 // NewPCAPCollector creates a new PCAP collector instance
@@ -92,6 +90,17 @@ func NewPCAPCollector(cfg Config, bi esutil.BulkIndexer) *PCAPCollector {
 		localIPs:       make(map[string]bool),
 	}
 
+	if cfg.PCAPConfig.FileLoggingEnabled {
+		path := fmt.Sprintf("%s/pcap-events.jsonl", cfg.EventsDir)
+		bw, err := NewBatchedFileWriter(path, 64*1024, 5*time.Second)
+		if err != nil {
+			log.Printf("[!] Warning: Failed to create batched writer: %v", err)
+		} else {
+			pc.fileWriter = bw
+			log.Printf("[+] Batched file writer enabled: %s (64KB buffer, 5s flush)", path)
+		}
+	}
+
 	// Build whitelist from Elasticsearch config
 	pc.buildWhitelist()
 
@@ -99,6 +108,16 @@ func NewPCAPCollector(cfg Config, bi esutil.BulkIndexer) *PCAPCollector {
 	pc.detectLocalIPs()
 
 	return pc
+}
+
+func (pc *PCAPCollector) RotateLog() {
+	if pc.fileWriter != nil {
+		if err := pc.fileWriter.Rotate(); err != nil {
+			log.Printf("[!] PCAP Log Rotation Failed: %v", err)
+		} else {
+			log.Println("[+] PCAP Log Rotated")
+		}
+	}
 }
 
 // detectLocalIPs detects local IP addresses for direction inference
@@ -196,13 +215,6 @@ func (pc *PCAPCollector) isWhitelisted(srcIP, dstIP string, srcPort, dstPort uin
 
 // Start begins packet capture and processing
 func (pc *PCAPCollector) Start() error {
-	// Setup file logging for PCAP flows
-	if pc.cfg.PCAPConfig.FileLoggingEnabled {
-		if err := pc.setupLogging(); err != nil {
-			return fmt.Errorf("failed to setup PCAP logging: %v", err)
-		}
-	}
-
 	// Open network interface
 	handle, err := pcap.OpenLive(
 		pc.cfg.PCAPConfig.Interface,
@@ -250,28 +262,10 @@ func (pc *PCAPCollector) Start() error {
 // Stop gracefully stops the PCAP collector
 func (pc *PCAPCollector) Stop() {
 	close(pc.stopChan)
-	if pc.outputFile != nil {
-		pc.outputFile.Close()
+
+	if pc.fileWriter != nil {
+		pc.fileWriter.Close()
 	}
-}
-
-// setupLogging configures file logging for PCAP flows
-func (pc *PCAPCollector) setupLogging() error {
-	if pc.cfg.EventsDir == "" {
-		pc.cfg.EventsDir = "/var/monitoring/events"
-	}
-
-	os.MkdirAll(pc.cfg.EventsDir, 0755)
-
-	path := fmt.Sprintf("%s/pcap-flows.jsonl", pc.cfg.EventsDir)
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-
-	pc.outputFile = f
-	fmt.Printf("[+] PCAP logging: %s\n", path)
-	return nil
 }
 
 // processPacket extracts flow information from a packet
@@ -554,12 +548,8 @@ func (pc *PCAPCollector) flushFlows() {
 			flushedCount++
 		}
 
-		// Write to file (only inactive flows to avoid duplicates)
-		if inactive && pc.cfg.PCAPConfig.FileLoggingEnabled && pc.outputFile != nil {
-			pc.fileLock.Lock()
-			pc.outputFile.Write(jsonBytes)
-			pc.outputFile.WriteString("\n")
-			pc.fileLock.Unlock()
+		if pc.fileWriter != nil {
+			pc.fileWriter.Write(jsonBytes)
 		}
 
 		// Remove from memory if inactive

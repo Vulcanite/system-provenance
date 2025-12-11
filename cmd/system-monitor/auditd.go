@@ -5,9 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/elastic/go-elasticsearch/v8/esutil"
@@ -19,11 +17,20 @@ import (
 type AuditdCollector struct {
 	cfg         Config
 	bulkIndexer esutil.BulkIndexer
-	outputFile  *os.File
 	client      *libaudit.AuditClient
 	reassembler *libaudit.Reassembler
 	stopChan    chan struct{}
-	fileMutex   sync.Mutex
+	fileWriter  *BatchedFileWriter
+}
+
+func (ac *AuditdCollector) RotateLog() {
+	if cfg.AuditdConfig.FileLoggingEnabled && ac.fileWriter != nil {
+		if err := ac.fileWriter.Rotate(); err != nil {
+			log.Printf("[!] auditd Log Rotation Failed: %v", err)
+		} else {
+			log.Println("[+] auditd Log Rotated")
+		}
+	}
 }
 
 type AuditEvent struct {
@@ -51,18 +58,27 @@ type AuditEvent struct {
 }
 
 func NewAuditdCollector(cfg Config, bi esutil.BulkIndexer) *AuditdCollector {
-	return &AuditdCollector{
+	ac := &AuditdCollector{
 		cfg:         cfg,
 		bulkIndexer: bi,
 		stopChan:    make(chan struct{}),
 	}
+
+	if cfg.AuditdConfig.FileLoggingEnabled {
+		path := fmt.Sprintf("%s/auditd-events.jsonl", cfg.EventsDir)
+		bw, err := NewBatchedFileWriter(path, 64*1024, 5*time.Second)
+		if err != nil {
+			log.Printf("[!] Warning: Failed to create batched writer: %v", err)
+		} else {
+			ac.fileWriter = bw
+			log.Printf("[+] Batched file writer enabled: %s (64KB buffer, 5s flush)", path)
+		}
+	}
+
+	return ac
 }
 
 func (ac *AuditdCollector) Start() error {
-	if err := ac.setupLogging(); err != nil {
-		log.Printf("[!] Warning: Failed to setup Auditd file logging: %v", err)
-	}
-
 	var err error
 	ac.client, err = libaudit.NewAuditClient(nil)
 	if err != nil {
@@ -139,36 +155,16 @@ func (ac *AuditdCollector) Start() error {
 
 func (ac *AuditdCollector) Stop() {
 	close(ac.stopChan)
-	if ac.outputFile != nil {
-		ac.outputFile.Close()
-	}
-
 	if ac.client != nil {
 		log.Println("[*] Stopping audit client and unregistering...")
 		if err := ac.client.Close(); err != nil {
 			log.Printf("[!] Error closing audit client: %v", err)
 		}
 	}
-}
 
-func (ac *AuditdCollector) setupLogging() error {
-	if ac.cfg.EventsDir == "" {
-		ac.cfg.EventsDir = "/var/monitoring/events"
+	if ac.fileWriter != nil {
+		ac.fileWriter.Close()
 	}
-
-	if err := os.MkdirAll(ac.cfg.EventsDir, 0755); err != nil {
-		return err
-	}
-
-	path := fmt.Sprintf("%s/auditd-events.jsonl", ac.cfg.EventsDir)
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-
-	ac.outputFile = f
-	fmt.Printf("[+] Auditd logging enabled: %s\n", path)
-	return nil
 }
 
 type auditStreamHandler struct {
@@ -247,15 +243,9 @@ func (h *auditStreamHandler) ReassemblyComplete(msgs []*auparse.AuditMessage) {
 		return
 	}
 
-	if h.collector.outputFile != nil {
-		h.collector.fileMutex.Lock()
-		if _, err := h.collector.outputFile.Write(data); err != nil {
-			log.Printf("[!] Failed to write audit event to file: %v", err)
-		}
-		if _, err := h.collector.outputFile.WriteString("\n"); err != nil {
-			log.Printf("[!] Failed to write newline to file: %v", err)
-		}
-		h.collector.fileMutex.Unlock()
+	if h.collector.fileWriter != nil {
+		h.collector.fileWriter.Write(data)
+		h.collector.fileWriter.Write([]byte("\n"))
 	}
 
 	// Send to Elasticsearch

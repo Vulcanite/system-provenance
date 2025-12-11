@@ -88,6 +88,30 @@ func NewBatchedFileWriter(path string, maxBufferSize int, flushInterval time.Dur
 	return bw, nil
 }
 
+func (bw *BatchedFileWriter) Rotate() error {
+	bw.mu.Lock()
+	defer bw.mu.Unlock()
+
+	// 1. Flush existing buffer to the old file
+	if bw.buffer.Len() > 0 {
+		bw.file.Write(bw.buffer.Bytes())
+		bw.buffer.Reset()
+	}
+
+	// 2. Close the old file
+	bw.file.Close()
+
+	// 3. Open the new file (created by logrotate)
+	newFile, err := os.OpenFile(bw.file.Name(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to rotate log: %v", err)
+	}
+
+	bw.file = newFile
+	bw.lastFlush = time.Now()
+	return nil
+}
+
 // Write adds JSON data to the buffer (non-blocking unless buffer is huge)
 func (bw *BatchedFileWriter) Write(jsonBytes []byte) {
 	bw.mu.Lock()

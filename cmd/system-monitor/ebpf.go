@@ -83,7 +83,6 @@ type RuntimeMetrics struct {
 // EBPFCollector handles eBPF program loading and event processing
 type EBPFCollector struct {
 	cfg         Config
-	outputFile  *os.File
 	bulkIndexer esutil.BulkIndexer
 	objs        bpfObjects
 	links       []link.Link
@@ -97,8 +96,18 @@ type EBPFCollector struct {
 	denoiser    *Denoiser
 }
 
+func (ec *EBPFCollector) RotateLog() {
+	if ec.fileWriter != nil {
+		if err := ec.fileWriter.Rotate(); err != nil {
+			log.Printf("[!] eBPF Log Rotation Failed: %v", err)
+		} else {
+			log.Println("[+] eBPF Log Rotated")
+		}
+	}
+}
+
 // NewEBPFCollector creates a new eBPF collector instance
-func NewEBPFCollector(cfg Config, outputFile *os.File, bulkIndexer esutil.BulkIndexer) (*EBPFCollector, error) {
+func NewEBPFCollector(cfg Config, bulkIndexer esutil.BulkIndexer) (*EBPFCollector, error) {
 	realtimeNow := time.Now()
 
 	var mono unix.Timespec
@@ -111,7 +120,6 @@ func NewEBPFCollector(cfg Config, outputFile *os.File, bulkIndexer esutil.BulkIn
 
 	collector := &EBPFCollector{
 		cfg:         cfg,
-		outputFile:  outputFile,
 		bulkIndexer: bulkIndexer,
 		stopChan:    make(chan struct{}),
 		eventsChan:  make(chan eBPFEvent, 50000),
@@ -170,11 +178,11 @@ func NewEBPFCollector(cfg Config, outputFile *os.File, bulkIndexer esutil.BulkIn
 }
 
 // populateWhitelist populates the eBPF whitelist map with rules
-func (ec *EBPFCollector) populateWhitelist() error {
+func (ac *EBPFCollector) populateWhitelist() error {
 	// Add Elasticsearch host+port combination
-	if ec.cfg.ESConfig.Host != "" && ec.cfg.ESConfig.Port > 0 {
-		esHost := ec.cfg.ESConfig.Host
-		esPort := ec.cfg.ESConfig.Port
+	if ac.cfg.ESConfig.Host != "" && ac.cfg.ESConfig.Port > 0 {
+		esHost := ac.cfg.ESConfig.Host
+		esPort := ac.cfg.ESConfig.Port
 
 		// Resolve hostname to IP
 		ips, err := net.LookupIP(esHost)
@@ -205,7 +213,7 @@ func (ec *EBPFCollector) populateWhitelist() error {
 
 			// Insert into map at index
 			key := uint64(idx)
-			if err := ec.objs.WhitelistRules.Put(&key, &rule); err != nil {
+			if err := ac.objs.WhitelistRules.Put(&key, &rule); err != nil {
 				return fmt.Errorf("failed to add whitelist rule: %v", err)
 			}
 
@@ -218,7 +226,7 @@ func (ec *EBPFCollector) populateWhitelist() error {
 }
 
 // populateIgnoredComms populates the eBPF ignored_comms map with default process names to ignore
-func (ec *EBPFCollector) populateIgnoredComms() error {
+func (ac *EBPFCollector) populateIgnoredComms() error {
 	// Default list of process names to ignore
 	ignoredComms := []string{
 		"ebpf-exporter",
@@ -231,7 +239,7 @@ func (ec *EBPFCollector) populateIgnoredComms() error {
 		copy(key[:], comm)
 		value := uint8(1)
 
-		if err := ec.objs.IgnoredComms.Put(&key, &value); err != nil {
+		if err := ac.objs.IgnoredComms.Put(&key, &value); err != nil {
 			return fmt.Errorf("failed to add ignored comm %s: %v", comm, err)
 		}
 		fmt.Printf("[+] eBPF filter: Ignoring process '%s'\n", comm)
@@ -241,146 +249,146 @@ func (ec *EBPFCollector) populateIgnoredComms() error {
 }
 
 // attachTracepoints attaches all eBPF programs to kernel tracepoints
-func (ec *EBPFCollector) attachTracepoints() error {
+func (ac *EBPFCollector) attachTracepoints() error {
 	attach := func(group, name string, prog *ebpf.Program) error {
 		l, err := link.Tracepoint(group, name, prog, nil)
 		if err != nil {
 			return fmt.Errorf("failed to attach %s/%s: %v", group, name, err)
 		}
-		ec.links = append(ec.links, l)
+		ac.links = append(ac.links, l)
 		return nil
 	}
 
 	// EXECVE
-	if err := attach("syscalls", "sys_enter_execve", ec.objs.SysEnterExecve); err != nil {
+	if err := attach("syscalls", "sys_enter_execve", ac.objs.SysEnterExecve); err != nil {
 		return err
 	}
 
-	if err := attach("syscalls", "sys_exit_execve", ec.objs.SysExitExecve); err != nil {
+	if err := attach("syscalls", "sys_exit_execve", ac.objs.SysExitExecve); err != nil {
 		return err
 	}
 
 	// OPEN
-	if err := attach("syscalls", "sys_enter_openat", ec.objs.SysEnterOpenat); err != nil {
+	if err := attach("syscalls", "sys_enter_openat", ac.objs.SysEnterOpenat); err != nil {
 		return err
 	}
-	if err := attach("syscalls", "sys_exit_openat", ec.objs.SysExitOpenat); err != nil {
+	if err := attach("syscalls", "sys_exit_openat", ac.objs.SysExitOpenat); err != nil {
 		return err
 	}
-	if err := attach("syscalls", "sys_enter_openat2", ec.objs.SysEnterOpenat2); err != nil {
+	if err := attach("syscalls", "sys_enter_openat2", ac.objs.SysEnterOpenat2); err != nil {
 		return err
 	}
-	if err := attach("syscalls", "sys_exit_openat2", ec.objs.SysExitOpenat2); err != nil {
+	if err := attach("syscalls", "sys_exit_openat2", ac.objs.SysExitOpenat2); err != nil {
 		return err
 	}
 
 	// WRITE
-	if err := attach("syscalls", "sys_enter_write", ec.objs.SysEnterWrite); err != nil {
+	if err := attach("syscalls", "sys_enter_write", ac.objs.SysEnterWrite); err != nil {
 		return err
 	}
-	if err := attach("syscalls", "sys_exit_write", ec.objs.SysExitWrite); err != nil {
+	if err := attach("syscalls", "sys_exit_write", ac.objs.SysExitWrite); err != nil {
 		return err
 	}
 
 	// READ
-	if err := attach("syscalls", "sys_enter_read", ec.objs.SysEnterRead); err != nil {
+	if err := attach("syscalls", "sys_enter_read", ac.objs.SysEnterRead); err != nil {
 		return err
 	}
-	if err := attach("syscalls", "sys_exit_read", ec.objs.SysExitRead); err != nil {
+	if err := attach("syscalls", "sys_exit_read", ac.objs.SysExitRead); err != nil {
 		return err
 	}
 
 	// CLOSE (for FD cleanup)
 	// NOTE: Requires `go generate` to be run after updating main.bpf.c
-	// if err := attach("syscalls", "sys_enter_close", ec.objs.SysEnterClose); err != nil {
-	// 	return err
-	// }
-
-	// CLONE
-	if err := attach("syscalls", "sys_enter_clone", ec.objs.SysEnterClone); err != nil {
+	if err := attach("syscalls", "sys_enter_close", ac.objs.SysEnterClose); err != nil {
 		return err
 	}
-	if err := attach("syscalls", "sys_enter_clone3", ec.objs.SysEnterClone3); err != nil {
+
+	// CLONE
+	if err := attach("syscalls", "sys_enter_clone", ac.objs.SysEnterClone); err != nil {
+		return err
+	}
+	if err := attach("syscalls", "sys_enter_clone3", ac.objs.SysEnterClone3); err != nil {
 		return err
 	}
 
 	// OTHERS
-	if err := attach("syscalls", "sys_enter_unlinkat", ec.objs.SysEnterUnlinkat); err != nil {
+	if err := attach("syscalls", "sys_enter_unlinkat", ac.objs.SysEnterUnlinkat); err != nil {
 		return err
 	}
-	if err := attach("syscalls", "sys_enter_vfork", ec.objs.SysEnterVfork); err != nil {
+	if err := attach("syscalls", "sys_enter_vfork", ac.objs.SysEnterVfork); err != nil {
 		return err
 	}
 
 	// NETWORK SYSCALLS (Enhanced)
-	if err := attach("syscalls", "sys_enter_socket", ec.objs.SysEnterSocket); err != nil {
+	if err := attach("syscalls", "sys_enter_socket", ac.objs.SysEnterSocket); err != nil {
 		return err
 	}
-	if err := attach("syscalls", "sys_enter_connect", ec.objs.SysEnterConnect); err != nil {
+	if err := attach("syscalls", "sys_enter_connect", ac.objs.SysEnterConnect); err != nil {
 		return err
 	}
-	if err := attach("syscalls", "sys_exit_connect", ec.objs.SysExitConnect); err != nil {
+	if err := attach("syscalls", "sys_exit_connect", ac.objs.SysExitConnect); err != nil {
 		return err
 	}
-	if err := attach("syscalls", "sys_enter_bind", ec.objs.SysEnterBind); err != nil {
+	if err := attach("syscalls", "sys_enter_bind", ac.objs.SysEnterBind); err != nil {
 		return err
 	}
-	if err := attach("syscalls", "sys_enter_listen", ec.objs.SysEnterListen); err != nil {
+	if err := attach("syscalls", "sys_enter_listen", ac.objs.SysEnterListen); err != nil {
 		return err
 	}
-	if err := attach("syscalls", "sys_enter_accept", ec.objs.SysEnterAccept); err != nil {
+	if err := attach("syscalls", "sys_enter_accept", ac.objs.SysEnterAccept); err != nil {
 		return err
 	}
-	if err := attach("syscalls", "sys_exit_accept", ec.objs.SysExitAccept); err != nil {
+	if err := attach("syscalls", "sys_exit_accept", ac.objs.SysExitAccept); err != nil {
 		return err
 	}
-	if err := attach("syscalls", "sys_enter_accept4", ec.objs.SysEnterAccept4); err != nil {
+	if err := attach("syscalls", "sys_enter_accept4", ac.objs.SysEnterAccept4); err != nil {
 		return err
 	}
-	if err := attach("syscalls", "sys_exit_accept4", ec.objs.SysExitAccept4); err != nil {
+	if err := attach("syscalls", "sys_exit_accept4", ac.objs.SysExitAccept4); err != nil {
 		return err
 	}
-	if err := attach("syscalls", "sys_enter_sendto", ec.objs.SysEnterSendto); err != nil {
+	if err := attach("syscalls", "sys_enter_sendto", ac.objs.SysEnterSendto); err != nil {
 		return err
 	}
-	if err := attach("syscalls", "sys_exit_sendto", ec.objs.SysExitSendto); err != nil {
+	if err := attach("syscalls", "sys_exit_sendto", ac.objs.SysExitSendto); err != nil {
 		return err
 	}
-	if err := attach("syscalls", "sys_enter_recvfrom", ec.objs.SysEnterRecvfrom); err != nil {
+	if err := attach("syscalls", "sys_enter_recvfrom", ac.objs.SysEnterRecvfrom); err != nil {
 		return err
 	}
-	if err := attach("syscalls", "sys_exit_recvfrom", ec.objs.SysExitRecvfrom); err != nil {
+	if err := attach("syscalls", "sys_exit_recvfrom", ac.objs.SysExitRecvfrom); err != nil {
 		return err
 	}
 
-	fmt.Printf("[+] eBPF monitoring started with %d probes active.\n", len(ec.links))
+	fmt.Printf("[+] eBPF monitoring started with %d probes active.\n", len(ac.links))
 	return nil
 }
 
 // Start begins processing eBPF events
-func (ec *EBPFCollector) Start() error {
+func (ac *EBPFCollector) Start() error {
 	// Start multiple indexer goroutines for parallel processing
 	numWorkers := 4
 	for i := 0; i < numWorkers; i++ {
-		ec.indexerWg.Add(1)
-		go ec.indexerWorker()
+		ac.indexerWg.Add(1)
+		go ac.indexerWorker()
 	}
 
 	// Start metrics reporter
-	go ec.reportMetrics()
+	go ac.reportMetrics()
 
 	// Read from perf buffer and push to channel
 	for {
 		select {
-		case <-ec.stopChan:
-			close(ec.eventsChan)
-			ec.indexerWg.Wait()
+		case <-ac.stopChan:
+			close(ac.eventsChan)
+			ac.indexerWg.Wait()
 			return nil
 		default:
-			if err := ec.readPerfEvent(); err != nil {
+			if err := ac.readPerfEvent(); err != nil {
 				if errors.Is(err, perf.ErrClosed) {
-					close(ec.eventsChan)
-					ec.indexerWg.Wait()
+					close(ac.eventsChan)
+					ac.indexerWg.Wait()
 					return nil
 				}
 				log.Printf("[!] eBPF event processing error: %v", err)
@@ -390,13 +398,13 @@ func (ec *EBPFCollector) Start() error {
 }
 
 // indexerWorker consumes events from channel and indexes them
-func (ec *EBPFCollector) indexerWorker() {
-	defer ec.indexerWg.Done()
+func (ac *EBPFCollector) indexerWorker() {
+	defer ac.indexerWg.Done()
 
-	for evt := range ec.eventsChan {
-		if ec.denoiser != nil {
-			if ec.denoiser.ShouldFilter(evt.EventType, evt.Comm, evt.Syscall, evt.Filename) {
-				atomic.AddUint64(&ec.metrics.EventsFiltered, 1)
+	for evt := range ac.eventsChan {
+		if ac.denoiser != nil {
+			if ac.denoiser.ShouldFilter(evt.EventType, evt.Comm, evt.Syscall, evt.Filename) {
+				atomic.AddUint64(&ac.metrics.EventsFiltered, 1)
 				continue // Skip this event
 			}
 		}
@@ -406,16 +414,16 @@ func (ec *EBPFCollector) indexerWorker() {
 			continue
 		}
 
-		if ec.fileWriter != nil {
-			ec.fileWriter.Write(jsonBytes)
+		if ac.fileWriter != nil {
+			ac.fileWriter.Write(jsonBytes)
 		}
 
-		if ec.bulkIndexer != nil {
-			err := ec.bulkIndexer.Add(context.Background(), esutil.BulkIndexerItem{
+		if ac.bulkIndexer != nil {
+			err := ac.bulkIndexer.Add(context.Background(), esutil.BulkIndexerItem{
 				Action: "index",
 				Body:   bytes.NewReader(jsonBytes),
 				OnFailure: func(ctx context.Context, item esutil.BulkIndexerItem, res esutil.BulkIndexerResponseItem, err error) {
-					atomic.AddUint64(&ec.metrics.IndexingFailures, 1)
+					atomic.AddUint64(&ac.metrics.IndexingFailures, 1)
 					if err != nil {
 						log.Printf("ES Index Error: %v", err)
 					} else {
@@ -425,21 +433,21 @@ func (ec *EBPFCollector) indexerWorker() {
 			})
 
 			if err == nil {
-				atomic.AddUint64(&ec.metrics.EventsIndexed, 1)
+				atomic.AddUint64(&ac.metrics.EventsIndexed, 1)
 			}
 		}
 	}
 }
 
 // readPerfEvent reads a single event from the perf buffer and pushes to channel
-func (ec *EBPFCollector) readPerfEvent() error {
-	record, err := ec.perfReader.Read()
+func (ac *EBPFCollector) readPerfEvent() error {
+	record, err := ac.perfReader.Read()
 	if err != nil {
 		return err
 	}
 
 	if record.LostSamples > 0 {
-		atomic.AddUint64(&ec.metrics.LostSamples, record.LostSamples)
+		atomic.AddUint64(&ac.metrics.LostSamples, record.LostSamples)
 		log.Printf("[!] Buffer full: dropped %d events", record.LostSamples)
 		return nil
 	}
@@ -450,16 +458,16 @@ func (ec *EBPFCollector) readPerfEvent() error {
 	}
 
 	raw := *(*bpfSoEvent)(unsafe.Pointer(&record.RawSample[0]))
-	evt := ec.parseEvent(&raw)
+	evt := ac.parseEvent(&raw)
 
-	atomic.AddUint64(&ec.metrics.EventsReceived, 1)
+	atomic.AddUint64(&ac.metrics.EventsReceived, 1)
 
 	// Push to buffered channel (non-blocking)
 	select {
-	case ec.eventsChan <- evt:
+	case ac.eventsChan <- evt:
 	default:
-		ec.metrics.ChannelDrops++
-		atomic.AddUint64(&ec.metrics.ChannelDrops, 1)
+		ac.metrics.ChannelDrops++
+		atomic.AddUint64(&ac.metrics.ChannelDrops, 1)
 		log.Printf("[!] Event channel full, dropping event")
 	}
 
@@ -467,14 +475,14 @@ func (ec *EBPFCollector) readPerfEvent() error {
 }
 
 // parseEvent converts raw eBPF event to eBPFEvent
-func (ec *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
+func (ac *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 	// Use kernel monotonic timestamp (bpf_ktime_get_ns) as canonical event time
 	kernelTimeNs := int64(raw.Timestamp)
 
-	eventWallclock := ec.bootTime.Add(time.Duration(kernelTimeNs))
+	eventWallclock := ac.bootTime.Add(time.Duration(kernelTimeNs))
 
 	evt := eBPFEvent{
-		Hostname:         ec.cfg.Hostname,
+		Hostname:         ac.cfg.Hostname,
 		Module:           "ebpf",
 		TimestampNs:      kernelTimeNs, // Canonical kernel event time (monotonic)
 		EpochTimestamp:   eventWallclock.UnixMilli(),
@@ -563,40 +571,40 @@ func (ec *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 		// FD is now properly set from the BPF event, no hack needed
 	}
 
-	evt.ProcessUUID = GenerateProcessUUID(ec.cfg.Hostname, raw.Pid, raw.ProcessStartTime)
-	evt.ParentUUID = GenerateParentUUID(ec.cfg.Hostname, raw.Ppid, raw.ParentStartTime)
+	evt.ProcessUUID = GenerateProcessUUID(ac.cfg.Hostname, raw.Pid, raw.ProcessStartTime)
+	evt.ParentUUID = GenerateParentUUID(ac.cfg.Hostname, raw.Ppid, raw.ParentStartTime)
 	return evt
 }
 
-func (ec *EBPFCollector) reportMetrics() {
+func (ac *EBPFCollector) reportMetrics() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-ec.stopChan:
+		case <-ac.stopChan:
 			return
 		case <-ticker.C:
 			// No mutex needed - use atomic loads
-			received := atomic.LoadUint64(&ec.metrics.EventsReceived)
-			indexed := atomic.LoadUint64(&ec.metrics.EventsIndexed)
-			filtered := atomic.LoadUint64(&ec.metrics.EventsFiltered)
-			lost := atomic.LoadUint64(&ec.metrics.LostSamples)
-			indexFail := atomic.LoadUint64(&ec.metrics.IndexingFailures)
-			chanDrops := atomic.LoadUint64(&ec.metrics.ChannelDrops)
+			received := atomic.LoadUint64(&ac.metrics.EventsReceived)
+			indexed := atomic.LoadUint64(&ac.metrics.EventsIndexed)
+			filtered := atomic.LoadUint64(&ac.metrics.EventsFiltered)
+			lost := atomic.LoadUint64(&ac.metrics.LostSamples)
+			indexFail := atomic.LoadUint64(&ac.metrics.IndexingFailures)
+			chanDrops := atomic.LoadUint64(&ac.metrics.ChannelDrops)
 
 			log.Printf("[*] eBPF Metrics: recv=%d indexed=%d filtered=%d lost=%d fail=%d drops=%d",
 				received, indexed, filtered, lost, indexFail, chanDrops)
 
 			// Log denoiser stats
-			if ec.denoiser != nil {
-				total, filt, ratio := ec.denoiser.GetStats()
+			if ac.denoiser != nil {
+				total, filt, ratio := ac.denoiser.GetStats()
 				log.Printf("[*] Denoiser: total=%d filtered=%d ratio=%.1f%%", total, filt, ratio)
 			}
 
 			// Log file writer stats
-			if ec.fileWriter != nil {
-				bytes, flushes, events := ec.fileWriter.GetStats()
+			if ac.fileWriter != nil {
+				bytes, flushes, events := ac.fileWriter.GetStats()
 				log.Printf("[*] FileWriter: bytes=%d flushes=%d events=%d", bytes, flushes, events)
 			}
 		}
@@ -604,37 +612,37 @@ func (ec *EBPFCollector) reportMetrics() {
 }
 
 // Stop gracefully stops the eBPF collector
-func (ec *EBPFCollector) Stop() {
-	close(ec.stopChan)
+func (ac *EBPFCollector) Stop() {
+	close(ac.stopChan)
 
 	// Wait until Start() closes eventsChan and all workers exit
-	ec.indexerWg.Wait()
+	ac.indexerWg.Wait()
 
 	// Only now it is safe to close the bulk indexer
-	if ec.bulkIndexer != nil {
-		ec.bulkIndexer.Close(context.Background())
+	if ac.bulkIndexer != nil {
+		ac.bulkIndexer.Close(context.Background())
 	}
 
-	if ec.fileWriter != nil {
-		ec.fileWriter.Close()
+	if ac.fileWriter != nil {
+		ac.fileWriter.Close()
 	}
 
-	if ec.denoiser != nil {
-		ec.denoiser.Close()
+	if ac.denoiser != nil {
+		ac.denoiser.Close()
 	}
 
-	ec.cleanup()
+	ac.cleanup()
 }
 
 // cleanup releases all eBPF resources
-func (ec *EBPFCollector) cleanup() {
-	if ec.perfReader != nil {
-		ec.perfReader.Close()
+func (ac *EBPFCollector) cleanup() {
+	if ac.perfReader != nil {
+		ac.perfReader.Close()
 	}
-	for _, l := range ec.links {
+	for _, l := range ac.links {
 		l.Close()
 	}
-	ec.objs.Close()
+	ac.objs.Close()
 }
 
 // Helper functions
