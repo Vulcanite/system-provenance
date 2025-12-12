@@ -19,6 +19,8 @@ struct enter_data_t {
     u32 dest_ipv6[4];
     u16 dest_port;
     u16 sa_family;
+    u8 socket_type;    // Socket type (SOCK_STREAM, SOCK_DGRAM)
+    u8 protocol;       // Protocol (IPPROTO_TCP, IPPROTO_UDP)
 };
 
 // Network socket tracking data
@@ -40,6 +42,7 @@ struct accept_args_t {
     u16 port;
     u32 ipv4;
     u32 ipv6[4];
+    s64 listen_fd;  // Listening socket FD to lookup protocol
 };
 
 // Event type classification
@@ -193,6 +196,14 @@ struct {
     __type(key, u64);  // Index
     __type(value, struct whitelist_rule);
 } whitelist_rules SEC(".maps");
+
+// Map to track socket fd -> protocol (from socket syscall)
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, u64);  // pid_tgid << 32 | fd
+    __type(value, u8);  // protocol (IPPROTO_TCP=6, IPPROTO_UDP=17)
+} socket_proto_map SEC(".maps");
 
 // Map to track connect enter data
 struct {
@@ -586,7 +597,12 @@ SEC("tp/syscalls/sys_enter_close")
 int sys_enter_close(struct args_close *ctx) {
     u64 id = bpf_get_current_pid_tgid();
     u64 fd_key = (id & 0xFFFFFFFF00000000ULL) | (u32)ctx->fd;
+
+    // Clean up all FD-related maps
     bpf_map_delete_elem(&fd_to_filename, &fd_key);
+    bpf_map_delete_elem(&socket_map, &fd_key);
+    bpf_map_delete_elem(&socket_proto_map, &fd_key);
+
     return 0;
 }
 
@@ -615,6 +631,20 @@ int sys_enter_vfork(void *ctx) {
 
 SEC("tp/syscalls/sys_enter_socket")
 int sys_enter_socket(struct args_socket *ctx) {
+    u64 id = bpf_get_current_pid_tgid();
+
+    // Store socket args for exit probe
+    u32 zero = 0;
+    struct enter_data_t *data = bpf_map_lookup_elem(&enter_data_heap, &zero);
+    if (!data) return 0;
+    __builtin_memset(data, 0, sizeof(*data));
+
+    data->sa_family = ctx->family;
+    data->socket_type = ctx->type;
+    data->protocol = ctx->protocol;
+
+    bpf_map_update_elem(&exec_data, &id, data, BPF_ANY);
+
     struct so_event *event = init_event();
     if (!event) return 0;
     event->event_type = EV_NET;
@@ -626,12 +656,36 @@ int sys_enter_socket(struct args_socket *ctx) {
     return 0;
 }
 
+SEC("tp/syscalls/sys_exit_socket")
+int sys_exit_socket(struct args_exit *ctx) {
+    u64 id = bpf_get_current_pid_tgid();
+    struct enter_data_t *data = bpf_map_lookup_elem(&exec_data, &id);
+    if (!data) return 0;
+
+    // If socket creation successful, store protocol for future correlation
+    if (ctx->ret >= 0) {
+        u64 sock_key = (id & 0xFFFFFFFF00000000ULL) | (u32)ctx->ret;
+        u8 protocol = data->protocol;
+        bpf_map_update_elem(&socket_proto_map, &sock_key, &protocol, BPF_ANY);
+    }
+
+    bpf_map_delete_elem(&exec_data, &id);
+    return 0;
+}
+
 SEC("tp/syscalls/sys_enter_connect")
 int sys_enter_connect(struct args_connect *ctx) {
     u64 id = bpf_get_current_pid_tgid();
     struct socket_data_t sock_data = {};
 
     sock_data.fd = ctx->fd;
+
+    // Look up protocol from socket_proto_map
+    u64 sock_key = (id & 0xFFFFFFFF00000000ULL) | (u32)ctx->fd;
+    u8 *proto = bpf_map_lookup_elem(&socket_proto_map, &sock_key);
+    if (proto) {
+        sock_data.protocol = *proto;
+    }
 
     u16 family = 0;
     bpf_probe_read_user(&family, sizeof(family), ctx->uservaddr);
@@ -666,6 +720,7 @@ int sys_exit_connect(struct args_exit *ctx) {
         event->sa_family = sock_data->sa_family;
         event->dest_ip = sock_data->dest_ip;
         event->dest_port = sock_data->dest_port;
+        event->protocol = sock_data->protocol;
         __builtin_memcpy(event->dest_ipv6, sock_data->dest_ipv6, sizeof(event->dest_ipv6));
         event->ret = ctx->ret;
 
@@ -683,11 +738,20 @@ int sys_exit_connect(struct args_exit *ctx) {
 
 SEC("tp/syscalls/sys_enter_bind")
 int sys_enter_bind(struct args_bind *ctx) {
+    u64 id = bpf_get_current_pid_tgid();
+
     struct so_event *event = init_event();
     if (!event) return 0;
     event->event_type = EV_NET;
     __builtin_memcpy(event->syscall, "bind", 5);
     event->fd = ctx->fd;
+
+    // Look up protocol from socket_proto_map
+    u64 sock_key = (id & 0xFFFFFFFF00000000ULL) | (u32)ctx->fd;
+    u8 *proto = bpf_map_lookup_elem(&socket_proto_map, &sock_key);
+    if (proto) {
+        event->protocol = *proto;
+    }
 
     u16 family = 0;
     bpf_probe_read_user(&family, sizeof(family), ctx->umyaddr);
@@ -711,11 +775,21 @@ int sys_enter_bind(struct args_bind *ctx) {
 
 SEC("tp/syscalls/sys_enter_listen")
 int sys_enter_listen(struct args_listen *ctx) {
+    u64 id = bpf_get_current_pid_tgid();
+
     struct so_event *event = init_event();
     if (!event) return 0;
     event->event_type = EV_NET;
     __builtin_memcpy(event->syscall, "listen", 7);
     event->fd = ctx->fd;
+
+    // Look up protocol from socket_proto_map
+    u64 sock_key = (id & 0xFFFFFFFF00000000ULL) | (u32)ctx->fd;
+    u8 *proto = bpf_map_lookup_elem(&socket_proto_map, &sock_key);
+    if (proto) {
+        event->protocol = *proto;
+    }
+
     submit(ctx, event);
     return 0;
 }
@@ -724,6 +798,8 @@ SEC("tp/syscalls/sys_enter_accept")
 int sys_enter_accept(struct args_accept *ctx) {
     u64 id = bpf_get_current_pid_tgid();
     struct accept_args_t args = {};
+
+    args.listen_fd = ctx->fd;  // Store listening socket fd
 
     if (ctx->upeer_sockaddr) {
         u16 family = 0;
@@ -751,6 +827,8 @@ SEC("tp/syscalls/sys_enter_accept4")
 int sys_enter_accept4(struct args_accept *ctx) {
     u64 id = bpf_get_current_pid_tgid();
     struct accept_args_t args = {};
+
+    args.listen_fd = ctx->fd;  // Store listening socket fd
 
     if (ctx->upeer_sockaddr) {
         u16 family = 0;
@@ -798,6 +876,14 @@ static __always_inline int process_exit_accept(struct args_exit *ctx, const char
     struct socket_data_t sock_data = {};
     sock_data.sa_family = args->sa_family;
 
+    // Look up protocol from listening socket
+    u64 listen_sock_key = (id & 0xFFFFFFFF00000000ULL) | (u32)args->listen_fd;
+    u8 *proto = bpf_map_lookup_elem(&socket_proto_map, &listen_sock_key);
+    if (proto) {
+        sock_data.protocol = *proto;
+        event->protocol = *proto;
+    }
+
     if (args->sa_family == 2) { // AF_INET
         event->src_ip = args->ipv4;
         event->src_port = args->port;
@@ -810,8 +896,14 @@ static __always_inline int process_exit_accept(struct args_exit *ctx, const char
         __builtin_memcpy(sock_data.dest_ipv6, args->ipv6, sizeof(sock_data.dest_ipv6));
     }
 
+    // Store new accepted socket with protocol
     u64 sock_key = (id & 0xFFFFFFFF00000000ULL) | (u32)ctx->ret;
     bpf_map_update_elem(&socket_map, &sock_key, &sock_data, BPF_ANY);
+
+    // Also store protocol for the new socket fd
+    if (proto) {
+        bpf_map_update_elem(&socket_proto_map, &sock_key, proto, BPF_ANY);
+    }
 
     submit(ctx, event);
     bpf_map_delete_elem(&active_accepts, &id);
@@ -885,6 +977,7 @@ int sys_exit_sendto(struct args_exit *ctx) {
             event->dest_ip = sock_data->dest_ip;
             event->dest_port = sock_data->dest_port;
             event->sa_family = sock_data->sa_family;
+            event->protocol = sock_data->protocol;
         } else if (data->sa_family != 0) {
             event->dest_ip = data->dest_ip;
             event->dest_port = data->dest_port;
@@ -937,6 +1030,7 @@ int sys_exit_recvfrom(struct args_exit *ctx) {
             event->src_ip = sock_data->src_ip;
             event->src_port = sock_data->src_port;
             event->sa_family = sock_data->sa_family;
+            event->protocol = sock_data->protocol;
         } else if (data->addr_ptr != 0) {
             void *addr_ptr = (void *)data->addr_ptr;
             u16 family = 0;
@@ -948,6 +1042,7 @@ int sys_exit_recvfrom(struct args_exit *ctx) {
                 bpf_probe_read_user(&addr, sizeof(addr), addr_ptr);
                 event->src_ip = bpf_ntohl(addr.sin_addr.s_addr);
                 event->src_port = bpf_ntohs(addr.sin_port);
+                event->protocol = sock_data->protocol;
             } else if (family == 10) { // AF_INET6
                 struct sockaddr_in6 addr = {};
                 bpf_probe_read_user(&addr, sizeof(addr), addr_ptr);
