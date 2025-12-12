@@ -31,7 +31,7 @@ st.sidebar.header("🔍 Filters")
 time_range = st.sidebar.selectbox(
     "Time Range",
     ["Last 1 hour", "Last 6 hours", "Last 24 hours", "Last 7 days", "Custom"],
-    index=1
+    index=0
 )
 
 if time_range == "Custom":
@@ -61,11 +61,13 @@ end_ms = to_epoch_ms(end_dt)
 
 # Hostname filter
 hostnames = get_unique_hostnames(es, pcap_index)
-hostname_options = ["All"] + hostnames
-hostname_filter = st.sidebar.selectbox("Hostname", hostname_options)
+hostname_filter = st.sidebar.selectbox("Hostname", hostnames)
 
 # Protocol filter
 protocol_filter = st.sidebar.selectbox("Protocol", ["All", "TCP", "UDP"])
+
+# Flow ID filter (for correlation with eBPF events)
+flow_id_filter = st.sidebar.text_input("Flow ID (exact match)", "", help="Enter flow ID to correlate with eBPF network events")
 
 # Sort by option (for table display only)
 sort_by = st.sidebar.selectbox(
@@ -81,6 +83,8 @@ if hostname_filter != "All":
     filters["hostname"] = hostname_filter
 if protocol_filter != "All":
     filters["protocol"] = protocol_filter
+if flow_id_filter:
+    filters["flow.id"] = flow_id_filter
 
 # Main content
 st.markdown("---")
@@ -92,16 +96,16 @@ st.info(f"📊 **Total Flows in Selected Time Range:** {total_count:,}")
 if total_count > 0:
     # Determine sort field and order based on selection
     if sort_by == "Bytes (Highest)":
-        sort_field = "byte_count"
+        sort_field = "network.bytes"
         sort_order = "desc"
     elif sort_by == "Packets (Highest)":
-        sort_field = "packet_count"
+        sort_field = "network.packets"
         sort_order = "desc"
     elif sort_by == "Duration (Longest)":
         sort_field = "epoch_last"
         sort_order = "desc"
     else:  # Most Recent
-        sort_field = "first_seen"
+        sort_field = "epoch_first"
         sort_order = "desc"
 
     # Fetch top 100 flows for table display
@@ -120,7 +124,9 @@ if total_count > 0:
         table_data = []
         for flow in top_flows:
             duration_s = (flow.get('epoch_last', 0) - flow.get('epoch_first', 0)) / 1000.0
+            flow_id = flow.get("flow.id", flow.get("flow_id", "N/A"))  # Support both field names
             table_data.append({
+                "Flow ID": flow_id,  # Truncate for display
                 "Hostname": flow.get("hostname", "N/A"),
                 "Protocol": flow.get("protocol", "N/A"),
                 "Source": f"{flow.get('src_ip', 'N/A')}:{flow.get('src_port', '')}",
@@ -130,7 +136,7 @@ if total_count > 0:
                 "Bytes": flow.get("byte_count", 0),
                 "Duration (s)": round(duration_s, 2),
                 "First Seen": flow.get("datetime_first", "N/A")[:19] if flow.get("datetime_first") else "N/A",
-                # Keep raw data for visualizations
+                # Keep raw data for visualizations and correlation
                 "src_ip": flow.get("src_ip", "N/A"),
                 "dst_ip": flow.get("dst_ip", "N/A"),
                 "src_port": flow.get("src_port", 0),
@@ -142,8 +148,32 @@ if total_count > 0:
         df_table = pd.DataFrame(table_data)
 
         # Display table (without raw data columns)
-        display_df = df_table[["Hostname", "Protocol", "Source", "Destination", "Domain", "Packets", "Bytes", "Duration (s)", "First Seen"]]
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        display_df = df_table[["Flow ID", "Hostname", "Protocol", "Source", "Destination", "Domain", "Packets", "Bytes", "Duration (s)", "First Seen"]]
+
+        # Add interactive flow ID copying for correlation
+        st.dataframe(
+            display_df,
+            width="stretch",
+            hide_index=True
+        )
+
+        # Flow ID correlation helper
+        if not flow_id_filter:
+            with st.expander("🔗 How to Correlate with eBPF Events", expanded=False):
+                st.markdown("""
+                **Flow ID Correlation Guide:**
+                1. Copy a Flow ID from the table above (you can click and select the text)
+                2. Go to the **eBPF Events** page
+                3. Paste the Flow ID into the "Flow ID" filter in the sidebar
+                4. View all syscalls (connect, sendto, recvfrom) associated with that network flow
+
+                This allows you to see which process generated the network traffic!
+                """)
+
+                # Show a sample flow ID if available
+                if len(df_table) > 0 and df_table['Flow ID'].iloc[0] != "N/A":
+                    st.code(df_table['Flow ID'].iloc[0], language="text")
+                    st.caption("↑ Example Flow ID (copy this to filter eBPF events)")
 
         # Create DataFrame for visualizations (ALL flows in time range)
         viz_data = []
@@ -195,7 +225,7 @@ if total_count > 0:
                 height=350,
                 margin=dict(l=20, r=20, t=40, b=20)
             )
-            st.plotly_chart(fig_protocol, use_container_width=True)
+            st.plotly_chart(fig_protocol, width="stretch")
 
         with col2:
             st.subheader("Traffic Over Time")
@@ -216,7 +246,7 @@ if total_count > 0:
                 color_discrete_map={'TCP': '#636EFA', 'UDP': '#EF553B'}
             )
             fig_time.update_layout(height=350, margin=dict(l=20, r=20, t=40, b=20))
-            st.plotly_chart(fig_time, use_container_width=True)
+            st.plotly_chart(fig_time, width="stretch")
 
         # Row 2: Top sources and destinations
         col1, col2 = st.columns(2)
@@ -238,7 +268,7 @@ if total_count > 0:
                 margin=dict(l=20, r=20, t=20, b=20),
                 yaxis={'categoryorder': 'total ascending'}
             )
-            st.plotly_chart(fig_src, use_container_width=True)
+            st.plotly_chart(fig_src, width="stretch")
 
         with col2:
             st.subheader("Top 10 Destination IPs (by Bytes)")
@@ -257,7 +287,7 @@ if total_count > 0:
                 margin=dict(l=20, r=20, t=20, b=20),
                 yaxis={'categoryorder': 'total ascending'}
             )
-            st.plotly_chart(fig_dst, use_container_width=True)
+            st.plotly_chart(fig_dst, width="stretch")
 
         # Row 3: Port analysis
         col1, col2 = st.columns(2)
@@ -283,7 +313,7 @@ if total_count > 0:
                 margin=dict(l=20, r=20, t=20, b=20),
                 yaxis={'categoryorder': 'total ascending'}
             )
-            st.plotly_chart(fig_ports, use_container_width=True)
+            st.plotly_chart(fig_ports, width="stretch")
 
         with col2:
             st.subheader("Top 10 Destination Ports (by Bytes)")
@@ -304,7 +334,7 @@ if total_count > 0:
                 margin=dict(l=20, r=20, t=20, b=20),
                 yaxis={'categoryorder': 'total ascending'}
             )
-            st.plotly_chart(fig_ports_bytes, use_container_width=True)
+            st.plotly_chart(fig_ports_bytes, width="stretch")
 
         # Row 4: Flow characteristics
         col1, col2 = st.columns(2)
@@ -329,7 +359,7 @@ if total_count > 0:
                 height=350,
                 margin=dict(l=20, r=20, t=20, b=20)
             )
-            st.plotly_chart(fig_duration, use_container_width=True)
+            st.plotly_chart(fig_duration, width="stretch")
 
         with col2:
             st.subheader("Bytes vs Packets Scatter")
@@ -344,7 +374,7 @@ if total_count > 0:
                 color_discrete_map={'TCP': '#636EFA', 'UDP': '#EF553B'}
             )
             fig_scatter.update_layout(height=350, margin=dict(l=20, r=20, t=20, b=20))
-            st.plotly_chart(fig_scatter, use_container_width=True)
+            st.plotly_chart(fig_scatter, width="stretch")
 
         # Row 5: TCP Analysis (if TCP flows exist)
         tcp_flows = df[df['Protocol'] == 'TCP']
@@ -371,7 +401,7 @@ if total_count > 0:
                     height=350,
                     margin=dict(l=20, r=20, t=20, b=20)
                 )
-                st.plotly_chart(fig_flags, use_container_width=True)
+                st.plotly_chart(fig_flags, width="stretch")
             else:
                 st.info("No TCP flag data available in captured flows")
 
@@ -390,7 +420,7 @@ if total_count > 0:
             aspect='auto'
         )
         fig_heatmap.update_layout(height=250, margin=dict(l=20, r=20, t=20, b=20))
-        st.plotly_chart(fig_heatmap, use_container_width=True)
+        st.plotly_chart(fig_heatmap, width="stretch")
 
         # Row 7: Domain analysis (if DNS resolved data exists)
         domains_resolved = df[df['Domain'] != '-']
@@ -412,7 +442,7 @@ if total_count > 0:
                 margin=dict(l=20, r=20, t=20, b=20),
                 yaxis={'categoryorder': 'total ascending'}
             )
-            st.plotly_chart(fig_domains, use_container_width=True)
+            st.plotly_chart(fig_domains, width="stretch")
 
         # Summary statistics
         st.markdown("---")

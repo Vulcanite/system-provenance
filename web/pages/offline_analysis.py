@@ -59,7 +59,7 @@ if pcap_file:
                 help="Limit for large files (prevents memory issues)"
             )
 
-    if st.button("🔄 Process PCAP File", type="primary", use_container_width=True):
+    if st.button("🔄 Process PCAP File", type="primary", width="stretch"):
         with st.spinner("Parsing PCAP file with tshark..."):
             # Save uploaded file
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pcap') as tmp_pcap:
@@ -240,7 +240,7 @@ if auditd_file:
                 help="Limit for large log files"
             )
 
-    if st.button("🔄 Process Auditd Log", type="primary", use_container_width=True):
+    if st.button("🔄 Process Auditd Log", type="primary", width="stretch"):
         with st.spinner("Parsing auditd log file..."):
             try:
                 # Read uploaded file
@@ -386,7 +386,7 @@ if st.session_state['pcap_flows'] is not None:
             title="Traffic by Protocol",
             hole=0.4
         )
-        st.plotly_chart(fig_protocol, use_container_width=True)
+        st.plotly_chart(fig_protocol, width="stretch")
 
     with col2:
         # Traffic over time
@@ -410,7 +410,7 @@ if st.session_state['pcap_flows'] is not None:
             xaxis_title="Time",
             yaxis_title="MB per Minute"
         )
-        st.plotly_chart(fig_time, use_container_width=True)
+        st.plotly_chart(fig_time, width="stretch")
 
     # ===== TOP TALKERS =====
     st.markdown("### 🔝 Top Talkers")
@@ -427,7 +427,7 @@ if st.session_state['pcap_flows'] is not None:
             title="Top 10 Source IPs (by data sent)",
             labels={'x': 'MB', 'y': 'Source IP'}
         )
-        st.plotly_chart(fig_src, use_container_width=True)
+        st.plotly_chart(fig_src, width="stretch")
 
     with col2:
         # Top destination IPs
@@ -439,7 +439,7 @@ if st.session_state['pcap_flows'] is not None:
             title="Top 10 Destination IPs (by data received)",
             labels={'x': 'MB', 'y': 'Destination IP'}
         )
-        st.plotly_chart(fig_dst, use_container_width=True)
+        st.plotly_chart(fig_dst, width="stretch")
 
     with col3:
         # Top ports
@@ -462,7 +462,7 @@ if st.session_state['pcap_flows'] is not None:
             title="Top 10 Destination Ports",
             labels={'x': 'MB', 'y': 'Port'}
         )
-        st.plotly_chart(fig_ports, use_container_width=True)
+        st.plotly_chart(fig_ports, width="stretch")
 
     # ===== FLOW CHARACTERISTICS =====
     st.markdown("### 📊 Flow Characteristics")
@@ -479,7 +479,7 @@ if st.session_state['pcap_flows'] is not None:
             labels={'duration': 'Duration (seconds)', 'count': 'Number of Flows'},
             log_y=True
         )
-        st.plotly_chart(fig_duration, use_container_width=True)
+        st.plotly_chart(fig_duration, width="stretch")
 
     with col2:
         # Packet count distribution
@@ -491,7 +491,7 @@ if st.session_state['pcap_flows'] is not None:
             labels={'packet_count': 'Packets per Flow', 'count': 'Number of Flows'},
             log_y=True
         )
-        st.plotly_chart(fig_packets, use_container_width=True)
+        st.plotly_chart(fig_packets, width="stretch")
 
     # ===== CONNECTION PATTERNS =====
     st.markdown("### 🔗 Connection Patterns")
@@ -512,7 +512,7 @@ if st.session_state['pcap_flows'] is not None:
         },
         log_y=True
     )
-    st.plotly_chart(fig_scatter, use_container_width=True)
+    st.plotly_chart(fig_scatter, width="stretch")
 
     # ===== TCP ANALYSIS =====
     if 'TCP' in df['protocol'].values:
@@ -536,7 +536,7 @@ if st.session_state['pcap_flows'] is not None:
                     title="Top TCP Flag Combinations",
                     labels={'x': 'Flags', 'y': 'Count'}
                 )
-                st.plotly_chart(fig_flags, use_container_width=True)
+                st.plotly_chart(fig_flags, width="stretch")
 
         with col2:
             # Average packet size by protocol
@@ -547,7 +547,7 @@ if st.session_state['pcap_flows'] is not None:
                 title="Average Packet Size by Protocol",
                 labels={'x': 'Protocol', 'y': 'Bytes'}
             )
-            st.plotly_chart(fig_avgsize, use_container_width=True)
+            st.plotly_chart(fig_avgsize, width="stretch")
 
     # ===== NETWORK MAP =====
     st.markdown("### 🗺️ Communication Network Map")
@@ -628,7 +628,7 @@ if st.session_state['pcap_flows'] is not None:
         height=600
     )
 
-    st.plotly_chart(fig_network, use_container_width=True)
+    st.plotly_chart(fig_network, width="stretch")
 
     # ===== DETAILED FLOW TABLE =====
     st.markdown("### 📋 Detailed Flow Data")
@@ -674,7 +674,7 @@ if st.session_state['pcap_flows'] is not None:
 
     st.dataframe(
         filtered_df[display_cols].head(100),
-        use_container_width=True,
+        width="stretch",
         hide_index=True
     )
 
@@ -690,7 +690,7 @@ if st.session_state['pcap_flows'] is not None:
             data=csv,
             file_name=f"pcap_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             mime="text/csv",
-            use_container_width=True
+            width="stretch"
         )
 
     with col2:
@@ -701,7 +701,7 @@ if st.session_state['pcap_flows'] is not None:
             data=top_flows_json,
             file_name=f"top_flows_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
             mime="application/json",
-            use_container_width=True
+            width="stretch"
         )
 
 # ===== AUDITD VISUALIZATIONS =====
@@ -727,7 +727,7 @@ if st.session_state['auditd_events'] is not None:
                 title="Top 15 Audit Event Types",
                 labels={'x': 'Count', 'y': 'Event Type'}
             )
-            st.plotly_chart(fig_types, use_container_width=True)
+            st.plotly_chart(fig_types, width="stretch")
 
     with col2:
         # Events over time
@@ -749,7 +749,7 @@ if st.session_state['auditd_events'] is not None:
                 xaxis_title="Time",
                 yaxis_title="Events per Minute"
             )
-            st.plotly_chart(fig_time, use_container_width=True)
+            st.plotly_chart(fig_time, width="stretch")
 
     # ===== PROCESS ACTIVITY =====
     st.markdown("### 👤 Process & User Activity")
@@ -767,7 +767,7 @@ if st.session_state['auditd_events'] is not None:
                 title="Top 10 Processes (by event count)",
                 labels={'x': 'Events', 'y': 'Process'}
             )
-            st.plotly_chart(fig_procs, use_container_width=True)
+            st.plotly_chart(fig_procs, width="stretch")
 
     with col2:
         # Top executables
@@ -780,7 +780,7 @@ if st.session_state['auditd_events'] is not None:
                 title="Top 10 Executables",
                 labels={'x': 'Events', 'y': 'Executable'}
             )
-            st.plotly_chart(fig_exes, use_container_width=True)
+            st.plotly_chart(fig_exes, width="stretch")
 
     with col3:
         # User activity (by UID)
@@ -793,7 +793,7 @@ if st.session_state['auditd_events'] is not None:
                 title="Top 10 User IDs (by activity)",
                 labels={'x': 'Events', 'y': 'UID'}
             )
-            st.plotly_chart(fig_uids, use_container_width=True)
+            st.plotly_chart(fig_uids, width="stretch")
 
     # ===== SYSCALL ANALYSIS =====
     if 'syscall' in df_audit.columns:
@@ -811,7 +811,7 @@ if st.session_state['auditd_events'] is not None:
                 title="Top 15 Syscalls",
                 labels={'x': 'Count', 'y': 'Syscall'}
             )
-            st.plotly_chart(fig_syscalls, use_container_width=True)
+            st.plotly_chart(fig_syscalls, width="stretch")
 
         with col2:
             # Success/failure analysis
@@ -823,7 +823,7 @@ if st.session_state['auditd_events'] is not None:
                     title="Syscall Success vs Failure",
                     hole=0.4
                 )
-                st.plotly_chart(fig_success, use_container_width=True)
+                st.plotly_chart(fig_success, width="stretch")
 
     # ===== FILE ACCESS ANALYSIS =====
     if 'name' in df_audit.columns:
@@ -841,7 +841,7 @@ if st.session_state['auditd_events'] is not None:
                 title="Top 15 Accessed Files/Paths",
                 labels={'x': 'Access Count', 'y': 'Path'}
             )
-            st.plotly_chart(fig_files, use_container_width=True)
+            st.plotly_chart(fig_files, width="stretch")
 
         with col2:
             # Directory analysis (extract directory from path)
@@ -855,7 +855,7 @@ if st.session_state['auditd_events'] is not None:
                 title="Top 15 Accessed Directories",
                 labels={'x': 'Access Count', 'y': 'Directory'}
             )
-            st.plotly_chart(fig_dirs, use_container_width=True)
+            st.plotly_chart(fig_dirs, width="stretch")
 
     # ===== PROCESS TREE VISUALIZATION =====
     if 'pid' in df_audit.columns and 'ppid' in df_audit.columns and 'comm' in df_audit.columns:
@@ -937,7 +937,7 @@ if st.session_state['auditd_events'] is not None:
 
     st.dataframe(
         filtered_audit[display_cols].head(100),
-        use_container_width=True,
+        width="stretch",
         hide_index=True
     )
 
@@ -953,7 +953,7 @@ if st.session_state['auditd_events'] is not None:
             data=csv_audit,
             file_name=f"auditd_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             mime="text/csv",
-            use_container_width=True
+            width="stretch"
         )
 
     with col2:
@@ -964,7 +964,7 @@ if st.session_state['auditd_events'] is not None:
             data=filtered_json,
             file_name=f"auditd_filtered_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
             mime="application/json",
-            use_container_width=True
+            width="stretch"
         )
 
 # ===== CORRELATION ANALYSIS =====
@@ -1053,7 +1053,7 @@ if st.session_state['pcap_flows'] is not None and st.session_state['auditd_event
                 ),
                 hovermode='x unified'
             )
-            st.plotly_chart(fig_combined, use_container_width=True)
+            st.plotly_chart(fig_combined, width="stretch")
 
             # Process-Network correlation
             st.markdown("### 🔍 Process-Network Correlation")
@@ -1081,7 +1081,7 @@ if st.session_state['pcap_flows'] is not None and st.session_state['auditd_event
                             title="Top Processes During PCAP Capture",
                             labels={'x': 'Event Count', 'y': 'Process'}
                         )
-                        st.plotly_chart(fig_net_procs, use_container_width=True)
+                        st.plotly_chart(fig_net_procs, width="stretch")
 
                     with col2:
                         # Protocol distribution for context
@@ -1092,7 +1092,7 @@ if st.session_state['pcap_flows'] is not None and st.session_state['auditd_event
                             title="Network Protocol Distribution",
                             hole=0.4
                         )
-                        st.plotly_chart(fig_proto, use_container_width=True)
+                        st.plotly_chart(fig_proto, width="stretch")
 
                     # Correlation table
                     st.markdown("### 📋 Potential Process-Flow Correlations")
@@ -1127,7 +1127,7 @@ if st.session_state['pcap_flows'] is not None and st.session_state['auditd_event
                         df_corr = pd.DataFrame(correlations).head(100)
                         st.dataframe(
                             df_corr,
-                            use_container_width=True,
+                            width="stretch",
                             hide_index=True
                         )
                         st.caption(f"Showing potential correlations (processes active within ±{time_tolerance}s of network flows)")

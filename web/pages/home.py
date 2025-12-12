@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Home/Dashboard page for eBPF Provenance Monitor"""
+"""Home/Dashboard page for System Provenance Monitor"""
 
 import streamlit as st
 from datetime import datetime, timedelta
@@ -18,24 +18,7 @@ config = load_config()
 es_config = config.get("es_config", {})
 
 # Connection status
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-    ebpf_enabled = config.get("ebpf_config", {}).get("enabled", True)
-    pcap_enabled = config.get("pcap_config", {}).get("enabled", True)
-    if ebpf_enabled and pcap_enabled:
-        mode = "eBPF + PCAP"
-    elif ebpf_enabled:
-        mode = "eBPF Only"
-    elif pcap_enabled:
-        mode = "PCAP Only"
-    else:
-        mode = "Disabled"
-    st.metric("🔧 Monitoring Mode", mode)
-
-with col2:
-    storage_type = config.get("storage_type", "local")
-    st.metric("💾 Storage", storage_type.upper())
+col3, col4 = st.columns(2)
 
 with col3:
     try:
@@ -65,8 +48,7 @@ end_ms = int(now.timestamp() * 1000)
 
 try:
     es = connect_elasticsearch(es_config)
-
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3 = st.columns(3)
 
     with col1:
         ebpf_index = es_config.get("ebpf_index", "ebpf-events")
@@ -79,14 +61,9 @@ try:
         st.metric("🌐 PCAP Flows", f"{total_flows:,}")
 
     with col3:
-        network_events = get_event_count(es, ebpf_index, start_ms, end_ms,
-                                        filters={"syscall": "connect"})
-        st.metric("🔌 Connections", f"{network_events:,}")
-
-    with col4:
-        file_events = get_event_count(es, ebpf_index, start_ms, end_ms,
-                                     filters={"syscall": "openat"})
-        st.metric("📂 File Opens", f"{file_events:,}")
+        auditd_index = es_config.get("auditd_index", "auditd-events")
+        total_flows = get_event_count(es, auditd_index, start_ms, end_ms)
+        st.metric("📊 Auditd Events", f"{total_flows:,}")
 
 except Exception as e:
     st.error(f"Unable to fetch statistics: {e}")
@@ -148,16 +125,16 @@ st.subheader("⚡ Quick Actions")
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    if st.button("📝 View eBPF Events", use_container_width=True):
+    if st.button("📝 View eBPF Events", width="stretch"):
         st.switch_page("pages/ebpf_events.py")
 
 with col2:
-    if st.button("🌐 View PCAP Flows", use_container_width=True):
+    if st.button("🌐 View PCAP Flows", width="stretch"):
         st.switch_page("pages/pcap_flows.py")
 
 with col3:
-    if st.button("🔍 Generate Provenance Graph", use_container_width=True):
-        st.switch_page("pages/provenance.py")
+    if st.button("🔍 View Auditd Events", width="stretch"):
+        st.switch_page("pages/auditd_events.py")
 
 st.markdown("---")
 st.caption("💡 Tip: Use the sidebar to navigate between different analysis views.")
