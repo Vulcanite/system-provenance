@@ -48,6 +48,7 @@ type eBPFEvent struct {
 	EventType        string `json:"event.type,omitempty"`
 	Error            string `json:"error.message,omitempty"`
 	ErrorCode        int64  `json:"error.code,omitempty"`
+	UserUnset        bool   `json:"user_unset"`
 
 	// ECS: Network fields
 	SourceIP   string `json:"source.ip,omitempty"`
@@ -365,6 +366,14 @@ func (ac *EBPFCollector) attachTracepoints() error {
 	return nil
 }
 
+func normalizeUID(uid uint32) (uint32, bool) {
+	// Linux kernel uses -1 (UINT_MAX) to indicate "unset"
+	if uid == ^uint32(0) {
+		return 0, true // unset
+	}
+	return uid, false
+}
+
 // Start begins processing eBPF events
 func (ac *EBPFCollector) Start() error {
 	// Start multiple indexer goroutines for parallel processing
@@ -478,18 +487,22 @@ func (ac *EBPFCollector) readPerfEvent() error {
 func (ac *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 	// Use kernel monotonic timestamp (bpf_ktime_get_ns) as canonical event time
 	kernelTimeNs := int64(raw.Timestamp)
-
 	eventWallclock := ac.bootTime.Add(time.Duration(kernelTimeNs))
 
+	uid, uidUnset := normalizeUID(raw.Uid)
+
 	evt := eBPFEvent{
-		Hostname:         ac.cfg.Hostname,
-		Module:           "ebpf",
-		TimestampNs:      kernelTimeNs, // Canonical kernel event time (monotonic)
-		EpochTimestamp:   eventWallclock.UnixMilli(),
-		Datetime:         eventWallclock.UTC().Format(time.RFC3339Nano),
-		Pid:              raw.Pid,
-		Ppid:             raw.Ppid,
-		Uid:              raw.Uid,
+		Hostname:       ac.cfg.Hostname,
+		Module:         "ebpf",
+		TimestampNs:    kernelTimeNs, // Canonical kernel event time (monotonic)
+		EpochTimestamp: eventWallclock.UnixMilli(),
+		Datetime:       eventWallclock.UTC().Format(time.RFC3339Nano),
+
+		Pid:  raw.Pid,
+		Ppid: raw.Ppid,
+
+		// 🔧 FIX: normalized UID
+		Uid:              uid,
 		ParentStartTime:  raw.ParentStartTime,
 		ProcessStartTime: raw.ProcessStartTime,
 		Comm:             int8ToStr(raw.Comm[:]),
@@ -500,6 +513,8 @@ func (ac *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 		Protocol:         raw.Protocol,
 		SocketType:       raw.SocketType,
 	}
+
+	evt.UserUnset = uidUnset
 
 	// Set event type classification
 	switch raw.EventType {
@@ -515,7 +530,6 @@ func (ac *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 		evt.Error, evt.ErrorCode = getErrno(raw.Ret)
 	}
 
-	// Parse network fields
 	if raw.SaFamily > 0 {
 		switch raw.SaFamily {
 		case 2: // AF_INET
@@ -528,10 +542,12 @@ func (ac *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 			}
 		case 10: // AF_INET6
 			evt.SaFamily = "ipv6"
-			if raw.SrcIpv6[0] > 0 || raw.SrcIpv6[1] > 0 || raw.SrcIpv6[2] > 0 || raw.SrcIpv6[3] > 0 {
+			if raw.SrcIpv6[0] > 0 || raw.SrcIpv6[1] > 0 ||
+				raw.SrcIpv6[2] > 0 || raw.SrcIpv6[3] > 0 {
 				evt.SourceIPv6 = parseIPv6(raw.SrcIpv6)
 			}
-			if raw.DestIpv6[0] > 0 || raw.DestIpv6[1] > 0 || raw.DestIpv6[2] > 0 || raw.DestIpv6[3] > 0 {
+			if raw.DestIpv6[0] > 0 || raw.DestIpv6[1] > 0 ||
+				raw.DestIpv6[2] > 0 || raw.DestIpv6[3] > 0 {
 				evt.DestIPv6 = parseIPv6(raw.DestIpv6)
 			}
 		default:
@@ -541,34 +557,40 @@ func (ac *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 		evt.SourcePort = raw.SrcPort
 		evt.DestPort = raw.DestPort
 
-		// Generate Flow ID for network events with complete 5-tuple
-		if raw.Protocol == 6 || raw.Protocol == 17 { // TCP or UDP
+		if raw.Protocol == 6 || raw.Protocol == 17 {
 			var srcIP, destIP string
 			if evt.SourceIP != "" {
 				srcIP = evt.SourceIP
 			}
-			if evt.DestIP != "" {
-				destIP = evt.DestIP
-			}
+
 			if evt.SourceIPv6 != "" {
 				srcIP = evt.SourceIPv6
 			}
+
+			if evt.DestIP != "" {
+				destIP = evt.DestIP
+			}
+
 			if evt.DestIPv6 != "" {
 				destIP = evt.DestIPv6
 			}
 
 			if srcIP != "" && destIP != "" {
 				proto := map[uint8]string{6: "TCP", 17: "UDP"}[raw.Protocol]
-				evt.FlowID = GenerateFlowID(srcIP, destIP, evt.SourcePort, evt.DestPort, proto)
+				evt.FlowID = GenerateFlowID(
+					srcIP, destIP,
+					evt.SourcePort, evt.DestPort,
+					proto,
+				)
 			}
 		}
 	}
 
-	// Parse I/O fields
-	if evt.Syscall == "write" || evt.Syscall == "read" || evt.Syscall == "sendto" || evt.Syscall == "recvfrom" {
+	// I/O fields
+	if evt.Syscall == "write" || evt.Syscall == "read" ||
+		evt.Syscall == "sendto" || evt.Syscall == "recvfrom" {
 		evt.Count = raw.Count
 		evt.BytesRW = raw.BytesRw
-		// FD is now properly set from the BPF event, no hack needed
 	}
 
 	evt.ProcessUUID = GenerateProcessUUID(ac.cfg.Hostname, raw.Pid, raw.ProcessStartTime)
