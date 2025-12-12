@@ -189,6 +189,7 @@ func (h *auditStreamHandler) ReassemblyComplete(msgs []*auparse.AuditMessage) {
 	// Simplify the raw kernel messages into a high-level event
 	event, err := aucoalesce.CoalesceMessages(msgs)
 	if err != nil {
+		log.Printf("[!] Failed to coalesce audit messages: %v", err)
 		return
 	}
 
@@ -273,20 +274,21 @@ func (h *auditStreamHandler) ReassemblyComplete(msgs []*auparse.AuditMessage) {
 
 	if h.collector.fileWriter != nil {
 		h.collector.fileWriter.Write(data)
-		h.collector.fileWriter.Write([]byte("\n"))
 	}
 
-	// Send to Elasticsearch
-	h.collector.bulkIndexer.Add(
-		context.Background(),
-		esutil.BulkIndexerItem{
-			Action: "index",
-			Body:   strings.NewReader(string(data)),
-			OnFailure: func(ctx context.Context, item esutil.BulkIndexerItem, res esutil.BulkIndexerResponseItem, err error) {
-				log.Printf("[!] Auditd Index Error: %v", err)
+	// Send to Elasticsearch (if configured)
+	if h.collector.bulkIndexer != nil {
+		h.collector.bulkIndexer.Add(
+			context.Background(),
+			esutil.BulkIndexerItem{
+				Action: "index",
+				Body:   strings.NewReader(string(data)),
+				OnFailure: func(ctx context.Context, item esutil.BulkIndexerItem, res esutil.BulkIndexerResponseItem, err error) {
+					log.Printf("[!] Auditd Index Error: %v", err)
+				},
 			},
-		},
-	)
+		)
+	}
 }
 
 func (h *auditStreamHandler) EventsLost(count int) {
