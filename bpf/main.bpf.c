@@ -1037,12 +1037,17 @@ int sys_exit_recvfrom(struct args_exit *ctx) {
             bpf_probe_read_user(&family, sizeof(family), addr_ptr);
             event->sa_family = family;
 
+            // Lookup protocol from socket_proto_map when sock_data not available
+            u8 *proto = bpf_map_lookup_elem(&socket_proto_map, &sock_key);
+            if (proto) {
+                event->protocol = *proto;
+            }
+
             if (family == 2) { // AF_INET
                 struct sockaddr_in addr = {};
                 bpf_probe_read_user(&addr, sizeof(addr), addr_ptr);
                 event->src_ip = bpf_ntohl(addr.sin_addr.s_addr);
                 event->src_port = bpf_ntohs(addr.sin_port);
-                event->protocol = sock_data->protocol;
             } else if (family == 10) { // AF_INET6
                 struct sockaddr_in6 addr = {};
                 bpf_probe_read_user(&addr, sizeof(addr), addr_ptr);

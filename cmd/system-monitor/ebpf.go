@@ -587,8 +587,8 @@ func (ec *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 		evt.BytesRW = raw.BytesRw
 	}
 
-	evt.ProcessUUID = GenerateProcessUUID(ec.cfg.Hostname, raw.Pid, raw.ProcessStartTime)
-	evt.ParentUUID = GenerateParentUUID(ec.cfg.Hostname, raw.Ppid, raw.ParentStartTime)
+	evt.ProcessUUID = GenerateProcessUUID(ec.cfg.Hostname, raw.Pid, GetProcessStartTime(int(raw.Pid)))
+	evt.ParentUUID = GenerateParentUUID(ec.cfg.Hostname, raw.Ppid, GetProcessStartTime(int(raw.Ppid)))
 	return evt
 }
 
