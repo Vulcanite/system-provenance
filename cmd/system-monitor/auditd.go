@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -50,6 +51,10 @@ type AuditEvent struct {
 	ProcessName string `json:"process.name,omitempty"`
 	ProcessExe  string `json:"process.executable,omitempty"`
 	UserAUID    string `json:"user.id,omitempty"` // Audit User ID (login uid)
+
+	// Process correlation fields
+	ProcessUUID string `json:"process.entity_id,omitempty"`
+	ParentUUID  string `json:"process.parent.entity_id,omitempty"`
 
 	// Additional fields
 	Category string                 `json:"category"`
@@ -237,6 +242,25 @@ func (h *auditStreamHandler) ReassemblyComplete(msgs []*auparse.AuditMessage) {
 		parts := strings.Split(output.ProcessExe, "/")
 		if len(parts) > 0 {
 			output.ProcessName = parts[len(parts)-1]
+		}
+	}
+
+	// Generate process correlation UUIDs
+	if output.ProcessPID != "" {
+		if pid, err := strconv.Atoi(output.ProcessPID); err == nil && pid > 0 {
+			processStartTime := GetProcessStartTime(pid)
+			if processStartTime > 0 {
+				output.ProcessUUID = GenerateProcessUUID(h.collector.cfg.Hostname, uint32(pid), processStartTime)
+			}
+		}
+	}
+
+	if output.ProcessPPID != "" {
+		if ppid, err := strconv.Atoi(output.ProcessPPID); err == nil && ppid > 0 {
+			parentStartTime := GetProcessStartTime(ppid)
+			if parentStartTime > 0 {
+				output.ParentUUID = GenerateParentUUID(h.collector.cfg.Hostname, uint32(ppid), parentStartTime)
+			}
 		}
 	}
 

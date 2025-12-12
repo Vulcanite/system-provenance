@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,6 +30,49 @@ func GenerateProcessUUID(hostname string, pid uint32, processStartTimeNs uint64)
 // GenerateParentUUID creates UUID for parent process
 func GenerateParentUUID(hostname string, ppid uint32, parentStartTimeNs uint64) string {
 	return GenerateProcessUUID(hostname, ppid, parentStartTimeNs)
+}
+
+// GetProcessStartTime reads process start time from /proc/[pid]/stat
+// Returns start time in nanoseconds (converted from jiffies), or 0 if unavailable
+func GetProcessStartTime(pid int) uint64 {
+	if pid <= 0 {
+		return 0
+	}
+
+	// Read /proc/[pid]/stat
+	statPath := fmt.Sprintf("/proc/%d/stat", pid)
+	data, err := os.ReadFile(statPath)
+	if err != nil {
+		return 0 // Process might have exited
+	}
+
+	// Parse stat file
+	// Format: pid (comm) state ppid ... starttime ...
+	// starttime is field 22 (0-indexed 21)
+	statStr := string(data)
+
+	// Find the last ')' to skip the comm field which can contain spaces
+	lastParen := strings.LastIndexByte(statStr, ')')
+	if lastParen == -1 {
+		return 0
+	}
+
+	// Split the rest of the fields
+	fields := strings.Fields(statStr[lastParen+1:])
+	if len(fields) < 20 { // starttime is at index 19 (22 - 3 consumed fields)
+		return 0
+	}
+
+	// Parse starttime (in jiffies since boot)
+	starttimeJiffies, err := strconv.ParseUint(fields[19], 10, 64)
+	if err != nil {
+		return 0
+	}
+
+	// Convert jiffies to nanoseconds
+	// Linux typically uses 100 Hz (USER_HZ), so 1 jiffy = 10ms = 10,000,000 ns
+	const nsPerJiffy = 10_000_000
+	return starttimeJiffies * nsPerJiffy
 }
 
 // ============================================

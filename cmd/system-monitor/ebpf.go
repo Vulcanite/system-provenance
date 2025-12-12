@@ -559,19 +559,14 @@ func (ac *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 
 		if raw.Protocol == 6 || raw.Protocol == 17 {
 			var srcIP, destIP string
-			if evt.SourceIP != "" {
+
+			// Use appropriate IP fields based on address family
+			switch raw.SaFamily {
+			case 2: // AF_INET (IPv4)
 				srcIP = evt.SourceIP
-			}
-
-			if evt.SourceIPv6 != "" {
-				srcIP = evt.SourceIPv6
-			}
-
-			if evt.DestIP != "" {
 				destIP = evt.DestIP
-			}
-
-			if evt.DestIPv6 != "" {
+			case 10: // AF_INET6 (IPv6)
+				srcIP = evt.SourceIPv6
 				destIP = evt.DestIPv6
 			}
 
@@ -587,8 +582,7 @@ func (ac *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 	}
 
 	// I/O fields
-	if evt.Syscall == "write" || evt.Syscall == "read" ||
-		evt.Syscall == "sendto" || evt.Syscall == "recvfrom" {
+	if evt.Syscall == "write" || evt.Syscall == "read" || evt.Syscall == "sendto" || evt.Syscall == "recvfrom" {
 		evt.Count = raw.Count
 		evt.BytesRW = raw.BytesRw
 	}
@@ -690,7 +684,7 @@ func parseIPv4(ip uint32) string {
 // parseIPv6 converts IPv6 address parts to formatted string
 func parseIPv6(parts [4]uint32) string {
 	buf := make([]byte, 16)
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		binary.BigEndian.PutUint32(buf[i*4:], parts[i])
 	}
 	return net.IP(buf).String()
