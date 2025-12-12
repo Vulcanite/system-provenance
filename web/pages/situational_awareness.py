@@ -69,7 +69,7 @@ max_pcap = st.sidebar.slider("Max PCAP Flows", 100, 5000, 1000, 100)
 st.markdown("---")
 
 # Main analysis button
-if st.button("🔍 Run Situational Awareness Analysis", type="primary", use_container_width=True):
+if st.button("🔍 Run Situational Awareness Analysis", type="primary", width="stretch"):
     with st.spinner("Analyzing multi-source data..."):
         # Fetch eBPF events (sort by datetime field)
         ebpf_events = fetch_events(es, ebpf_index, start_ms, end_ms, page=1, page_size=max_ebpf, sort_field="datetime")
@@ -145,7 +145,7 @@ if 'current_results' in st.session_state:
         ))
         
         fig_gauge.update_layout(height=300)
-        st.plotly_chart(fig_gauge, use_container_width=True)
+        st.plotly_chart(fig_gauge, width="stretch")
     
     with col2:
         st.metric("Threat Level", level)
@@ -182,7 +182,7 @@ if 'current_results' in st.session_state:
         
         if threat_data:
             df_threats = pd.DataFrame(threat_data)
-            st.dataframe(df_threats, use_container_width=True, hide_index=True)
+            st.dataframe(df_threats, width="stretch", hide_index=True)
     
     with col2:
         # All threat probabilities bar chart
@@ -213,7 +213,7 @@ if 'current_results' in st.session_state:
             margin=dict(l=20, r=20, t=20, b=20)
         )
         
-        st.plotly_chart(fig_threats, use_container_width=True)
+        st.plotly_chart(fig_threats, width="stretch")
     
     st.markdown("---")
     
@@ -277,7 +277,7 @@ if 'current_results' in st.session_state:
             yaxis_range=[0, 1]
         )
         
-        st.plotly_chart(fig_trend, use_container_width=True)
+        st.plotly_chart(fig_trend, width="stretch")
     
     st.markdown("---")
     
@@ -289,12 +289,12 @@ if 'current_results' in st.session_state:
     col1, col2, col3 = st.columns([1, 1, 2])
     
     with col1:
-        if st.button("👍 Accurate Assessment", type="secondary", use_container_width=True):
+        if st.button("👍 Accurate Assessment", type="secondary", width="stretch"):
             engine.provide_analyst_feedback(1, results)
             st.success("✅ Positive feedback recorded")
     
     with col2:
-        if st.button("👎 Inaccurate Assessment", type="secondary", use_container_width=True):
+        if st.button("👎 Inaccurate Assessment", type="secondary", width="stretch"):
             engine.provide_analyst_feedback(0, results)
             st.warning("⚠️ Negative feedback recorded")
     
@@ -310,7 +310,7 @@ if 'current_results' in st.session_state:
             
             st.dataframe(
                 feedback_df[['timestamp', 'feedback', 'score', 'error']],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
     
@@ -328,12 +328,12 @@ if 'current_results' in st.session_state:
             data=json_str,
             file_name=f"mf_cssa_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
             mime="application/json",
-            use_container_width=True
+            width="stretch"
         )
     
     with col2:
         # Export to file
-        if st.button("💾 Save to Server", use_container_width=True):
+        if st.button("💾 Save to Server", width="stretch"):
             os.makedirs(output_dir, exist_ok=True)
             filename = os.path.join(
                 output_dir,
