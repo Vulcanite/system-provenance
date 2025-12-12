@@ -29,7 +29,7 @@ st.sidebar.header("🔍 Filters")
 time_range = st.sidebar.selectbox(
     "Time Range",
     ["Last 1 hour", "Last 6 hours", "Last 24 hours", "Last 7 days", "Custom"],
-    index=1
+    index=0
 )
 
 if time_range == "Custom":
@@ -59,14 +59,14 @@ end_ms = to_epoch_ms(end_dt)
 
 # Hostname filter
 hostnames = get_unique_hostnames(es, ebpf_index)
-hostname_options = ["All"] + hostnames
-hostname_filter = st.sidebar.selectbox("Hostname", hostname_options)
+hostname_filter = st.sidebar.selectbox("Hostname", hostnames)
 
 # Additional filters
 syscall_filter = st.sidebar.text_input("Syscall (exact match)", "")
 comm_filter = st.sidebar.text_input("Process Name (exact match)", "")
 pid_filter = st.sidebar.text_input("PID", "")
 ppid_filter = st.sidebar.text_input("PPID", "")
+flow_id_filter = st.sidebar.text_input("Flow ID (exact match)", "", help="Enter flow ID to see network events from PCAP flows")
 
 # Build filters dict
 filters = {}
@@ -86,6 +86,9 @@ if ppid_filter:
         filters["ppid"] = int(ppid_filter)
     except ValueError:
         st.sidebar.error("PPID must be a number")
+
+if flow_id_filter:
+    filters["flow.id"] = flow_id_filter
 
 # Events per page - default to 1000
 page_size = st.sidebar.selectbox("Events per page", [500, 1000, 2000, 5000], index=1)
@@ -145,6 +148,13 @@ if total_count > 0:
             else:
                 ret_str = str(ret_val)
 
+            # Get flow ID for network events (support both field names)
+            flow_id = ""
+            if event_type == "🌐 Network":
+                flow_id_full = event.get("flow.id", event.get("flow_id", ""))
+                if flow_id_full:
+                    flow_id = flow_id_full[:12] + "..." if len(flow_id_full) > 12 else flow_id_full
+
             table_data.append({
                 "Timestamp": event.get("datetime", "N/A")[:19] if event.get("datetime") else "N/A",
                 "Hostname": event.get("hostname", "N/A"),
@@ -154,6 +164,7 @@ if total_count > 0:
                 "PID": event.get("pid", "N/A"),
                 "PPID": event.get("ppid", "N/A"),
                 "UID": event.get("uid", "N/A"),
+                "Flow ID": flow_id if flow_id else "-",
                 "Target": target,
                 "Return": ret_str,
                 "Error": event.get("error", ""),
@@ -164,7 +175,7 @@ if total_count > 0:
         # Configure column widths and display
         st.dataframe(
             df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "Timestamp": st.column_config.TextColumn("Timestamp", width="medium"),
@@ -175,11 +186,32 @@ if total_count > 0:
                 "PID": st.column_config.NumberColumn("PID", width="small"),
                 "PPID": st.column_config.NumberColumn("PPID", width="small"),
                 "UID": st.column_config.NumberColumn("UID", width="small"),
+                "Flow ID": st.column_config.TextColumn("Flow ID", width="small", help="Correlates with PCAP flows"),
                 "Target": st.column_config.TextColumn("Target", width="large"),
                 "Return": st.column_config.TextColumn("Return", width="small"),
                 "Error": st.column_config.TextColumn("Error", width="small"),
             }
         )
+
+        # Flow ID correlation helper for network events
+        network_events_with_flow = df[(df['Type'] == '🌐 Network') & (df['Flow ID'] != '-')]
+        if not flow_id_filter and len(network_events_with_flow) > 0:
+            with st.expander("🔗 How to Correlate with PCAP Flows", expanded=False):
+                st.markdown("""
+                **Flow ID Correlation Guide:**
+                1. Copy a Flow ID from the "Flow ID" column above (for network events)
+                2. Go to the **PCAP Network Flows** page
+                3. Paste the Flow ID into the "Flow ID" filter in the sidebar
+                4. View the aggregated network flow statistics for this connection
+
+                This allows you to see packet counts, byte volumes, and DNS resolution for the network traffic!
+                """)
+
+                # Show example if available
+                example_flow_id = network_events_with_flow['Flow ID'].iloc[0]
+                if example_flow_id != "-":
+                    st.code(example_flow_id, language="text")
+                    st.caption("↑ Example Flow ID from a network event")
 
         # Summary statistics
         st.markdown("---")
