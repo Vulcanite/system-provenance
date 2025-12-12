@@ -146,6 +146,10 @@ func (ac *AuditdCollector) Start() error {
 			}
 
 			// Filter out non-audit messages (type < 1000 are system control messages)
+			if msg.Type < 1000 {
+				continue
+			}
+
 			if err := ac.reassembler.Push(msg.Type, msg.Data); err != nil {
 				log.Printf("[!] Reassembler Push Error: %v (dropping raw message)", err)
 			}
