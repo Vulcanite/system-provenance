@@ -284,7 +284,7 @@ def beep_key(event):
     canonical = canonicalize_filename(filename)
 
     return (
-        event.get("process.parent.pid", event.get("ppid", 0)),
+        event.get("process.parent.pid"),
         event.get("syscall"),
         canonical
     )
@@ -535,7 +535,7 @@ class ProvenanceGraph:
         })
 
         for event in events:
-            pid = str(event.get('process.pid', event.get('pid', 0)))
+            pid = str(event['process.pid'])
             sc = event['syscall']
 
             if sc in ['openat', 'read', 'write']:
@@ -553,7 +553,7 @@ class ProvenanceGraph:
                 process_stats[pid]['net_connections'] += 1
 
             if sc == 'execve':
-                parent = str(event.get('process.parent.pid', event.get('ppid', 0)))
+                parent = str(event['process.parent.pid'])
                 process_stats[parent]['child_processes'] += 1
 
         for pid, stats in process_stats.items():
@@ -810,7 +810,7 @@ class ProvenanceGraph:
             for ev in events:
                 sc = ev.get("syscall", "")
                 fn = ev.get("file.path", "") or ""
-                dt = ev.get("@timestamp", ev.get("datetime", ""))
+                dt = ev.get("@timestamp", "")
                 dip = ev.get("destination.ip", "")
                 dport = ev.get("destination.port", 0)
 
@@ -913,8 +913,8 @@ class ProvenanceGraph:
         """Check if event belongs to a noise category"""
         syscall = event['syscall']
         filename = event.get('file.path', '')
-        comm = event.get('process.name', event.get('comm', ''))
-        pid = str(event.get('process.pid', event.get('pid', 0)))
+        comm = event.get('process.name', '')
+        pid = str(event['process.pid'])
 
         for _, rules in NOISE_CATEGORIES.items():
             sensitivity = rules.get('sensitivity', 'medium')
@@ -954,8 +954,8 @@ class ProvenanceGraph:
     def _should_filter_event(self, event):
         syscall = event['syscall']
         filename = event.get('file.path', '')
-        comm = event.get('process.name', event.get('comm', '')).split('\x00', 1)[0].strip()
-        pid = str(event.get('process.pid', event.get('pid', 0)))
+        comm = event.get('process.name', '').split('\x00', 1)[0].strip()
+        pid = str(event['process.pid'])
 
         # ------------------------------
         # 0. Filter out gdbus completely
@@ -1150,9 +1150,9 @@ class ProvenanceGraph:
                 self.filtered_events += 1
                 continue
 
-            pid = str(event.get('process.pid', event.get('pid', 0)))
-            ppid = str(event.get('process.parent.pid', event.get('ppid', 0)))
-            comm = event.get('process.name', event.get('comm', 'unknown')).split('\x00', 1)[0].strip()
+            pid = str(event['process.pid'])
+            ppid = str(event['process.parent.pid'])
+            comm = event.get('process.name', 'unknown').split('\x00', 1)[0].strip()
             syscall = event['syscall']
 
             if 'epoch_timestamp' in event:
