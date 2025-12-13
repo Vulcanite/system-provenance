@@ -187,7 +187,7 @@ if total_count > 0:
         # Create timeline dataframe
         timeline_data = []
         for event in analysis_events:
-            dt = datetime.fromtimestamp(event.get("@timestamp") / 1000).strftime("%Y-%m-%d %H:%M:%S"),
+            dt = datetime.fromtimestamp(event.get("@timestamp") / 1000)
             timeline_data.append({
                 "timestamp": dt,
                 "type": event.get("event.category", "unknown")
@@ -224,7 +224,7 @@ if total_count > 0:
             is_persistence = any(path in obj for path in persistence_paths)
 
             if is_persistence or "persistence" in event.get("tags", []) or "identity" in event.get("tags", []):
-                dt = datetime.fromtimestamp(event.get("@timestamp") / 1000).strftime("%Y-%m-%d %H:%M:%S"),
+                dt = datetime.fromtimestamp(event.get("@timestamp") / 1000).strftime("%Y-%m-%d %H:%M:%S")
                 persistence_events.append({
                     "Timestamp": dt,
                     "User": event.get("user.id", "N/A"),
@@ -255,7 +255,7 @@ if total_count > 0:
         exec_events = []
         for event in analysis_events:
             if "audit_exec" in event.get("tags", []) or event.get("event.category") == "EXECVE":
-                dt = datetime.fromtimestamp(event.get("@timestamp") / 1000).strftime("%Y-%m-%d %H:%M:%S"),
+                dt = datetime.fromtimestamp(event.get("@timestamp") / 1000).strftime("%Y-%m-%d %H:%M:%S")
 
                 # Try to get command line from raw_data
                 raw_data = event.get("raw_data", {})
