@@ -139,7 +139,7 @@ if total_count > 0:
                 "Packets": flow.get("network.packets", 0),
                 "Bytes": flow.get("network.bytes", 0),
                 "Duration (s)": round(duration_s, 2),
-                "First Seen": flow.get("event.start", flow.get("@timestamp", "N/A"))[:19] if flow.get("event.start") or flow.get("@timestamp") else "N/A",
+                "First Seen": datetime.fromtimestamp(flow.get("epoch_first") / 1000).strftime("%Y-%m-%d %H:%M:%S"),
                 # Keep raw data for visualizations and correlation
                 "src_ip": src_ip,
                 "dst_ip": dst_ip,

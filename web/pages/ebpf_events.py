@@ -156,7 +156,7 @@ if total_count > 0:
                     flow_id = flow_id_full[:12] + "..." if len(flow_id_full) > 12 else flow_id_full
 
             table_data.append({
-                "Timestamp": event.get("@timestamp", "N/A")[:19] if event.get("@timestamp") else "N/A",
+                "Timestamp": datetime.fromtimestamp(event.get("@timestamp") / 1000).strftime("%Y-%m-%d %H:%M:%S"),
                 "Hostname": event.get("host.name", "N/A"),
                 "Type": event_type,
                 "Syscall": syscall,

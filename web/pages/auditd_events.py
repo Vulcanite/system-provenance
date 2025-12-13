@@ -187,16 +187,11 @@ if total_count > 0:
         # Create timeline dataframe
         timeline_data = []
         for event in analysis_events:
-            timestamp_iso = event.get("@timestamp")
-            if timestamp_iso:
-                try:
-                    dt = datetime.fromisoformat(timestamp_iso.replace('Z', '+00:00'))
-                    timeline_data.append({
-                        "timestamp": dt,
-                        "type": event.get("event.category", "unknown")
-                    })
-                except:
-                    pass
+            dt = datetime.fromtimestamp(event.get("@timestamp") / 1000).strftime("%Y-%m-%d %H:%M:%S"),
+            timeline_data.append({
+                "timestamp": dt,
+                "type": event.get("event.category", "unknown")
+            })
 
         if timeline_data:
             timeline_df = pd.DataFrame(timeline_data)
@@ -229,13 +224,7 @@ if total_count > 0:
             is_persistence = any(path in obj for path in persistence_paths)
 
             if is_persistence or "persistence" in event.get("tags", []) or "identity" in event.get("tags", []):
-                timestamp_iso = event.get("@timestamp")
-                try:
-                    dt_obj = datetime.fromisoformat(timestamp_iso.replace('Z', '+00:00'))
-                    dt = dt_obj.strftime("%Y-%m-%d %H:%M:%S")
-                except:
-                    dt = "N/A"
-
+                dt = datetime.fromtimestamp(event.get("@timestamp") / 1000).strftime("%Y-%m-%d %H:%M:%S"),
                 persistence_events.append({
                     "Timestamp": dt,
                     "User": event.get("user.id", "N/A"),
@@ -266,12 +255,7 @@ if total_count > 0:
         exec_events = []
         for event in analysis_events:
             if "audit_exec" in event.get("tags", []) or event.get("event.category") == "EXECVE":
-                timestamp_iso = event.get("@timestamp")
-                try:
-                    dt_obj = datetime.fromisoformat(timestamp_iso.replace('Z', '+00:00'))
-                    dt = dt_obj.strftime("%Y-%m-%d %H:%M:%S")
-                except:
-                    dt = "N/A"
+                dt = datetime.fromtimestamp(event.get("@timestamp") / 1000).strftime("%Y-%m-%d %H:%M:%S"),
 
                 # Try to get command line from raw_data
                 raw_data = event.get("raw_data", {})
