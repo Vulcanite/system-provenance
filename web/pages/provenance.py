@@ -11,6 +11,9 @@ from pyvis.network import Network
 import streamlit.components.v1 as components
 import time
 import re
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import ollama_agent
 from analyzer import ProvenanceGraph
 
@@ -97,14 +100,28 @@ def create_interactive_graph(dot_file_path):
         for node_id, attrs in graph.nodes(data=True):
             label = str(attrs.get("label", node_id)).strip('"').replace("\\n", "\n")
             tooltip = label
-            fillcolor = str(attrs.get("fillcolor", "#CCCCCC")).strip('"')
-            shape = attrs.get("shape", "box")
+
+            node_type = (attrs.get("type") or "").strip('"')
+
+            # Node color/shape rules
+            if node_type == "process":
+                color = "#4FC3F7"   # light blue
+                shape = "ellipse"
+            elif node_type == "file":
+                color = "#FFB74D"   # orange
+                shape = "box"
+            elif node_type == "network":
+                color = "#E57373"   # red
+                shape = "diamond"
+            else:
+                color = "#BDBDBD"   # grey
+                shape = "ellipse"
 
             net.add_node(
                 node_id,
                 label=label,
                 title=tooltip,
-                color=fillcolor,
+                color=color,
                 shape=shape,
                 size=18
             )
@@ -113,9 +130,32 @@ def create_interactive_graph(dot_file_path):
         for u, v, attrs in graph.edges(data=True):
             label = attrs.get("label", "").strip('"')
             tooltip = label
-            color = attrs.get("color", "gray").strip('"')
 
-            net.add_edge(u, v, label=label, title=tooltip, color=color)
+            # We added "source" to edges in analyzer.py: ebpf / auditd / pcap
+            edge_src = str(attrs.get("source", "ebpf")).strip('"')
+
+            if edge_src == "auditd":
+                color = "green"
+                dashes = True
+            elif edge_src == "pcap":
+                color = "red"
+                dashes = [5, 5]  # dotted style
+            else:  # ebpf default
+                color = "blue"
+                dashes = False
+
+            net.add_edge(
+                u, v,
+                label=label,
+                title=tooltip,
+                color=color,
+                smooth={"type": "continuous"},
+                dashes=dashes
+            )
+
+        for node in net.nodes:
+            node_id = node['id']
+            node['title'] = f"<b>{node_id}</b><br>Type: {graph.nodes[node_id].get('type','unknown')}"
 
         return net
 
@@ -362,7 +402,12 @@ with tab2:
         use_beep = "BEEP" in analysis_mode
         use_both = "Both" in analysis_mode
 
-    if st.button("🔍 Analyze & Build Graph", type="primary", use_container_width=True):
+    # st.sidebar.markdown("### 🔗 SPECTRA Fusion")
+    enable_fusion = False #st.sidebar.checkbox("Enable Multi-Source Fusion (eBPF + PCAP + Auditd)", value=False)
+    include_pcap = False #st.sidebar.checkbox("Include PCAP Network Enrichment", value=True)
+    include_auditd = False #st.sidebar.checkbox("Include Auditd Semantic Edges", value=True)
+
+    if st.button("🔍 Analyze & Build Graph", type="primary", width="stretch"):
         if not target_comm and not target_pid:
             st.error("Please enter either a Target Process Name OR a Target PID.")
             st.stop()
@@ -411,6 +456,13 @@ with tab2:
 
                     if selected_host:
                         cmd.extend(["--host", selected_host])
+
+                    if enable_fusion:
+                        cmd.append("--fusion")
+                        if not include_pcap:
+                            cmd.append("--no-pcap")
+                        if not include_auditd:
+                            cmd.append("--no-auditd")
 
                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
@@ -466,6 +518,69 @@ with tab2:
         if st.session_state.get('mitre_techniques'):
             st.markdown("### 🧬 MITRE ATT&CK Techniques Detected")
             mitre_list = st.session_state['mitre_techniques']
+
+            # Create heatmap visualization
+            st.markdown("#### Tactic Coverage Heatmap")
+
+            # Define MITRE ATT&CK tactics in standard order
+            all_tactics = [
+                "Initial Access",
+                "Execution",
+                "Persistence",
+                "Privilege Escalation",
+                "Defense Evasion",
+                "Credential Access",
+                "Discovery",
+                "Lateral Movement",
+                "Collection",
+                "Command and Control",
+                "Exfiltration",
+                "Impact"
+            ]
+
+            # Count techniques per tactic
+            tactic_counts = {}
+            technique_details = {}
+            for tech in mitre_list:
+                tactic = tech.get('tactic', 'Unknown')
+                tactic_counts[tactic] = tactic_counts.get(tactic, 0) + 1
+                if tactic not in technique_details:
+                    technique_details[tactic] = []
+                technique_details[tactic].append(f"{tech.get('tid', '')} - {tech.get('name', '')}")
+
+            # Build heatmap data
+            heatmap_data = []
+            for tactic in all_tactics:
+                count = tactic_counts.get(tactic, 0)
+                heatmap_data.append({
+                    'Tactic': tactic,
+                    'Technique Count': count,
+                    'Status': '🔴 Detected' if count > 0 else '⚪ Not Detected'
+                })
+
+            heatmap_df = pd.DataFrame(heatmap_data)
+
+            # Create horizontal bar chart with color coding
+            fig_heatmap = px.bar(
+                heatmap_df,
+                x='Technique Count',
+                y='Tactic',
+                orientation='h',
+                color='Technique Count',
+                color_continuous_scale='Reds',
+                labels={'Technique Count': 'Techniques Detected', 'Tactic': 'MITRE ATT&CK Tactic'},
+                hover_data={'Status': True}
+            )
+            fig_heatmap.update_layout(
+                height=450,
+                margin=dict(l=20, r=20, t=20, b=20),
+                yaxis={'categoryorder': 'array', 'categoryarray': all_tactics[::-1]},
+                showlegend=False
+            )
+            st.plotly_chart(fig_heatmap, width="stretch")
+
+            # Detailed technique breakdown
+            st.markdown("#### Technique Details")
             for tech in mitre_list:
                 with st.expander(f"{tech['tid']} • {tech['tactic']} • {tech['name']}", expanded=False):
                     if tech.get('description'):
@@ -474,13 +589,247 @@ with tab2:
                         st.markdown("**Evidence:**")
                         for ev in tech['evidence']:
                             st.markdown(f"- {ev}")
+
+            # Summary metrics
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Techniques", len(mitre_list))
+            with col2:
+                st.metric("Tactics Covered", len(tactic_counts))
+            with col3:
+                highest_tactic = max(tactic_counts.items(), key=lambda x: x[1]) if tactic_counts else ("None", 0)
+                st.metric("Most Active Tactic", highest_tactic[0], delta=f"{highest_tactic[1]} techniques")
+
         else:
             st.markdown("### 🧬 MITRE ATT&CK Techniques Detected")
             st.caption("No strong MITRE ATT&CK patterns were identified in this graph.")
 
+    # Context-Aware Timeline (extract from analyzer stdout)
+    if 'analyzer_stdout' in st.session_state:
+        stdout = st.session_state['analyzer_stdout']
+
+        # Try to extract activity window from stdout
+        activity_window_match = re.search(
+            r'\[.\] Target found active between ([^\n]+) and ([^\n]+)',
+            stdout
+        )
+
+        if activity_window_match:
+            start_time_str = activity_window_match.group(1).strip()
+            end_time_str = activity_window_match.group(2).strip()
+
+            st.markdown("---")
+            st.markdown("### ⏱️ Activity Window Context")
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Window Start", start_time_str[-8:] if len(start_time_str) > 8 else start_time_str)
+            with col2:
+                st.metric("Window End", end_time_str[-8:] if len(end_time_str) > 8 else end_time_str)
+            with col3:
+                # Calculate window duration
+                try:
+                    start_dt = datetime.strptime(start_time_str, "%Y-%m-%d %H:%M:%S.%f")
+                    end_dt = datetime.strptime(end_time_str, "%Y-%m-%d %H:%M:%S.%f")
+                    duration = (end_dt - start_dt).total_seconds()
+                    st.metric("Duration", f"{duration:.0f}s")
+                except:
+                    try:
+                        start_dt = datetime.strptime(start_time_str, "%Y-%m-%d %H:%M:%S")
+                        end_dt = datetime.strptime(end_time_str, "%Y-%m-%d %H:%M:%S")
+                        duration = (end_dt - start_dt).total_seconds()
+                        st.metric("Duration", f"{duration:.0f}s")
+                    except:
+                        st.metric("Duration", "N/A")
+
+            st.caption("""
+            📍 **Activity Window**: The time range where the target process was active,
+            with padding for context. Events outside this window show the broader system state.
+            """)
+
+            # Parse chronological events from text summary
+            if 'text_summary' in st.session_state:
+                summary = st.session_state['text_summary']
+
+                # Extract chronological events section
+                chron_match = re.search(
+                    r'=== CHRONOLOGICAL EVENTS \(GRAPH ORDER\) ===(.*?)(?:===|$)',
+                    summary,
+                    re.DOTALL
+                )
+
+                if chron_match:
+                    chron_section = chron_match.group(1)
+
+                    # Parse individual events (format: [HH:MM:SS] event description)
+                    event_pattern = r'\[(\d{2}:\d{2}:\d{2})\]\s*(.+?)(?=\n\[|\n\n|\Z)'
+                    events = re.findall(event_pattern, chron_section, re.DOTALL)
+
+                    if events and len(events) > 1:
+                        st.markdown("#### Event Timeline")
+
+                        # Create timeline dataframe
+                        timeline_data = []
+                        for i, (time_str, desc) in enumerate(events):
+                            # Clean up description
+                            desc_clean = desc.strip().replace('\n', ' ')[:80]
+                            if len(desc) > 80:
+                                desc_clean += "..."
+
+                            timeline_data.append({
+                                'Time': time_str,
+                                'Sequence': i + 1,
+                                'Event': desc_clean
+                            })
+
+                        timeline_df = pd.DataFrame(timeline_data)
+
+                        # Create timeline visualization
+                        fig_timeline = go.Figure()
+
+                        # Add scatter trace for events
+                        fig_timeline.add_trace(go.Scatter(
+                            x=timeline_df['Sequence'],
+                            y=[1] * len(timeline_df),
+                            mode='markers+text',
+                            marker=dict(
+                                size=15,
+                                color=timeline_df['Sequence'],
+                                colorscale='Viridis',
+                                showscale=False,
+                                line=dict(width=2, color='white')
+                            ),
+                            text=timeline_df['Time'],
+                            textposition='top center',
+                            hovertemplate='<b>%{text}</b><br>Event %{x}<extra></extra>',
+                            showlegend=False
+                        ))
+
+                        # Add connecting line
+                        fig_timeline.add_trace(go.Scatter(
+                            x=timeline_df['Sequence'],
+                            y=[1] * len(timeline_df),
+                            mode='lines',
+                            line=dict(color='rgba(100,100,100,0.3)', width=2),
+                            showlegend=False,
+                            hoverinfo='skip'
+                        ))
+
+                        # Update layout
+                        fig_timeline.update_layout(
+                            height=200,
+                            margin=dict(l=20, r=20, t=40, b=20),
+                            xaxis=dict(
+                                title='Event Sequence',
+                                showgrid=False,
+                                zeroline=False
+                            ),
+                            yaxis=dict(
+                                showticklabels=False,
+                                showgrid=False,
+                                zeroline=False,
+                                range=[0.5, 1.5]
+                            ),
+                            plot_bgcolor='rgba(0,0,0,0)',
+                            paper_bgcolor='rgba(0,0,0,0)'
+                        )
+
+                        st.plotly_chart(fig_timeline, width="stretch")
+
+                        # Show event details in expandable table
+                        with st.expander("📋 View Event Details", expanded=False):
+                            # Create detailed table with full descriptions
+                            detailed_data = []
+                            for time_str, desc in events:
+                                detailed_data.append({
+                                    'Time': time_str,
+                                    'Description': desc.strip()
+                                })
+                            detailed_df = pd.DataFrame(detailed_data)
+                            st.dataframe(detailed_df, width="stretch", hide_index=True, height=400)
+
     # Display graph if available
     if st.session_state.get('dot_file_path'):
         st.markdown("---")
+
+        # ========================================
+        # SPECTRA AUTOMATED NARRATIVE SECTION
+        # ========================================
+        if 'text_summary' in st.session_state:
+            summary_text = st.session_state['text_summary']
+
+            # Parse SPECTRA narrative sections
+            if "SPECTRA: AUTOMATED ATTACK NARRATIVE" in summary_text:
+                st.markdown("## 📖 SPECTRA Attack Narrative")
+                st.caption("Automated natural language analysis of the attack")
+
+                # Extract and display executive summary
+                exec_summary_match = re.search(
+                    r'## Executive Summary\n\n(.+?)(?=\n##|\n====|$)',
+                    summary_text,
+                    re.DOTALL
+                )
+
+                if exec_summary_match:
+                    exec_summary = exec_summary_match.group(1).strip()
+
+                    # Display in an info box
+                    if "🔴 CRITICAL" in exec_summary:
+                        st.error(f"**Executive Summary**\n\n{exec_summary}")
+                    elif "🟠 HIGH" in exec_summary:
+                        st.warning(f"**Executive Summary**\n\n{exec_summary}")
+                    elif "🟡 MEDIUM" in exec_summary:
+                        st.info(f"**Executive Summary**\n\n{exec_summary}")
+                    else:
+                        st.success(f"**Executive Summary**\n\n{exec_summary}")
+
+                # Extract evaluation metrics
+                metrics_match = re.search(
+                    r'SPECTRA EVALUATION METRICS REPORT(.+?)(?====|$)',
+                    summary_text,
+                    re.DOTALL
+                )
+
+                if metrics_match:
+                    with st.expander("📊 SPECTRA Performance Metrics", expanded=False):
+                        metrics_text = metrics_match.group(1)
+
+                        # Parse key metrics
+                        reduction_match = re.search(r'Reduction Percentage: ([\d.]+)%', metrics_text)
+                        compression_match = re.search(r'Overall Compression:\s+([\d.]+)%', metrics_text)
+                        nodes_match = re.search(r'Reduced Nodes:\s+(\d+)', metrics_text)
+                        edges_match = re.search(r'Reduced Edges:\s+(\d+)', metrics_text)
+
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            if reduction_match:
+                                st.metric("Log Reduction", f"{reduction_match.group(1)}%")
+                        with col2:
+                            if compression_match:
+                                st.metric("Graph Compression", f"{compression_match.group(1)}%")
+                        with col3:
+                            if nodes_match:
+                                st.metric("Graph Nodes", nodes_match.group(1))
+                        with col4:
+                            if edges_match:
+                                st.metric("Graph Edges", edges_match.group(1))
+
+                        st.code(metrics_text, language="text")
+
+                # Extract full narrative
+                narrative_match = re.search(
+                    r'FULL NARRATIVE\n=+\n\n(.+?)(?=\n====|$)',
+                    summary_text,
+                    re.DOTALL
+                )
+
+                if narrative_match:
+                    with st.expander("📝 Full Attack Narrative", expanded=True):
+                        narrative = narrative_match.group(1).strip()
+                        st.markdown(narrative)
+
+                st.markdown("---")
+
         st.markdown("### Interactive Provenance Graph")
 
         # Button to switch to AI tab

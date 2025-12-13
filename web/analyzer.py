@@ -10,6 +10,9 @@ import networkx as nx
 from elasticsearch import Elasticsearch
 from datetime import datetime, timedelta
 from collections import defaultdict, Counter
+from utils import normalize_event_fields, get_event_field
+from narrative_gen import generate_narrative_from_analysis
+from evaluation import EvaluationMetrics
 
 TIME_WINDOW_MS = 2000
 
@@ -425,6 +428,9 @@ UNIQUE_FILE_SUSPICIOUS = 200      # previously 20
 
 class ProvenanceGraph:
     def __init__(self, es_config):
+        self.ebpf_index = es_config.get("ebpf_index", "ebpf-events")
+        self.pcap_index = es_config.get("pcap_index", "pcap-flows")
+        self.auditd_index = es_config.get("auditd_index", "auditd-events")
         self.graph = nx.DiGraph()
         self.processes = {}
         self.process_comm = {}
@@ -479,18 +485,22 @@ class ProvenanceGraph:
 
         return es
 
-    def load_events(self, start_ms, end_ms, hostname=None):
+    def load_events(self, start_ms, end_ms, hostname=None, limit=None):
         print("Loading events from ES from {} to {}...".format(datetime.fromtimestamp(int(start_ms) / 1000),datetime.fromtimestamp(int(end_ms) / 1000)))
         must_filters = [
-            {"range": {"epoch_timestamp": {"gte": start_ms, "lte": end_ms}}}
+            {"range": {"timestamp": {"gte": start_ms, "lte": end_ms}}}
         ]
 
         # Hostname filter (if present)
         if hostname:
             must_filters.append({"term": {"hostname.keyword": hostname}})
 
+        # Use limit if provided, otherwise default to 5000
+        size = limit if limit else 5000
+        max_events = limit if limit else 200000  # Max total events to load
+
         query = {
-            "size": 5000,
+            "size": min(size, 5000),  # ES max is 10000, use 5000 for scrolling
             "query": {
                 "bool": {
                     "must": must_filters
@@ -500,22 +510,33 @@ class ProvenanceGraph:
         }
 
         try:
-            response = self.es.search(index=f"{self.es_index}", body=query, scroll='2m')
-            sid = response['_scroll_id']
-            scroll_size = len(response['hits']['hits'])
-            events = [hit['_source'] for hit in response['hits']['hits']]
-
-            while scroll_size > 0:
-                response = self.es.scroll(scroll_id=sid, scroll='2m')
+            # If limit is small, use simple search without scrolling
+            if limit and limit <= 5000:
+                response = self.es.search(index=f"{self.es_index}", body=query)
+                events = [hit['_source'] for hit in response['hits']['hits']]
+                print(f"[+] Loaded {len(events)} total events.")
+            else:
+                # Use scrolling for larger queries
+                response = self.es.search(index=f"{self.es_index}", body=query, scroll='2m')
                 sid = response['_scroll_id']
                 scroll_size = len(response['hits']['hits'])
-                events.extend([hit['_source'] for hit in response['hits']['hits']])
-                if len(events) >= 200000:
-                    print("[!] Limit reached (50k events)")
-                    break
+                events = [hit['_source'] for hit in response['hits']['hits']]
 
-            self.es.clear_scroll(scroll_id=sid)
-            print(f"[+] Loaded {len(events)} total events.")
+                while scroll_size > 0:
+                    response = self.es.scroll(scroll_id=sid, scroll='2m')
+                    sid = response['_scroll_id']
+                    scroll_size = len(response['hits']['hits'])
+                    events.extend([hit['_source'] for hit in response['hits']['hits']])
+                    if len(events) >= max_events:
+                        print(f"[!] Limit reached ({len(events)} events)")
+                        break
+
+                self.es.clear_scroll(scroll_id=sid)
+                print(f"[+] Loaded {len(events)} total events.")
+
+            # Normalize events to support both ECS and legacy field names
+            events = [normalize_event_fields(event) for event in events]
+
             return events
 
         except Exception as e:
@@ -778,8 +799,12 @@ class ProvenanceGraph:
             comm = c["comm"]
 
             # Build filtered event query for this PID + hostname
+            # Try both ECS and legacy field names
             must_filters_pid = [
-                {"term": {"pid": pid}},
+                {"bool": {"should": [
+                    {"term": {"process.pid": pid}},
+                    {"term": {"pid": pid}}
+                ]}},
                 {"range": {"epoch_timestamp": {"gte": start_ms, "lte": end_ms}}}
             ]
             if hostname:
@@ -793,7 +818,7 @@ class ProvenanceGraph:
 
             try:
                 ev_resp = self.es.search(index=self.es_index, body=ev_query)
-                events = [hit["_source"] for hit in ev_resp["hits"]["hits"]]
+                events = [normalize_event_fields(hit["_source"]) for hit in ev_resp["hits"]["hits"]]
             except Exception as e:
                 print(f"[!] Failed to pull refinement events for PID {pid}: {e}")
                 events = []
@@ -1076,7 +1101,7 @@ class ProvenanceGraph:
         print(f"[*] Scouting for target (PID={pid}, Comm={comm}) in broad range...")
 
         must_filters = [
-             {"range": {"epoch_timestamp": {"gte": start_ms, "lte": end_ms}}}
+             {"range": {"timestamp": {"gte": start_ms, "lte": end_ms}}}
         ]
         
         if hostname:
@@ -1084,14 +1109,23 @@ class ProvenanceGraph:
 
         # Filter strictly by the target
         if pid:
-            must_filters.append({"term": {"pid": pid}})
+            # Try both ECS and legacy field names
+            must_filters.append({"bool": {"should": [
+                {"term": {"process.pid": pid}},
+                {"term": {"pid": pid}}
+            ]}})
         elif comm:
             truncated_comm = comm[:15]
+            # Try both ECS and legacy field names
             should_conditions = [
-                {"term": {"comm.keyword": comm}},            # Exact match (short commands)
-                {"term": {"comm.keyword": truncated_comm}},  # Truncated match
-                {"term": {"filename.keyword": comm}},        # Full filename match (from execve)
-                {"term": {"filename.keyword": "./" + comm}}  # Handle relative path case
+                {"term": {"process.name.keyword": comm}},      # ECS: Exact match (short commands)
+                {"term": {"process.name.keyword": truncated_comm}},  # ECS: Truncated match
+                {"term": {"file.path.keyword": comm}},         # ECS: Full filename match (from execve)
+                {"term": {"file.path.keyword": "./" + comm}},  # ECS: Handle relative path case
+                {"term": {"comm.keyword": comm}},              # Legacy: Exact match
+                {"term": {"comm.keyword": truncated_comm}},    # Legacy: Truncated match
+                {"term": {"filename.keyword": comm}},          # Legacy: Full filename match
+                {"term": {"filename.keyword": "./" + comm}}    # Legacy: Handle relative path case
             ]
             must_filters.append({"bool": {"should": should_conditions, "minimum_should_match": 1}})
         else:
@@ -1111,8 +1145,8 @@ class ProvenanceGraph:
                 return None, None  # Target not found in this range
 
             # Get the first and last time the target was seen
-            first_seen = hits[0]['_source']['epoch_timestamp']
-            last_seen = hits[-1]['_source']['epoch_timestamp']
+            first_seen = hits[0]['_source'].get('timestamp') or hits[0]['_source'].get('epoch_timestamp', 0)
+            last_seen = hits[-1]['_source'].get('timestamp') or hits[-1]['_source'].get('epoch_timestamp', 0)
 
             print(f"[+] Target found active between {datetime.fromtimestamp(first_seen/1000)} and {datetime.fromtimestamp(last_seen/1000)}")
 
@@ -1355,6 +1389,37 @@ class ProvenanceGraph:
             print(f"[+] Collapsed {len(nodes_to_remove)} sibling processes into clusters")
             
         return graph
+
+    def get_node_info(self, node_id):
+        if node_id not in self.graph:
+            return {"error": "Node not found"}
+
+        data = dict(self.graph.nodes[node_id])
+
+        # Add incoming/outgoing edges summary
+        incoming = []
+        outgoing = []
+
+        for u, v, edata in self.graph.in_edges(node_id, data=True):
+            incoming.append(
+                {"from": u, "label": edata.get("label"), "source": edata.get("source")}
+            )
+
+        for u, v, edata in self.graph.out_edges(node_id, data=True):
+            outgoing.append(
+                {"to": v, "label": edata.get("label"), "source": edata.get("source")}
+            )
+
+        data["incoming_edges"] = incoming
+        data["outgoing_edges"] = outgoing
+
+        # Optional: attach audit or pcap evidence
+        if "audit_events" in data:
+            data["audit_event_count"] = len(data["audit_events"])
+        if "pcap_flows" in data:
+            data["network_flow_count"] = len(data.get("pcap_flows", []))
+
+        return data
 
     def infer_mitre_techniques(self, graph):
         """
@@ -2040,60 +2105,458 @@ class ProvenanceGraph:
             print(f"[!] Temporal filtering failed: {e}")
             return graph
 
-    # ------------------------------------------------------------------------
-    # EXPORTS
-    # ------------------------------------------------------------------------
+    # ==============================
+    #  FUSION: DATA LOADERS
+    # ==============================
 
-    def export_text_summary(self, graph, filename):
-        """Export human-readable summary including inferred ATT&CK techniques"""
-        if not graph:
+    def _load_pcap_flows(self, start_ms, end_ms, hostname=None, max_flows=5000):
+        """
+        Load PCAP flows from Elasticsearch within [start_ms, end_ms].
+        Correlates later via flow.id.
+        """
+        if not self.pcap_index:
+            return []
+
+        must_filters = [
+            {"range": {"epoch_first": {"gte": start_ms, "lte": end_ms}}}
+        ]
+        if hostname:
+            must_filters.append({"term": {"hostname.keyword": hostname}})
+
+        query = {
+            "size": max_flows,
+            "query": {"bool": {"must": must_filters}},
+            "sort": [{"epoch_first": {"order": "asc"}}],
+        }
+
+        try:
+            resp = self.es.search(index=self.pcap_index, body=query)
+            flows = [hit["_source"] for hit in resp["hits"]["hits"]]
+            print(f"[*] Loaded {len(flows)} PCAP flows from index '{self.pcap_index}'")
+            return flows
+        except Exception as e:
+            print(f"[!] Failed to load PCAP flows: {e}")
+            return []
+
+    def _load_audit_events(self, start_ms, end_ms, hostname=None, max_events=5000):
+        """
+        Load auditd events from Elasticsearch within [start_ms, end_ms].
+        Correlates later via process.pid and hostname.
+        """
+        if not self.auditd_index:
+            return []
+
+        must_filters = [
+            {"range": {"timestamp": {"gte": start_ms, "lte": end_ms}}}
+        ]
+        if hostname:
+            must_filters.append({"term": {"hostname.keyword": hostname}})
+
+        query = {
+            "size": max_events,
+            "query": {"bool": {"must": must_filters}},
+            "sort": [{"timestamp": {"order": "asc"}}],
+        }
+
+        try:
+            resp = self.es.search(index=self.auditd_index, body=query)
+            events = [hit["_source"] for hit in resp["hits"]["hits"]]
+            print(f"[*] Loaded {len(events)} auditd events from index '{self.auditd_index}'")
+            return events
+        except Exception as e:
+            print(f"[!] Failed to load auditd events: {e}")
+            return []
+
+    # ==============================
+    #  FUSION: INDEX BUILDERS
+    # ==============================
+
+    def _build_flow_pid_index(self, ebpf_events):
+        """
+        Build mapping:
+            flow_id -> set of PIDs that touched that flow (from eBPF events).
+        Uses ECS/legacy field resolution via get_event_field().
+        """
+        flow_pid = {}
+
+        for ev in ebpf_events:
+            ev = normalize_event_fields(ev)
+            flow_id = get_event_field(ev, "flow.id") or ev.get("flow_id")
+            if not flow_id:
+                continue
+
+            pid = get_event_field(ev, "process.pid") or ev.get("pid")
+            if pid is None:
+                continue
+
+            pid = str(pid)
+
+            if flow_id not in flow_pid:
+                flow_pid[flow_id] = set()
+            flow_pid[flow_id].add(pid)
+
+        return flow_pid
+
+    def _build_pid_example_event_index(self, ebpf_events):
+        """
+        For each PID, keep a representative eBPF event.
+        This lets us recover comm / ppid / timestamps later to locate the
+        corresponding process node via _get_process_node().
+        """
+        pid_example = {}
+
+        for ev in ebpf_events:
+            ev = normalize_event_fields(ev)
+            pid = get_event_field(ev, "process.pid") or ev.get("pid")
+            if pid is None:
+                continue
+            pid = str(pid)
+            if pid not in pid_example:
+                pid_example[pid] = ev
+
+        return pid_example
+
+    # ==============================
+    #  FUSION: PCAP OVERLAY
+    # ==============================
+
+    def _integrate_pcap_flows(self, ebpf_events, pcap_flows):
+        """
+        ENHANCED: Create actual network nodes in the provenance graph from PCAP flows.
+
+        This creates a true multi-source provenance graph where:
+        - Process nodes (from eBPF) connect to Network nodes (from PCAP)
+        - Network nodes contain PCAP metadata (packet counts, bytes, duration)
+        - Edges show network→process communication
+
+        Correlation is via flow.id matching between eBPF and PCAP.
+        """
+        if not pcap_flows:
             return
 
-        print(f"Exporting text summary to {filename}...")
-        try:
-            edges = sorted(graph.edges(data=True), key=lambda x: x[2].get('time', ''))
-            with open(filename, 'w') as f:
-                f.write("=== ATTACK PROVENANCE ANALYSIS ===\n\n")
-                f.write(f"Total Nodes: {graph.number_of_nodes()}\n")
-                f.write(f"Total Edges: {graph.number_of_edges()}\n\n")
+        flow_pid_idx = self._build_flow_pid_index(ebpf_events)
+        pid_example_ev = self._build_pid_example_event_index(ebpf_events)
 
-                proc_count = sum(1 for _, d in graph.nodes(data=True) if d.get('type') == 'process')
-                file_count = sum(1 for _, d in graph.nodes(data=True) if d.get('type') == 'file')
-                net_count = sum(1 for _, d in graph.nodes(data=True) if d.get('type') == 'network')
+        attached_count = 0
+        unmatched_flows = 0
+        network_nodes_created = 0
 
-                f.write(f"Processes: {proc_count}\n")
-                f.write(f"Files: {file_count}\n")
-                f.write(f"Network: {net_count}\n\n")
+        for flow in pcap_flows:
+            # FlowID may be stored as flow.id or flow_id depending on pipeline
+            fid = flow.get("flow.id") or flow.get("flow_id")
+            if not fid:
+                continue
 
-                if self.beep_clusters:
-                    f.write(f"BEEP Event Clusters: {len(self.beep_clusters)}\n")
-                    burst_count = sum(1 for c in self.beep_clusters if c['count'] > 1)
-                    f.write(f"Multi-event Bursts: {burst_count}\n\n")
+            # Extract PCAP flow metadata
+            src_ip = flow.get("source.ip") or flow.get("src_ip", "unknown")
+            src_port = flow.get("source.port") or flow.get("src_port", 0)
+            dst_ip = flow.get("destination.ip") or flow.get("dst_ip", "unknown")
+            dst_port = flow.get("destination.port") or flow.get("dst_port", 0)
 
-                # MITRE ATT&CK section
-                f.write("=== MITRE ATT&CK TECHNIQUE INFERENCE ===\n\n")
-                if self.mitre_techniques:
-                    for tid, info in self.mitre_techniques.items():
-                        f.write(f"- {tid} | {info['tactic']} | {info['name']}\n")
-                        f.write(f"  Description: {info['description']}\n")
-                        for ev in info['evidence']:
-                            f.write(f"    * {ev}\n")
-                        f.write("\n")
-                else:
-                    f.write("No strong MITRE ATT&CK patterns were identified in this graph.\n\n")
+            packet_count = flow.get("packet_count", 0)
+            byte_count = flow.get("byte_count", 0)
+            duration_ms = flow.get("duration_ms", 0)
+            protocol = flow.get("network.transport") or flow.get("protocol", "TCP")
 
-                f.write("=== CHRONOLOGICAL EVENTS ===\n\n")
-                for u, v, data in edges:
-                    src = graph.nodes[u].get('label', u).replace('\n', ' ')
-                    dst = graph.nodes[v].get('label', v).replace('\n', ' ')
-                    edge_label = data.get('label', '')
-                    timestamp = data.get('time', 'N/A')
+            # Get DNS resolution if available
+            dns_query = flow.get("dns.query") or flow.get("domain", "")
 
-                    f.write(f"[{timestamp}] {src} --[{edge_label}]--> {dst}\n")
+            pids = flow_pid_idx.get(fid)
+            if not pids:
+                unmatched_flows += 1
+                continue
 
-            print(f"[+] Text summary saved")
-        except Exception as e:
-            print(f"[!] Text export failed: {e}")
+            # Create network node for this PCAP flow
+            net_node_id = f"pcap_{src_ip}_{src_port}_{dst_ip}_{dst_port}_{fid[:8]}"
+
+            # Build descriptive label with PCAP enrichment
+            if dns_query:
+                net_label = f"PCAP Flow:\n{src_ip}:{src_port} → {dns_query}:{dst_port}\n{packet_count} pkts, {byte_count} bytes"
+            else:
+                net_label = f"PCAP Flow:\n{src_ip}:{src_port} → {dst_ip}:{dst_port}\n{packet_count} pkts, {byte_count} bytes"
+
+            # Create network node if it doesn't exist
+            if net_node_id not in self.graph.nodes():
+                self._get_or_create_node(
+                    net_node_id,
+                    label=net_label,
+                    type="network",
+                    source="pcap",
+                    src_ip=src_ip,
+                    src_port=src_port,
+                    dst_ip=dst_ip,
+                    dst_port=dst_port,
+                    packet_count=packet_count,
+                    byte_count=byte_count,
+                    duration_ms=duration_ms,
+                    protocol=protocol,
+                    dns_query=dns_query,
+                    flow_id=fid
+                )
+                network_nodes_created += 1
+
+            # Connect each correlated process to this network node
+            for pid in pids:
+                ev = pid_example_ev.get(pid)
+                if not ev:
+                    continue
+
+                comm = get_event_field(ev, "process.name") or ev.get("comm") or "unknown"
+                ppid = (
+                    get_event_field(ev, "process.parent.pid")
+                    or ev.get("ppid")
+                    or "0"
+                )
+                ts = ev.get("epoch_timestamp") or ev.get("timestamp") or 0
+                proc_node_id = self._get_process_node(str(pid), str(ppid), comm, ts)
+
+                # Create edge from process to network
+                edge_label = f"{protocol}\n{packet_count} pkts"
+
+                # Determine direction (process sends to network)
+                self.graph.add_edge(
+                    proc_node_id,
+                    net_node_id,
+                    label=edge_label,
+                    time=flow.get("@timestamp") or str(datetime.now()),
+                    edge_type="network",
+                    source="pcap",
+                    packet_count=packet_count,
+                    byte_count=byte_count
+                )
+                attached_count += 1
+
+                # Also attach flow metadata to process node for backward compatibility
+                node_data = self.graph.nodes[proc_node_id]
+                flows_list = node_data.setdefault("pcap_flows", [])
+                flows_list.append(flow)
+
+        print(
+            f"[+] PCAP fusion: created {network_nodes_created} network nodes, "
+            f"{attached_count} process→network edges; "
+            f"{unmatched_flows} flows had no matching eBPF flow.id"
+        )
+
+    # ==============================
+    #  FUSION: AUDITD OVERLAY
+    # ==============================
+
+    def _integrate_audit_events(self, ebpf_events, audit_events):
+        """
+        Overlay auditd evidence onto the existing provenance graph.
+
+        A1 semantics:
+        - Attach structured audit evidence to process nodes (as before)
+        - ALSO create process<->file edges based on audit activity
+            (read / write / exec / chmod / delete).
+
+        This preserves CLI behaviour (graph still built from eBPF),
+        but gives SPECTRA-style multi-source provenance when fusion is enabled.
+        """
+        if not audit_events:
+            print("[+] No auditd events to integrate.")
+            return
+
+        print(f"[+] Integrating {len(audit_events)} auditd events into provenance graph (A1 mode).")
+
+        # --- Build a map from hostname -> set(process-node-ids) ---
+        host_proc_nodes = defaultdict(set)
+        for node_id, data in self.graph.nodes(data=True):
+            if data.get("type") != "process":
+                continue
+            hostname = data.get("hostname") or data.get("host") or "unknown"
+            host_proc_nodes[hostname].add(node_id)
+
+        attached = 0
+        orphaned = 0
+        file_edges = 0
+
+        for ae in audit_events:
+            host = ae.get("hostname") or "unknown"
+            pid = ae.get("ProcessID") or ae.get("pid") or ae.get("process_id")
+
+            # Normalize pid as string for matching against node attributes
+            pid = str(pid) if pid is not None else None
+
+            summary = ae.get("summary", "")
+            category = ae.get("category", "")
+            timestamp = ae.get("timestamp")  # epoch ms in your auditd.go
+            raw = ae.get("raw_data", {}) or {}
+
+            # Parse human readable timestamp if we can
+            ts_iso = None
+            if timestamp:
+                try:
+                    ts_iso = datetime.fromtimestamp(int(timestamp) / 1000).isoformat()
+                except Exception:
+                    ts_iso = None
+
+            # Tags used both in node annotations & edge attributes
+            tags = {
+                "source": "auditd",
+                "category": category,
+                "summary": summary,
+            }
+
+            # -------------------------------
+            # 1) Find matching process nodes
+            # -------------------------------
+            matched_nodes = []
+
+            # (a) First pass: by hostname + exact PID
+            if pid:
+                for node_id in host_proc_nodes.get(host, []):
+                    nd = self.graph.nodes[node_id]
+                    node_pid = str(nd.get("pid") or nd.get("pid_str") or "")
+                    if node_pid and node_pid == pid:
+                        matched_nodes.append(node_id)
+
+            # (b) Fallback: match by executable path / comm if PID failed or missing
+            if not matched_nodes:
+                exe = raw.get("exe") or raw.get("process_path") or ""
+                comm = raw.get("comm") or ""
+                exe = str(exe)
+                comm = str(comm)
+
+                if exe or comm:
+                    for node_id in host_proc_nodes.get(host, []):
+                        nd = self.graph.nodes[node_id]
+                        node_label = (nd.get("label") or "").lower()
+                        node_exe = (nd.get("exe") or "").lower()
+                        node_comm = (nd.get("comm") or "").lower()
+
+                        # loosened matching: containment or high overlap
+                        score = 0
+                        if exe and exe.lower() in node_label:
+                            score += 1
+                        if comm and comm.lower() in node_label:
+                            score += 1
+                        if exe and node_exe and exe.lower() == node_exe:
+                            score += 2
+                        if comm and node_comm and comm.lower() == node_comm:
+                            score += 1
+
+                        if score >= 2:
+                            matched_nodes.append(node_id)
+
+            # -------------------------------
+            # 2) Attach evidence + create edges
+            # -------------------------------
+            if matched_nodes:
+                for node_id in matched_nodes:
+                    node_data = self.graph.nodes[node_id]
+
+                    # ---- a) Attach raw audit evidence to node ----
+                    ev_entry = {
+                        "timestamp": ts_iso or timestamp,
+                        "summary": summary,
+                        "category": category,
+                        "raw": raw,
+                    }
+                    node_data.setdefault("audit_events", []).append(ev_entry)
+
+                    # ---- b) Try to create a semantic file edge ----
+                    file_path, direction, edge_label, edge_type = self._audit_event_to_file_edge(ae)
+
+                    if file_path:
+                        # Normalize / abstract path similar to eBPF side
+                        abstract_path = abstract_file_path(file_path)
+
+                        # Ensure file node exists
+                        if file_path not in self.graph:
+                            self.graph.add_node(
+                                file_path,
+                                label=file_path,
+                                type="file",
+                                abstract_path=abstract_path,
+                            )
+
+                        edge_attrs = {
+                            "label": edge_label,
+                            "edge_type": edge_type,
+                            "source": "auditd",
+                        }
+                        if ts_iso:
+                            edge_attrs["time"] = ts_iso
+
+                        if direction == "file->proc":
+                            self.graph.add_edge(file_path, node_id, **edge_attrs)
+                        else:
+                            self.graph.add_edge(node_id, file_path, **edge_attrs)
+
+                        file_edges += 1
+
+                attached += 1
+            else:
+                orphaned += 1
+
+        print(f"[+] auditd integration complete: {attached} events attached to processes, "
+            f"{file_edges} file edges created, {orphaned} events orphaned.")
+
+    def _audit_event_to_file_edge(self, ae):
+        """
+        Infer (file_path, direction, label, edge_type) from a single auditd event.
+
+        direction: "proc->file" or "file->proc"
+        edge_type: "data" / "control" / "meta"
+        """
+        raw = ae.get("raw_data", {}) or {}
+
+        # --- 1) Figure out which file this event is about ---
+        file_path = (
+            raw.get("object")
+            or raw.get("name")
+            or raw.get("path")
+        )
+
+        if not isinstance(file_path, str) or not file_path:
+            return None, None, None, None
+
+        file_path = file_path.strip()
+        if not file_path:
+            return None, None, None, None
+
+        # --- 2) Pull basic fields used for classification ---
+        perm = str(raw.get("perm", "") or "").lower()
+        syscall = str(raw.get("syscall", "") or "").lower()
+        summary = str(ae.get("summary", "") or "").lower()
+        category = str(ae.get("category", "") or "").lower()
+
+        direction = "proc->file"
+        label = "audit_access"
+        edge_type = "data"
+
+        # --- 3) Heuristics to classify the operation ---
+        # Exec-like
+        if ("exec" in summary) or ("execute" in summary) or ("execve" in category) or (syscall == "execve"):
+            label = "audit_exec"
+            edge_type = "control"
+
+        # Chmod / chown / metadata
+        elif any(x in summary for x in ["chmod", "chown", "setxattr", "attr"]) or syscall in ["chmod", "fchmod", "fchmodat"]:
+            label = "audit_chmod"
+            edge_type = "meta"
+
+        # Delete / unlink
+        elif any(x in summary for x in ["delete", "unlink", "remove"]) or syscall in ["unlink", "unlinkat", "rmdir"]:
+            label = "audit_delete"
+            edge_type = "data"
+
+        else:
+            # Use perms if available
+            if "w" in perm or "a" in perm:
+                label = "audit_write"
+                edge_type = "data"
+            elif "r" in perm:
+                label = "audit_read"
+                edge_type = "data"
+                direction = "file->proc"
+            else:
+                # Fallback
+                label = "audit_access"
+                edge_type = "data"
+
+        return file_path, direction, label, edge_type
 
     def export_to_dot(self, graph, filename, focus_nodes=None):
         """Export cleaned graph to a Graphviz DOT file with SAFE attributes."""
@@ -2199,12 +2662,207 @@ class ProvenanceGraph:
             print(f"[!] DOT export failed: {e}")
             raise
 
+    def export_text_summary(self, graph, filename, comm=None, pid=None, events=None):
+        """Export human-readable summary with SPECTRA narrative generation"""
+        if not graph:
+            return
+
+        print(f"Exporting text summary to {filename}...")
+        try:
+            # Collect events for narrative generation
+            if events is None:
+                events = []
+
+            # Prepare stats for evaluation and narrative
+            stats = {
+                'events_loaded': self.total_events,
+                'events_filtered': self.filtered_events,
+                'filter_percentage': (self.filtered_events / self.total_events * 100) if self.total_events > 0 else 0,
+                'nodes': graph.number_of_nodes(),
+                'edges': graph.number_of_edges()
+            }
+
+            # Generate automated narrative using SPECTRA narrative generator
+            print("[+] Generating automated attack narrative...")
+            full_narrative, short_summary = generate_narrative_from_analysis(
+                graph=graph,
+                mitre_techniques=self.mitre_techniques,
+                events=events,
+                stats=stats
+            )
+
+            # Compute evaluation metrics
+            print("[+] Computing SPECTRA evaluation metrics...")
+            evaluator = EvaluationMetrics()
+
+            log_reduction = evaluator.compute_log_reduction(
+                self.total_events,
+                self.filtered_events
+            )
+
+            graph_compression = evaluator.compute_graph_compression(
+                reduced_nodes=graph.number_of_nodes(),
+                reduced_edges=graph.number_of_edges(),
+                original_nodes=self.total_events,  # Approximate
+                original_edges=self.total_events * 2  # Approximate
+            )
+
+            coverage = evaluator.compute_coverage_metrics(graph)
+
+            # Generate metrics report
+            metrics_report = evaluator.generate_metrics_report(
+                log_reduction=log_reduction,
+                graph_compression=graph_compression,
+                coverage=coverage,
+                algorithm_name="SPECTRA (BEEP+HOLMES)" if self.beep_clusters else "Standard"
+            )
+
+            edges = sorted(graph.edges(data=True), key=lambda x: x[2].get('time', ''))
+
+            with open(filename, 'w') as f:
+                # ========================================
+                # SPECTRA AUTOMATED NARRATIVE
+                # ========================================
+                f.write("=" * 70 + "\n")
+                f.write("SPECTRA: AUTOMATED ATTACK NARRATIVE\n")
+                f.write("=" * 70 + "\n\n")
+
+                f.write("## Executive Summary\n\n")
+                f.write(short_summary + "\n\n")
+
+                f.write("=" * 70 + "\n")
+                f.write("FULL NARRATIVE\n")
+                f.write("=" * 70 + "\n\n")
+                f.write(full_narrative)
+                f.write("\n\n")
+
+                # ========================================
+                # EVALUATION METRICS
+                # ========================================
+                f.write(metrics_report)
+                f.write("\n\n")
+
+                # ========================================
+                # ORIGINAL ANALYSIS (Legacy Format)
+                # ========================================
+                f.write("=" * 70 + "\n")
+                f.write("TECHNICAL ANALYSIS DETAILS\n")
+                f.write("=" * 70 + "\n\n")
+
+                f.write("=== GRAPH STATISTICS ===\n\n")
+                f.write(f"Total Nodes: {graph.number_of_nodes()}\n")
+                f.write(f"Total Edges: {graph.number_of_edges()}\n\n")
+
+                proc_count = sum(1 for _, d in graph.nodes(data=True) if d.get('type') == 'process')
+                file_count = sum(1 for _, d in graph.nodes(data=True) if d.get('type') == 'file')
+                net_count = sum(1 for _, d in graph.nodes(data=True) if d.get('type') == 'network')
+
+                f.write(f"Processes: {proc_count}\n")
+                f.write(f"Files: {file_count}\n")
+                f.write(f"Network: {net_count}\n\n")
+
+                if self.beep_clusters:
+                    f.write(f"BEEP Event Clusters: {len(self.beep_clusters)}\n")
+                    burst_count = sum(1 for c in self.beep_clusters if c['count'] > 1)
+                    f.write(f"Multi-event Bursts: {burst_count}\n\n")
+
+                # MITRE ATT&CK section
+                f.write("=== MITRE ATT&CK TECHNIQUE INFERENCE ===\n\n")
+                if self.mitre_techniques:
+                    for tid, info in self.mitre_techniques.items():
+                        f.write(f"- {tid} | {info['tactic']} | {info['name']}\n")
+                        f.write(f"  Description: {info['description']}\n")
+                        for ev in info['evidence']:
+                            f.write(f"    * {ev}\n")
+                        f.write("\n")
+                else:
+                    f.write("No strong MITRE ATT&CK patterns were identified in this graph.\n\n")
+
+                f.write("=== CHRONOLOGICAL EVENTS (GRAPH ORDER) ===\n\n")
+                for u, v, data in edges:
+                    src = graph.nodes[u].get('label', u).replace('\n', ' ')
+                    dst = graph.nodes[v].get('label', v).replace('\n', ' ')
+                    edge_label = data.get('label', '')
+                    timestamp = data.get('time', 'N/A')
+
+                    f.write(f"[{timestamp}] {src} --[{edge_label}]--> {dst}\n")
+
+            print(f"[+] Text summary with SPECTRA narrative saved")
+        except Exception as e:
+            print(f"[!] Text export failed: {e}")
+            traceback.print_exc()
+
+    # ==============================
+    #  FUSION: HIGH-LEVEL ENTRYPOINT
+    # ==============================
+
+    def build_fused_graph(
+        self,
+        start_ms,
+        end_ms,
+        hostname=None,
+        enable_filtering=True,
+        enable_event_compression=True,
+        include_pcap=True,
+        include_auditd=True,
+        max_events=5000,
+        max_flows=5000,
+        max_audit_events=5000,
+    ):
+        """
+        Full SPECTRA-style fusion pipeline:
+
+          1. Load eBPF events.
+          2. Detect attack indicators (your existing heuristics).
+          3. Build base provenance graph (process/file/net).
+          4. Optionally overlay PCAP & Auditd evidence.
+
+        Returns:
+          (graph, ebpf_events, pcap_flows, audit_events)
+        """
+
+        # 1) Load eBPF events
+        ebpf_events = self.load_events(start_ms, end_ms, hostname, limit=max_events)
+
+        if not ebpf_events:
+            print("[!] No eBPF events found for the requested window; fusion disabled.")
+            return self.graph, [], [], []
+
+        # 2) Detect suspicious PIDs / coarse indicators (existing method)
+        try:
+            self.detect_attack_indicators(ebpf_events)
+        except Exception as e:
+            print(f"[!] detect_attack_indicators failed (non-fatal): {e}")
+
+        # 3) Build the base graph from eBPF (existing method)
+        self.build_graph(
+            ebpf_events,
+            enable_filtering=enable_filtering,
+            enable_event_compression=enable_event_compression,
+        )
+
+        # 4) Optional multi-source overlays
+        pcap_flows = []
+        audit_events = []
+
+        if include_pcap and self.pcap_index:
+            pcap_flows = self._load_pcap_flows(start_ms, end_ms, hostname, max_flows)
+            self._integrate_pcap_flows(ebpf_events, pcap_flows)
+
+        if include_auditd and self.auditd_index:
+            audit_events = self._load_audit_events(start_ms, end_ms, hostname, max_audit_events)
+            self._integrate_audit_events(ebpf_events, audit_events)
+
+        print("[+] Fused provenance graph construction complete.")
+        return self.graph, ebpf_events, pcap_flows, audit_events
+
 def main():
     print("Enhanced Provenance Graph Analyzer with Generalized Context-Aware Filtering + MITRE ATT&CK inference")
     parser = argparse.ArgumentParser(
         description="Enhanced Provenance Graph Analyzer with Generalized Context-Aware Filtering + MITRE ATT&CK inference"
     )
 
+    # Core targeting / time
     parser.add_argument("--comm", type=str, help="Target process name")
     parser.add_argument("--pid", type=str, help="Target process PID")
     parser.add_argument("--start", type=str, required=True, help="Start time (ISO format or epoch ms)")
@@ -2213,23 +2871,60 @@ def main():
     parser.add_argument("--out", type=str, default="provenance_attack_0.dot", help="Output DOT file")
     parser.add_argument("--text-out", type=str, default="attack_summary.txt", help="Text summary file")
 
+    # Graph expansion controls
     parser.add_argument("--no-parents", action="store_true", help="Disable ancestor tracing")
     parser.add_argument("--no-children", action="store_true", help="Disable descendant tracing")
     parser.add_argument("--prune", action="store_true", help="Enable high-degree pruning")
     parser.add_argument("--no-filter", action="store_true", help="Disable event filtering")
     parser.add_argument("--degree-threshold", type=int, default=5, help="Degree threshold for pruning")
+
+    # BEEP / compression
     parser.add_argument("--beep", action="store_true", help="Enable BEEP edge grouping")
     parser.add_argument("--beep-window", type=int, default=2000, help="BEEP time window in ms")
     parser.add_argument("--beep-threshold", type=int, default=3, help="BEEP minimum group size")
     parser.add_argument("--no-event-compression", action="store_true", help="Disable BEEP event-level compression")
+
+    # HOLMES / combined
     parser.add_argument("--holmes", action="store_true", help="Enable HOLMES backward slicing")
     parser.add_argument("--both", action="store_true", help="Uses both HOLMES backward slicing and BEEP edge grouping")
-    parser.add_argument("--holmes-forward", action="store_true", default=True, help="HOLMES: trace forward from alerts")
+    parser.add_argument(
+        "--holmes-forward",
+        action="store_true",
+        default=True,
+        help="HOLMES: trace forward from alerts"
+    )
+
+    # UI / host
     parser.add_argument("--cli-only", action="store_true", help="CLI mode: display summary in terminal")
     parser.add_argument("--host", help="Filter by hostname of agent")
-    parser.add_argument("--provenance-window", type=int, default=10, help="Minutes of context before/after the event")
+    parser.add_argument(
+        "--provenance-window",
+        type=int,
+        default=10,
+        help="Minutes of context before/after the event"
+    )
+
+    # ---------- NEW: SPECTRA-style fusion flags ----------
+    parser.add_argument(
+        "--fusion",
+        action="store_true",
+        help="Enable SPECTRA-style multi-source fusion (eBPF + PCAP + Auditd)"
+    )
+    parser.add_argument(
+        "--no-pcap",
+        action="store_true",
+        help="Disable PCAP overlay in fusion mode"
+    )
+    parser.add_argument(
+        "--no-auditd",
+        action="store_true",
+        help="Disable Auditd overlay in fusion mode"
+    )
+    # -----------------------------------------------------
 
     args = parser.parse_args()
+
+    # Load config
     try:
         with open('/var/monitoring/config.json', 'r') as f:
             config = json.load(f)
@@ -2240,10 +2935,12 @@ def main():
 
     output_dir = config.get('output_dir', '.')
     os.makedirs(output_dir, exist_ok=True)
-    for f in [args.out, args.out.replace('.dot', '.png'), args.text_out]:
-        if os.path.exists(f):
+
+    # Clean old outputs with same names (for CLI use / Streamlit reuse)
+    for fpath in [args.out, args.out.replace('.dot', '.png'), args.text_out]:
+        if os.path.exists(fpath):
             try:
-                os.remove(f)
+                os.remove(fpath)
             except OSError:
                 pass
 
@@ -2251,42 +2948,78 @@ def main():
         es_config = config.get("es_config", {})
         analyzer = ProvenanceGraph(es_config)
 
+        # ----------------------------
+        # 1) Time window selection
+        # ----------------------------
         final_start = args.start
         final_end = args.end
 
+        # Use provenance_window scout if PID/comm is given
         if args.pid or args.comm:
             found_start, found_end = analyzer.scout_activity_window(
-                args.start, 
-                args.end, 
-                pid=args.pid, 
-                comm=args.comm, 
+                args.start,
+                args.end,
+                pid=args.pid,
+                comm=args.comm,
                 window_minutes=args.provenance_window,
                 hostname=args.host
             )
 
             if found_start and found_end:
-                print(f"[+] Adjusting analysis window to capture provenance context.")
+                print("[+] Adjusting analysis window to capture provenance context.")
                 print(f"    Original: {args.start} -> {args.end}")
                 print(f"    Focused:  {found_start} -> {found_end} (Target ± {args.provenance_window} min)")
                 final_start = str(found_start)
                 final_end = str(found_end)
             else:
-                print(f"[!] Warning: Target not found in the original time range. Graph may be empty.")
+                print("[!] Warning: Target not found in the original time range. Graph may be empty.")
                 sys.exit(1)
 
-        events = analyzer.load_events(final_start, final_end, hostname=args.host)
-        if not events:
-            print("[!] No events found", file=sys.stderr)
-            sys.exit(1)
+        # ----------------------------
+        # 2) Build base / fused graph
+        # ----------------------------
+        all_events = []  # For narrative generation
 
-        # Build with context-aware filtering
-        print("Building Provenance Graph...")
-        analyzer.build_graph(
-            events,
-            enable_filtering=not args.no_filter,
-            enable_event_compression=not args.no_event_compression
-        )
+        if args.fusion:
+            print("[+] SPECTRA fusion mode enabled (eBPF + PCAP + Auditd).")
+            include_pcap = not args.no_pcap
+            include_auditd = not args.no_auditd
 
+            _graph, ebpf_events, pcap_flows, audit_events = analyzer.build_fused_graph(
+                final_start,
+                final_end,
+                hostname=args.host,
+                enable_filtering=not args.no_filter,
+                enable_event_compression=not args.no_event_compression,
+                include_pcap=include_pcap,
+                include_auditd=include_auditd,
+            )
+
+            if not ebpf_events:
+                print("[!] No eBPF events found in fused pipeline.", file=sys.stderr)
+                sys.exit(1)
+
+            # Combine all events for narrative generation
+            all_events = ebpf_events + pcap_flows + audit_events
+            print(f"[+] Fusion complete: {len(ebpf_events)} eBPF + {len(pcap_flows)} PCAP + {len(audit_events)} Auditd")
+        else:
+            # Legacy single-source path (pure eBPF), used by Streamlit today
+            events = analyzer.load_events(final_start, final_end, hostname=args.host)
+            if not events:
+                print("[!] No events found", file=sys.stderr)
+                sys.exit(1)
+
+            print("Building Provenance Graph...")
+            analyzer.build_graph(
+                events,
+                enable_filtering=not args.no_filter,
+                enable_event_compression=not args.no_event_compression
+            )
+            all_events = events
+
+        # ----------------------------
+        # 3) Find target process node(s)
+        # ----------------------------
         target_procs = []
         if args.pid:
             print(f"Searching for PID: {args.pid}")
@@ -2308,6 +3041,9 @@ def main():
 
         print(f"[+] Found {len(target_procs)} matching processes. Using the first one.")
 
+        # ----------------------------
+        # 4) Attack subgraph extraction
+        # ----------------------------
         print("Generating subgraph")
         attack_subgraph = analyzer.get_attack_subgraph(
             [target_procs[0]],
@@ -2318,36 +3054,6 @@ def main():
 
         # Generalized filtering pipeline
         attack_subgraph = analyzer.remove_low_value_nodes(attack_subgraph, [target_procs[0]])
-        attack_subgraph = analyzer.filter_temporal_window(attack_subgraph, args.start, window_hours=1)
-
-        if args.holmes:
-            print("Filtering using HOLMES")
-            attack_subgraph = analyzer.holmes_backward_slice(
-                attack_subgraph,
-                enable_forward=args.holmes_forward
-            )
-            attack_subgraph = analyzer.compress_structural_nodes(attack_subgraph)
-
-        if args.beep:
-            print("Filtering using BEEP")
-            attack_subgraph = analyzer.beep_edge_grouping(
-                attack_subgraph,
-                time_window_ms=args.beep_window,
-                min_group_size=args.beep_threshold
-            )
-
-        if args.both:
-            print("Filtering using Both Algorithms")
-            attack_subgraph = analyzer.holmes_backward_slice(
-                attack_subgraph,
-                enable_forward=args.holmes_forward
-            )
-            attack_subgraph = analyzer.compress_structural_nodes(attack_subgraph)
-            attack_subgraph = analyzer.beep_edge_grouping(
-                attack_subgraph,
-                time_window_ms=args.beep_window,
-                min_group_size=args.beep_threshold
-            )
 
         if args.prune:
             attack_subgraph = analyzer.prune_high_degree_files(
@@ -2355,31 +3061,63 @@ def main():
                 degree_threshold=args.degree_threshold
             )
 
-        attack_subgraph = analyzer.collapse_sibling_processes(attack_subgraph)
-        attack_subgraph = analyzer.remove_benign_only_subgraphs(attack_subgraph)
-        attack_subgraph = analyzer.remove_isolated_nodes(attack_subgraph)
-
-        if attack_subgraph.number_of_nodes() > 0:
-            # Run MITRE ATT&CK inference on final graph
-            analyzer.infer_mitre_techniques(attack_subgraph)
-            analyzer.export_to_dot(attack_subgraph, args.out, focus_nodes=[target_procs[0]])
-            analyzer.export_text_summary(attack_subgraph, args.text_out)
-            print(f"\n[✓] Analysis complete!")
-            print(f"[✓] Final graph: {attack_subgraph.number_of_nodes()} nodes, {attack_subgraph.number_of_edges()} edges")
-
-            if args.cli_only:
-                print("\n" + "=" * 80)
-                print("ATTACK SUMMARY")
-                print("=" * 80)
-                with open(args.text_out, 'r') as f:
-                    summary_text = f.read()
-                    print(summary_text)
-                print("=" * 80)
-                print(f"\n[i] Graph file: {args.out}")
-                print(f"[i] To visualize: dot -Tpng {args.out} -o graph.png && xdg-open graph.png")
+        # HOLMES + BEEP integration
+        if args.both:
+            print("[+] Applying HOLMES slicing + BEEP edge grouping")
+            attack_subgraph = analyzer.holmes_backward_slice(
+                attack_subgraph,
+                enable_forward=args.holmes_forward
+            )
+            attack_subgraph = analyzer.beep_edge_grouping(
+                attack_subgraph,
+                time_window_ms=args.beep_window,
+                min_group_size=args.beep_threshold
+            )
         else:
-            print("[!] No attack graph generated (all nodes filtered)")
-            sys.exit(1)
+            if args.holmes:
+                print("[+] Applying HOLMES slicing")
+                attack_subgraph = analyzer.holmes_backward_slice(
+                    attack_subgraph,
+                    enable_forward=args.holmes_forward
+                )
+
+            if args.beep:
+                print("[+] Applying BEEP edge grouping")
+                attack_subgraph = analyzer.beep_edge_grouping(
+                    attack_subgraph,
+                    time_window_ms=args.beep_window,
+                    min_group_size=args.beep_threshold
+                )
+
+        # ----------------------------
+        # 5) Risk scoring + MITRE + export
+        # ----------------------------
+        analyzer.graph = attack_subgraph
+
+        # Score nodes / edges (SPECTRA-inspired risk scoring)
+        # TODO: Implement score_graph() method for risk scoring
+        # analyzer.score_graph()
+
+        # Export DOT (used by Streamlit provenance.py)
+        analyzer.export_to_dot(attack_subgraph, args.out)
+
+        # Text summary with MITRE ATT&CK inference + SPECTRA narrative generation
+        analyzer.export_text_summary(
+            attack_subgraph,
+            args.text_out,
+            comm=args.comm,
+            pid=args.pid,
+            events=all_events
+        )
+
+        if args.cli_only:
+            # For terminal usage: print summary to stdout as well
+            try:
+                with open(args.text_out, "r") as fh:
+                    print("\n===== ATTACK SUMMARY (CLI) =====\n")
+                    print(fh.read())
+            except Exception as e:
+                print(f"[!] Failed to print CLI summary: {e}")
 
     except Exception as e:
         print(f"[!] Fatal error observed: {e}", file=sys.stderr)
