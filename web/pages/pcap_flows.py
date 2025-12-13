@@ -80,9 +80,9 @@ st.sidebar.caption("Note: Visualizations use ALL flows in time range")
 # Build filters dict
 filters = {}
 if hostname_filter != "All":
-    filters["hostname"] = hostname_filter
+    filters["host.name"] = hostname_filter
 if protocol_filter != "All":
-    filters["protocol"] = protocol_filter
+    filters["network.transport"] = protocol_filter
 if flow_id_filter:
     filters["flow.id"] = flow_id_filter
 
@@ -124,24 +124,28 @@ if total_count > 0:
         table_data = []
         for flow in top_flows:
             duration_s = (flow.get('epoch_last', 0) - flow.get('epoch_first', 0)) / 1000.0
-            flow_id = flow.get("flow.id", flow.get("flow_id", "N/A"))  # Support both field names
+            flow_id = flow.get("flow.id", "N/A")
+            src_ip = flow.get("source.ip", "N/A")
+            dst_ip = flow.get("destination.ip", "N/A")
+            src_port = flow.get("source.port", 0)
+            dst_port = flow.get("destination.port", 0)
             table_data.append({
-                "Flow ID": flow_id,  # Truncate for display
-                "Hostname": flow.get("hostname", "N/A"),
-                "Protocol": flow.get("protocol", "N/A"),
-                "Source": f"{flow.get('src_ip', 'N/A')}:{flow.get('src_port', '')}",
-                "Destination": f"{flow.get('dst_ip', 'N/A')}:{flow.get('dst_port', '')}",
-                "Domain": flow.get("domain_name", "-") if flow.get("dns_resolved") else "-",
-                "Packets": flow.get("packet_count", 0),
-                "Bytes": flow.get("byte_count", 0),
+                "Flow ID": flow_id,
+                "Hostname": flow.get("host.name", "N/A"),
+                "Protocol": flow.get("network.transport", "N/A"),
+                "Source": f"{src_ip}:{src_port}",
+                "Destination": f"{dst_ip}:{dst_port}",
+                "Domain": flow.get("destination.domain", "-") if flow.get("dns_resolved") else "-",
+                "Packets": flow.get("network.packets", 0),
+                "Bytes": flow.get("network.bytes", 0),
                 "Duration (s)": round(duration_s, 2),
-                "First Seen": flow.get("datetime_first", "N/A")[:19] if flow.get("datetime_first") else "N/A",
+                "First Seen": flow.get("event.start", flow.get("@timestamp", "N/A"))[:19] if flow.get("event.start") or flow.get("@timestamp") else "N/A",
                 # Keep raw data for visualizations and correlation
-                "src_ip": flow.get("src_ip", "N/A"),
-                "dst_ip": flow.get("dst_ip", "N/A"),
-                "src_port": flow.get("src_port", 0),
-                "dst_port": flow.get("dst_port", 0),
-                "tcp_flags": flow.get("tcp_flags", []),
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "tcp_flags": flow.get("network.tcp_flags", []),
                 "epoch_first": flow.get("epoch_first", 0),
             })
 
@@ -179,20 +183,24 @@ if total_count > 0:
         viz_data = []
         for flow in all_flows:
             duration_s = (flow.get('epoch_last', 0) - flow.get('epoch_first', 0)) / 1000.0
+            src_ip = flow.get("source.ip", "N/A")
+            dst_ip = flow.get("destination.ip", "N/A")
+            src_port = flow.get("source.port", "")
+            dst_port = flow.get("destination.port", "")
             viz_data.append({
-                "Hostname": flow.get("hostname", "N/A"),
-                "Protocol": flow.get("protocol", "N/A"),
-                "Source": f"{flow.get('src_ip', 'N/A')}:{flow.get('src_port', '')}",
-                "Destination": f"{flow.get('dst_ip', 'N/A')}:{flow.get('dst_port', '')}",
-                "Domain": flow.get("domain_name", "-") if flow.get("dns_resolved") else "-",
-                "Packets": flow.get("packet_count", 0),
-                "Bytes": flow.get("byte_count", 0),
+                "Hostname": flow.get("host.name", "N/A"),
+                "Protocol": flow.get("network.transport", "N/A"),
+                "Source": f"{src_ip}:{src_port}",
+                "Destination": f"{dst_ip}:{dst_port}",
+                "Domain": flow.get("destination.domain", "-") if flow.get("dns_resolved") else "-",
+                "Packets": flow.get("network.packets", 0),
+                "Bytes": flow.get("network.bytes", 0),
                 "Duration (s)": round(duration_s, 2),
-                "src_ip": flow.get("src_ip", "N/A"),
-                "dst_ip": flow.get("dst_ip", "N/A"),
-                "src_port": flow.get("src_port", 0),
-                "dst_port": flow.get("dst_port", 0),
-                "tcp_flags": flow.get("tcp_flags", []),
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "tcp_flags": flow.get("network.tcp_flags", []),
                 "epoch_first": flow.get("epoch_first", 0),
             })
 

@@ -76,7 +76,7 @@ user_filter = st.sidebar.text_input("User ID (AUID)", "", help="Filter by audit 
 # Build filters dict
 filters = {}
 if hostname_filter != "All":
-    filters["hostname"] = hostname_filter
+    filters["host.name"] = hostname_filter
 if user_filter:
     filters["user.id"] = user_filter
 
@@ -187,9 +187,21 @@ if total_count > 0:
         # Create timeline dataframe
         timeline_data = []
         for event in analysis_events:
-            timestamp = event.get("timestamp", 0)
-            if timestamp:
-                dt = datetime.fromtimestamp(timestamp / 1000)
+            # Support both @timestamp (ISO 8601) and epoch timestamp
+            timestamp_iso = event.get("@timestamp")
+            timestamp_epoch = event.get("timestamp", 0)
+
+            if timestamp_iso:
+                try:
+                    dt = datetime.fromisoformat(timestamp_iso.replace('Z', '+00:00'))
+                except:
+                    dt = datetime.fromtimestamp(timestamp_epoch / 1000) if timestamp_epoch else None
+            elif timestamp_epoch:
+                dt = datetime.fromtimestamp(timestamp_epoch / 1000)
+            else:
+                dt = None
+
+            if dt:
                 timeline_data.append({
                     "timestamp": dt,
                     "type": event.get("event.category", "unknown")
@@ -226,8 +238,20 @@ if total_count > 0:
             is_persistence = any(path in obj for path in persistence_paths)
 
             if is_persistence or "persistence" in event.get("tags", []) or "identity" in event.get("tags", []):
-                timestamp = event.get("timestamp", 0)
-                dt = datetime.fromtimestamp(timestamp / 1000).strftime("%Y-%m-%d %H:%M:%S") if timestamp else "N/A"
+                # Support both @timestamp (ISO 8601) and epoch timestamp
+                timestamp_iso = event.get("@timestamp")
+                timestamp_epoch = event.get("timestamp", 0)
+
+                if timestamp_iso:
+                    try:
+                        dt_obj = datetime.fromisoformat(timestamp_iso.replace('Z', '+00:00'))
+                        dt = dt_obj.strftime("%Y-%m-%d %H:%M:%S")
+                    except:
+                        dt = datetime.fromtimestamp(timestamp_epoch / 1000).strftime("%Y-%m-%d %H:%M:%S") if timestamp_epoch else "N/A"
+                elif timestamp_epoch:
+                    dt = datetime.fromtimestamp(timestamp_epoch / 1000).strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    dt = "N/A"
 
                 persistence_events.append({
                     "Timestamp": dt,
@@ -259,8 +283,20 @@ if total_count > 0:
         exec_events = []
         for event in analysis_events:
             if "audit_exec" in event.get("tags", []) or event.get("event.category") == "EXECVE":
-                timestamp = event.get("timestamp", 0)
-                dt = datetime.fromtimestamp(timestamp / 1000).strftime("%Y-%m-%d %H:%M:%S") if timestamp else "N/A"
+                # Support both @timestamp (ISO 8601) and epoch timestamp
+                timestamp_iso = event.get("@timestamp")
+                timestamp_epoch = event.get("timestamp", 0)
+
+                if timestamp_iso:
+                    try:
+                        dt_obj = datetime.fromisoformat(timestamp_iso.replace('Z', '+00:00'))
+                        dt = dt_obj.strftime("%Y-%m-%d %H:%M:%S")
+                    except:
+                        dt = datetime.fromtimestamp(timestamp_epoch / 1000).strftime("%Y-%m-%d %H:%M:%S") if timestamp_epoch else "N/A"
+                elif timestamp_epoch:
+                    dt = datetime.fromtimestamp(timestamp_epoch / 1000).strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    dt = "N/A"
 
                 # Try to get command line from raw_data
                 raw_data = event.get("raw_data", {})

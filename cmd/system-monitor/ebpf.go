@@ -26,14 +26,14 @@ import (
 // eBPFEvent represents a syscall event captured by eBPF
 type eBPFEvent struct {
 	// ECS: Base fields
-	Hostname string `json:"hostname"`
-	Module   string `json:"event.module"`
+	HostName  string `json:"host.name"`
+	Module    string `json:"event.module"`
+	Timestamp string `json:"@timestamp"`
 
-	// ECS: @timestamp fields
+	// Internal timestamp fields (for precision and backward compatibility)
 	TimestampNs    int64  `json:"timestamp_ns"`
 	EpochTimestamp int64  `json:"timestamp"`
 	Datetime       string `json:"datetime"`
-
 	// ECS: Process fields
 	Pid              uint32 `json:"process.pid"`
 	Ppid             uint32 `json:"process.parent.pid"`
@@ -50,11 +50,9 @@ type eBPFEvent struct {
 	ErrorCode        int64  `json:"error.code,omitempty"`
 	UserUnset        bool   `json:"user_unset"`
 
-	// ECS: Network fields
+	// ECS: Network fields (unified IP fields for both IPv4 and IPv6)
 	SourceIP   string `json:"source.ip,omitempty"`
 	DestIP     string `json:"destination.ip,omitempty"`
-	SourceIPv6 string `json:"source.ipv6,omitempty"`
-	DestIPv6   string `json:"destination.ipv6,omitempty"`
 	SourcePort uint16 `json:"source.port,omitempty"`
 	DestPort   uint16 `json:"destination.port,omitempty"`
 	SaFamily   string `json:"network.type,omitempty"`
@@ -492,8 +490,9 @@ func (ec *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 	uid, uidUnset := normalizeUID(raw.Uid)
 
 	evt := eBPFEvent{
-		Hostname:       ec.cfg.Hostname,
+		HostName:       ec.cfg.Hostname,
 		Module:         "ebpf",
+		Timestamp:      eventWallclock.UTC().Format(time.RFC3339Nano),
 		TimestampNs:    kernelTimeNs, // Canonical kernel event time (monotonic)
 		EpochTimestamp: eventWallclock.UnixMilli(),
 		Datetime:       eventWallclock.UTC().Format(time.RFC3339Nano),
@@ -544,11 +543,11 @@ func (ec *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 			evt.SaFamily = "ipv6"
 			if raw.SrcIpv6[0] > 0 || raw.SrcIpv6[1] > 0 ||
 				raw.SrcIpv6[2] > 0 || raw.SrcIpv6[3] > 0 {
-				evt.SourceIPv6 = parseIPv6(raw.SrcIpv6)
+				evt.SourceIP = parseIPv6(raw.SrcIpv6)
 			}
 			if raw.DestIpv6[0] > 0 || raw.DestIpv6[1] > 0 ||
 				raw.DestIpv6[2] > 0 || raw.DestIpv6[3] > 0 {
-				evt.DestIPv6 = parseIPv6(raw.DestIpv6)
+				evt.DestIP = parseIPv6(raw.DestIpv6)
 			}
 		default:
 			evt.SaFamily = fmt.Sprintf("AF_%d", raw.SaFamily)
@@ -558,22 +557,10 @@ func (ec *EBPFCollector) parseEvent(raw *bpfSoEvent) eBPFEvent {
 		evt.DestPort = raw.DestPort
 
 		if raw.Protocol == 6 || raw.Protocol == 17 {
-			var srcIP, destIP string
-
-			// Use appropriate IP fields based on address family
-			switch raw.SaFamily {
-			case 2: // AF_INET (IPv4)
-				srcIP = evt.SourceIP
-				destIP = evt.DestIP
-			case 10: // AF_INET6 (IPv6)
-				srcIP = evt.SourceIPv6
-				destIP = evt.DestIPv6
-			}
-
-			if srcIP != "" && destIP != "" {
+			if evt.SourceIP != "" && evt.DestIP != "" {
 				proto := map[uint8]string{6: "TCP", 17: "UDP"}[raw.Protocol]
 				evt.FlowID = GenerateFlowID(
-					srcIP, destIP,
+					evt.SourceIP, evt.DestIP,
 					evt.SourcePort, evt.DestPort,
 					proto,
 				)

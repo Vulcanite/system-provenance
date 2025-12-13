@@ -28,20 +28,23 @@ type FlowKey struct {
 // FlowStats tracks statistics for a network flow
 type FlowStats struct {
 	// ECS: Base fields
-	Hostname string `json:"hostname"`
-	Module   string `json:"event.module"`
+	HostName  string `json:"host.name"`
+	Module    string `json:"event.module"`
+	Timestamp string `json:"@timestamp"`
 	FlowKey
 	FlowID      string `json:"flow.id"`
 	PacketCount uint64 `json:"network.packets"`
 	ByteCount   uint64 `json:"network.bytes"`
 
-	// Time fields
-	FirstSeen     time.Time `json:"first_seen"`
-	LastSeen      time.Time `json:"last_seen"`
-	EpochFirst    int64     `json:"epoch_first"`
-	EpochLast     int64     `json:"epoch_last"`
-	DatetimeFirst string    `json:"datetime_first"`
-	DatetimeLast  string    `json:"datetime_last"`
+	// ECS: Time fields
+	EventStart string `json:"event.start"`
+	EventEnd   string `json:"event.end"`
+
+	// Internal time fields (for flow management)
+	FirstSeen  time.Time `json:"-"`
+	LastSeen   time.Time `json:"-"`
+	EpochFirst int64     `json:"epoch_first"`
+	EpochLast  int64     `json:"epoch_last"`
 
 	// Additional fields
 	Direction   string   `json:"network.direction,omitempty"`
@@ -363,20 +366,21 @@ func (pc *PCAPCollector) updateFlow(key FlowKey, packetLen int, tcpFlags []strin
 		flowID := GenerateFlowID(key.SrcIP, key.DstIP, key.SrcPort, key.DstPort, key.Protocol)
 		direction := pc.inferDirection(key.SrcIP, key.DstIP)
 		flow = &FlowStats{
-			Hostname:      pc.cfg.Hostname,
-			Module:        "pcap",
-			FlowKey:       key,
-			FlowID:        flowID,
-			Direction:     direction,
-			PacketCount:   1,
-			ByteCount:     uint64(packetLen),
-			FirstSeen:     now,
-			LastSeen:      now,
-			TCPFlags:      tcpFlags,
-			EpochFirst:    now.UnixMilli(),
-			EpochLast:     now.UnixMilli(),
-			DatetimeFirst: now.UTC().Format(time.RFC3339Nano),
-			DatetimeLast:  now.UTC().Format(time.RFC3339Nano),
+			HostName:    pc.cfg.Hostname,
+			Module:      "pcap",
+			Timestamp:   now.UTC().Format(time.RFC3339Nano),
+			FlowKey:     key,
+			FlowID:      flowID,
+			Direction:   direction,
+			PacketCount: 1,
+			ByteCount:   uint64(packetLen),
+			FirstSeen:   now,
+			LastSeen:    now,
+			EventStart:  now.UTC().Format(time.RFC3339Nano),
+			EventEnd:    now.UTC().Format(time.RFC3339Nano),
+			TCPFlags:    tcpFlags,
+			EpochFirst:  now.UnixMilli(),
+			EpochLast:   now.UnixMilli(),
 		}
 
 		// Try to resolve domain name from DNS cache
@@ -393,8 +397,9 @@ func (pc *PCAPCollector) updateFlow(key FlowKey, packetLen int, tcpFlags []strin
 		flow.PacketCount++
 		flow.ByteCount += uint64(packetLen)
 		flow.LastSeen = now
+		flow.Timestamp = now.UTC().Format(time.RFC3339Nano)
+		flow.EventEnd = now.UTC().Format(time.RFC3339Nano)
 		flow.EpochLast = now.UnixMilli()
-		flow.DatetimeLast = now.UTC().Format(time.RFC3339Nano)
 
 		// Merge TCP flags
 		if len(tcpFlags) > 0 {

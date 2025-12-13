@@ -71,19 +71,19 @@ flow_id_filter = st.sidebar.text_input("Flow ID (exact match)", "", help="Enter 
 # Build filters dict
 filters = {}
 if hostname_filter != "All":
-    filters["hostname"] = hostname_filter
+    filters["host.name"] = hostname_filter
 if syscall_filter:
     filters["syscall"] = syscall_filter
 if comm_filter:
-    filters["comm"] = comm_filter
+    filters["process.name"] = comm_filter
 if pid_filter:
     try:
-        filters["pid"] = int(pid_filter)
+        filters["process.pid"] = int(pid_filter)
     except ValueError:
         st.sidebar.error("PID must be a number")
 if ppid_filter:
     try:
-        filters["ppid"] = int(ppid_filter)
+        filters["process.parent.pid"] = int(ppid_filter)
     except ValueError:
         st.sidebar.error("PPID must be a number")
 
@@ -130,12 +130,12 @@ if total_count > 0:
 
             # Build target field based on syscall type
             target = ""
-            if event.get("filename"):
-                target = event.get("filename", "")
-            elif event.get("dest_ip"):
-                target = f"{event.get('dest_ip', '')}:{event.get('dest_port', '')}"
-            elif event.get("src_ip"):
-                target = f"{event.get('src_ip', '')}:{event.get('src_port', '')}"
+            if event.get("file.path"):
+                target = event.get("file.path", "")
+            elif event.get("destination.ip"):
+                target = f"{event.get('destination.ip', '')}:{event.get('destination.port', '')}"
+            elif event.get("source.ip"):
+                target = f"{event.get('source.ip', '')}:{event.get('source.port', '')}"
 
             # Truncate target if too long
             if len(target) > 60:
@@ -148,26 +148,26 @@ if total_count > 0:
             else:
                 ret_str = str(ret_val)
 
-            # Get flow ID for network events (support both field names)
+            # Get flow ID for network events
             flow_id = ""
             if event_type == "🌐 Network":
-                flow_id_full = event.get("flow.id", event.get("flow_id", ""))
+                flow_id_full = event.get("flow.id", "")
                 if flow_id_full:
                     flow_id = flow_id_full[:12] + "..." if len(flow_id_full) > 12 else flow_id_full
 
             table_data.append({
-                "Timestamp": event.get("datetime", "N/A")[:19] if event.get("datetime") else "N/A",
-                "Hostname": event.get("hostname", "N/A"),
+                "Timestamp": event.get("@timestamp", "N/A")[:19] if event.get("@timestamp") else "N/A",
+                "Hostname": event.get("host.name", "N/A"),
                 "Type": event_type,
                 "Syscall": syscall,
-                "Process": event.get("comm", "unknown"),
-                "PID": event.get("pid", "N/A"),
-                "PPID": event.get("ppid", "N/A"),
-                "UID": event.get("uid", "N/A"),
+                "Process": event.get("process.name", "unknown"),
+                "PID": event.get("process.pid", "N/A"),
+                "PPID": event.get("process.parent.pid", "N/A"),
+                "UID": event.get("user.id", "N/A"),
                 "Flow ID": flow_id if flow_id else "-",
                 "Target": target,
                 "Return": ret_str,
-                "Error": event.get("error", ""),
+                "Error": event.get("error.message", ""),
             })
 
         df = pd.DataFrame(table_data)

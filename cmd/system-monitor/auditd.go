@@ -36,14 +36,15 @@ func (ac *AuditdCollector) RotateLog() {
 
 type AuditEvent struct {
 	// ECS: Base fields
-	Module   string `json:"event.module"`
-	Hostname string `json:"hostname"`
+	Module    string `json:"event.module"`
+	HostName  string `json:"host.name"`
+	Timestamp string `json:"@timestamp"`
 
 	// ECS: Event fields
-	Timestamp int64  `json:"timestamp"`
-	Type      string `json:"event.category"`
-	Sequence  uint32 `json:"event.sequence"`
-	Summary   string `json:"message"`
+	EpochTimestamp int64  `json:"timestamp"`
+	Type           string `json:"event.category"`
+	Sequence       uint32 `json:"event.sequence"`
+	Summary        string `json:"message"`
 
 	// ECS: Process fields (ADDED)
 	ProcessPID  string `json:"process.pid,omitempty"`
@@ -197,15 +198,16 @@ func (h *auditStreamHandler) ReassemblyComplete(msgs []*auparse.AuditMessage) {
 	aucoalesce.ResolveIDs(event)
 
 	output := AuditEvent{
-		Module:    "auditd",
-		Timestamp: event.Timestamp.UnixMilli(),
-		Type:      event.Type.String(),
-		Hostname:  h.collector.cfg.Hostname,
-		Sequence:  event.Sequence,
-		Category:  event.Category.String(),
-		Summary:   event.Summary.Action,
-		RawData:   make(map[string]interface{}),
-		Tags:      []string{"auditd", "kernel"},
+		Module:         "auditd",
+		HostName:       h.collector.cfg.Hostname,
+		Timestamp:      event.Timestamp.UTC().Format(time.RFC3339Nano),
+		EpochTimestamp: event.Timestamp.UnixMilli(),
+		Type:           event.Type.String(),
+		Sequence:       event.Sequence,
+		Category:       event.Category.String(),
+		Summary:        event.Summary.Action,
+		RawData:        make(map[string]interface{}),
+		Tags:           []string{"auditd", "kernel"},
 	}
 
 	// Extract Actors and Objects for easier searching
