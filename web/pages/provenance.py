@@ -362,7 +362,7 @@ with tab2:
         use_beep = "BEEP" in analysis_mode
         use_both = "Both" in analysis_mode
 
-    if st.button("🔍 Analyze & Build Graph", type="primary", use_container_width=True):
+    if st.button("🔍 Analyze & Build Graph", type="primary", width='stretch'):
         if not target_comm and not target_pid:
             st.error("Please enter either a Target Process Name OR a Target PID.")
             st.stop()
@@ -413,7 +413,6 @@ with tab2:
                         cmd.extend(["--host", selected_host])
 
                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-
                     st.session_state['analyzer_stdout'] = result.stdout
                     st.session_state['analyzer_stderr'] = result.stderr
                     st.session_state['analyzer_stats'] = parse_analyzer_stats(result.stdout)

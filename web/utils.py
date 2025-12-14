@@ -6,7 +6,7 @@ SPECTRA-compliant normalization and correlation helpers
 
 import streamlit as st
 from elasticsearch import Elasticsearch
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import os
 import urllib3
@@ -161,7 +161,11 @@ def load_config():
 # TIME UTILS
 # ---------------------------------------------------------------------
 def to_epoch_ms(dt: datetime) -> int:
-    return int(dt.astimezone().timestamp() * 1000)
+    # If dt has no timezone, force it to UTC
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+        
+    return int(dt.timestamp() * 1000)
 
 
 # ---------------------------------------------------------------------
@@ -202,7 +206,7 @@ def get_event_count(es, index_name, start_ms=None, end_ms=None, filters=None):
         elif "auditd" in index_name:
             ts_field = "timestamp"
         else:
-            ts_field = "timestamp"  # NOT epoch_timestamp
+            ts_field = "timestamp" 
 
         must.append({"range": {ts_field: {"gte": start_ms, "lte": end_ms}}})
 

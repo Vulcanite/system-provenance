@@ -482,7 +482,7 @@ class ProvenanceGraph:
     def load_events(self, start_ms, end_ms, hostname=None):
         print("Loading events from ES from {} to {}...".format(datetime.fromtimestamp(int(start_ms) / 1000),datetime.fromtimestamp(int(end_ms) / 1000)))
         must_filters = [
-            {"range": {"epoch_timestamp": {"gte": start_ms, "lte": end_ms}}}
+            {"range": {"timestamp": {"gte": start_ms, "lte": end_ms}}}
         ]
 
         # Hostname filter (if present)
@@ -637,7 +637,7 @@ class ProvenanceGraph:
         # 1) Build aggregation query WITH hostname filter
         # -----------------------
         must_filters = [
-            {"range": {"epoch_timestamp": {"gte": start_ms, "lte": end_ms}}}
+            {"range": {"timestamp": {"gte": start_ms, "lte": end_ms}}}
         ]
 
         if hostname:
@@ -655,7 +655,7 @@ class ProvenanceGraph:
                         "files": {"terms": {"field": "file.path.keyword", "size": 50}},
                         "dest_ips": {"terms": {"field": "destination.ip.keyword", "size": 20}},
                         "dest_ports": {"terms": {"field": "destination.port", "size": 20}},
-                        "last_seen": {"max": {"field": "epoch_timestamp"}},
+                        "last_seen": {"max": {"field": "timestamp"}},
                         "event_count": {"value_count": {"field": "syscall.keyword"}}
                     }
                 }
@@ -780,7 +780,7 @@ class ProvenanceGraph:
             # Build filtered event query for this PID + hostname
             must_filters_pid = [
                 {"term": {"process.pid": pid}},
-                {"range": {"epoch_timestamp": {"gte": start_ms, "lte": end_ms}}}
+                {"range": {"timestamp": {"gte": start_ms, "lte": end_ms}}}
             ]
             if hostname:
                 must_filters_pid.append({"term": {"host.name.keyword": hostname}})
@@ -788,7 +788,7 @@ class ProvenanceGraph:
             ev_query = {
                 "size": per_pid_event_limit,
                 "query": {"bool": {"must": must_filters_pid}},
-                "sort": [{"epoch_timestamp": {"order": "asc"}}]
+                "sort": [{"timestamp": {"order": "asc"}}]
             }
 
             try:
@@ -1076,7 +1076,7 @@ class ProvenanceGraph:
         print(f"[*] Scouting for target (PID={pid}, Comm={comm}) in broad range...")
 
         must_filters = [
-             {"range": {"epoch_timestamp": {"gte": start_ms, "lte": end_ms}}}
+             {"range": {"timestamp": {"gte": start_ms, "lte": end_ms}}}
         ]
 
         if hostname:
@@ -1111,8 +1111,8 @@ class ProvenanceGraph:
                 return None, None  # Target not found in this range
 
             # Get the first and last time the target was seen
-            first_seen = hits[0]['_source']['epoch_timestamp']
-            last_seen = hits[-1]['_source']['epoch_timestamp']
+            first_seen = hits[0]['_source']['timestamp']
+            last_seen = hits[-1]['_source']['timestamp']
 
             print(f"[+] Target found active between {datetime.fromtimestamp(first_seen/1000)} and {datetime.fromtimestamp(last_seen/1000)}")
 
@@ -1155,8 +1155,8 @@ class ProvenanceGraph:
             comm = event.get('process.name', 'unknown').split('\x00', 1)[0].strip()
             syscall = event['syscall']
 
-            if 'epoch_timestamp' in event:
-                timestamp_ms = event['epoch_timestamp']
+            if 'timestamp' in event:
+                timestamp_ms = event['timestamp']
             elif 'timestamp_ns' in event:
                 timestamp_ms = event['timestamp_ns'] // 1000000
             else:
@@ -2320,6 +2320,12 @@ def main():
         attack_subgraph = analyzer.remove_low_value_nodes(attack_subgraph, [target_procs[0]])
         attack_subgraph = analyzer.filter_temporal_window(attack_subgraph, args.start, window_hours=1)
 
+        if args.prune:
+            attack_subgraph = analyzer.prune_high_degree_files(
+                attack_subgraph,
+                degree_threshold=args.degree_threshold
+            )
+
         if args.holmes:
             print("Filtering using HOLMES")
             attack_subgraph = analyzer.holmes_backward_slice(
@@ -2335,6 +2341,7 @@ def main():
                 time_window_ms=args.beep_window,
                 min_group_size=args.beep_threshold
             )
+            attack_subgraph = analyzer.collapse_sibling_processes(attack_subgraph)
 
         if args.both:
             print("Filtering using Both Algorithms")
@@ -2349,13 +2356,6 @@ def main():
                 min_group_size=args.beep_threshold
             )
 
-        if args.prune:
-            attack_subgraph = analyzer.prune_high_degree_files(
-                attack_subgraph,
-                degree_threshold=args.degree_threshold
-            )
-
-        attack_subgraph = analyzer.collapse_sibling_processes(attack_subgraph)
         attack_subgraph = analyzer.remove_benign_only_subgraphs(attack_subgraph)
         attack_subgraph = analyzer.remove_isolated_nodes(attack_subgraph)
 

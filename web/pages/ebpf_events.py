@@ -7,6 +7,7 @@ import pandas as pd
 import json
 import sys
 import os
+import plotly.express as px
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils import load_config, connect_elasticsearch, get_event_count, fetch_events, to_epoch_ms, get_unique_hostnames
@@ -172,7 +173,236 @@ if total_count > 0:
 
         df = pd.DataFrame(table_data)
 
+        # Add visualizations section
+        st.markdown("---")
+        st.subheader("📊 Event Analytics & Visualizations")
+
+        # Create tabs for different visualization categories
+        viz_tab1, viz_tab2, viz_tab3, viz_tab4 = st.tabs(["📈 Timeline", "🎯 Distribution", "🔝 Top Activity", "🔍 Deep Dive"])
+
+        with viz_tab1:
+            st.markdown("#### Event Timeline")
+
+            # Parse timestamps for timeline
+            df['timestamp_dt'] = pd.to_datetime(df['Timestamp'])
+
+            # Events over time
+            timeline_df = df.groupby([pd.Grouper(key='timestamp_dt', freq='1min'), 'Type']).size().reset_index(name='count')
+
+            fig_timeline = px.line(
+                timeline_df,
+                x='timestamp_dt',
+                y='count',
+                color='Type',
+                title='Events Over Time (1-minute intervals)',
+                labels={'timestamp_dt': 'Time', 'count': 'Event Count', 'Type': 'Event Type'}
+            )
+            fig_timeline.update_layout(height=400)
+            st.plotly_chart(fig_timeline, width='stretch')
+
+            # Syscall activity timeline
+            syscall_timeline = df.groupby([pd.Grouper(key='timestamp_dt', freq='1min'), 'Syscall']).size().reset_index(name='count')
+            top_syscalls_for_timeline = df['Syscall'].value_counts().head(5).index.tolist()
+            syscall_timeline_filtered = syscall_timeline[syscall_timeline['Syscall'].isin(top_syscalls_for_timeline)]
+
+            fig_syscall_timeline = px.line(
+                syscall_timeline_filtered,
+                x='timestamp_dt',
+                y='count',
+                color='Syscall',
+                title='Top 5 Syscalls Activity Over Time',
+                labels={'timestamp_dt': 'Time', 'count': 'Count'}
+            )
+            fig_syscall_timeline.update_layout(height=350)
+            st.plotly_chart(fig_syscall_timeline, width='stretch')
+
+        with viz_tab2:
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.markdown("#### Event Type Distribution")
+                type_counts = df['Type'].value_counts()
+                fig_type_pie = px.pie(
+                    values=type_counts.values,
+                    names=type_counts.index,
+                    title='Events by Type',
+                    hole=0.4
+                )
+                fig_type_pie.update_layout(height=350)
+                st.plotly_chart(fig_type_pie, width='stretch')
+
+            with col2:
+                st.markdown("#### Return Status Distribution")
+                df['status'] = df['Return'].apply(lambda x: 'Error' if '❌' in str(x) else 'Success')
+                status_counts = df['status'].value_counts()
+                fig_status_pie = px.pie(
+                    values=status_counts.values,
+                    names=status_counts.index,
+                    title='Success vs Error',
+                    hole=0.4,
+                    color=status_counts.index,
+                    color_discrete_map={'Success': '#00cc66', 'Error': '#ff4444'}
+                )
+                fig_status_pie.update_layout(height=350)
+                st.plotly_chart(fig_status_pie, width='stretch')
+
+            # Syscall distribution
+            st.markdown("#### Syscall Distribution")
+            syscall_counts = df['Syscall'].value_counts().head(15)
+            fig_syscall_bar = px.bar(
+                x=syscall_counts.values,
+                y=syscall_counts.index,
+                orientation='h',
+                title='Top 15 Syscalls',
+                labels={'x': 'Count', 'y': 'Syscall'},
+                color=syscall_counts.values,
+                color_continuous_scale='Blues'
+            )
+            fig_syscall_bar.update_layout(height=400, showlegend=False)
+            st.plotly_chart(fig_syscall_bar, width='stretch')
+
+        with viz_tab3:
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.markdown("#### Top 15 Active Processes")
+                process_counts = df['Process'].value_counts().head(15)
+                fig_process_bar = px.bar(
+                    x=process_counts.values,
+                    y=process_counts.index,
+                    orientation='h',
+                    title='Process Activity',
+                    labels={'x': 'Event Count', 'y': 'Process'},
+                    color=process_counts.values,
+                    color_continuous_scale='Greens'
+                )
+                fig_process_bar.update_layout(height=500, showlegend=False)
+                st.plotly_chart(fig_process_bar, width='stretch')
+
+            with col2:
+                st.markdown("#### Top 10 PIDs")
+                pid_counts = df['PID'].value_counts().head(10)
+                fig_pid_bar = px.bar(
+                    x=pid_counts.values,
+                    y=[str(p) for p in pid_counts.index],
+                    orientation='h',
+                    title='Most Active PIDs',
+                    labels={'x': 'Event Count', 'y': 'PID'},
+                    color=pid_counts.values,
+                    color_continuous_scale='Oranges'
+                )
+                fig_pid_bar.update_layout(height=400, showlegend=False)
+                st.plotly_chart(fig_pid_bar, width='stretch')
+
+                # UID distribution
+                st.markdown("#### User Activity (UID)")
+                uid_counts = df['UID'].value_counts().head(10)
+                fig_uid_bar = px.bar(
+                    x=uid_counts.values,
+                    y=[str(u) for u in uid_counts.index],
+                    orientation='h',
+                    title='Top UIDs',
+                    labels={'x': 'Event Count', 'y': 'UID'},
+                    color=uid_counts.values,
+                    color_continuous_scale='Purples'
+                )
+                fig_uid_bar.update_layout(height=350, showlegend=False)
+                st.plotly_chart(fig_uid_bar, width='stretch')
+
+        with viz_tab4:
+            # Process-Syscall heatmap
+            st.markdown("#### Process-Syscall Activity Heatmap")
+            st.caption("Shows which processes are making which syscalls (Top 10 processes × Top 10 syscalls)")
+
+            # Get top processes and syscalls
+            top_10_processes = df['Process'].value_counts().head(10).index.tolist()
+            top_10_syscalls = df['Syscall'].value_counts().head(10).index.tolist()
+
+            # Filter and create pivot table
+            filtered_df = df[df['Process'].isin(top_10_processes) & df['Syscall'].isin(top_10_syscalls)]
+            heatmap_data = filtered_df.groupby(['Process', 'Syscall']).size().reset_index(name='count')
+            heatmap_pivot = heatmap_data.pivot(index='Process', columns='Syscall', values='count').fillna(0)
+
+            fig_heatmap = px.imshow(
+                heatmap_pivot,
+                labels=dict(x="Syscall", y="Process", color="Event Count"),
+                x=heatmap_pivot.columns,
+                y=heatmap_pivot.index,
+                color_continuous_scale='YlOrRd',
+                aspect='auto'
+            )
+            fig_heatmap.update_layout(height=500)
+            st.plotly_chart(fig_heatmap, width='stretch')
+
+            # File operations breakdown
+            file_events = df[df['Type'] == '📂 File']
+            if len(file_events) > 0:
+                st.markdown("#### File Operations Analysis")
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    file_syscalls = file_events['Syscall'].value_counts()
+                    fig_file_ops = px.pie(
+                        values=file_syscalls.values,
+                        names=file_syscalls.index,
+                        title='File Syscall Distribution',
+                        hole=0.3
+                    )
+                    fig_file_ops.update_layout(height=350)
+                    st.plotly_chart(fig_file_ops, width='stretch')
+
+                with col2:
+                    # Top files accessed
+                    file_targets = file_events[file_events['Target'] != '']['Target'].value_counts().head(10)
+                    if len(file_targets) > 0:
+                        fig_files = px.bar(
+                            x=file_targets.values,
+                            y=file_targets.index,
+                            orientation='h',
+                            title='Top 10 File Targets',
+                            labels={'x': 'Access Count', 'y': 'File Path'}
+                        )
+                        fig_files.update_layout(height=350, showlegend=False)
+                        st.plotly_chart(fig_files, width='stretch')
+
+            # Network activity
+            network_events = df[df['Type'] == '🌐 Network']
+            if len(network_events) > 0:
+                st.markdown("#### Network Activity Analysis")
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    net_syscalls = network_events['Syscall'].value_counts()
+                    fig_net_ops = px.bar(
+                        x=net_syscalls.index,
+                        y=net_syscalls.values,
+                        title='Network Syscall Distribution',
+                        labels={'x': 'Syscall', 'y': 'Count'},
+                        color=net_syscalls.values,
+                        color_continuous_scale='Blues'
+                    )
+                    fig_net_ops.update_layout(height=350, showlegend=False)
+                    st.plotly_chart(fig_net_ops, width='stretch')
+
+                with col2:
+                    # Network targets
+                    net_targets = network_events[network_events['Target'] != '']['Target'].value_counts().head(10)
+                    if len(net_targets) > 0:
+                        fig_net_targets = px.bar(
+                            x=net_targets.values,
+                            y=net_targets.index,
+                            orientation='h',
+                            title='Top 10 Network Destinations',
+                            labels={'x': 'Connection Count', 'y': 'Destination'}
+                        )
+                        fig_net_targets.update_layout(height=350, showlegend=False)
+                        st.plotly_chart(fig_net_targets, width='stretch')
+
         # Configure column widths and display
+        st.markdown("---")
+        st.subheader("📋 Event Details Table")
         st.dataframe(
             df,
             width="stretch",
@@ -213,42 +443,32 @@ if total_count > 0:
                     st.code(example_flow_id, language="text")
                     st.caption("↑ Example Flow ID from a network event")
 
-        # Summary statistics
+        # Quick summary metrics
         st.markdown("---")
-        st.subheader("📊 Event Statistics (Current Page)")
+        st.subheader("📊 Quick Summary (Current Page)")
 
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
 
         with col1:
+            st.metric("Total Events", len(df))
+
+        with col2:
             syscall_counts = df['Syscall'].value_counts()
             st.metric("Unique Syscalls", len(syscall_counts))
 
-        with col2:
+        with col3:
             process_counts = df['Process'].value_counts()
             st.metric("Unique Processes", len(process_counts))
 
-        with col3:
-            error_count = len(df[df['Error'] != ''])
-            st.metric("Errors", error_count)
-
         with col4:
+            error_count = len(df[df['Error'] != ''])
+            error_pct = (error_count / len(df) * 100) if len(df) > 0 else 0
+            st.metric("Errors", error_count, delta=f"{error_pct:.1f}%", delta_color="inverse")
+
+        with col5:
             network_events = len(df[df['Type'] == '🌐 Network'])
-            st.metric("Network Events", network_events)
-
-        # Top syscalls and processes
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.markdown("**Top 10 Syscalls**")
-            top_syscalls = df['Syscall'].value_counts().head(10)
-            for syscall, count in top_syscalls.items():
-                st.write(f"- `{syscall}`: {count:,}")
-
-        with col2:
-            st.markdown("**Top 10 Processes**")
-            top_processes = df['Process'].value_counts().head(10)
-            for process, count in top_processes.items():
-                st.write(f"- `{process}`: {count:,}")
+            net_pct = (network_events / len(df) * 100) if len(df) > 0 else 0
+            st.metric("Network Events", network_events, delta=f"{net_pct:.1f}%")
 
         # Export option
         st.markdown("---")

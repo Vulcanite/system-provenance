@@ -84,7 +84,7 @@ try:
         # Simple aggregation for top syscalls
         query = {
             "query": {
-                "range": {"epoch_timestamp": {"gte": start_ms_1h, "lte": end_ms}}
+                "range": {"timestamp": {"gte": start_ms_1h, "lte": end_ms}}
             },
             "aggs": {
                 "top_syscalls": {
