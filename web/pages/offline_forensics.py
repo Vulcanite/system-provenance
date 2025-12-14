@@ -1,54 +1,188 @@
 #!/usr/bin/env python3
 """
 Offline Forensic Analysis - Parse auditd raw logs and build provenance graphs
+Uses the same ProvenanceGraph analyzer as the live eBPF system.
 """
 
 import streamlit as st
-import json
 import sys
 import os
-from datetime import datetime
-import plotly.graph_objects as go
+import time
+import subprocess
 import networkx as nx
+from pyvis.network import Network
+import streamlit.components.v1 as components
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from analyzer import ProvenanceGraph
-from narrative_gen import generate_narrative_from_analysis
 from utils import load_config
+from auditd_normalizer import parse_auditd_logs
+from analyzer import ProvenanceGraph
 
 st.set_page_config(page_title="Offline Forensics", page_icon="🔬", layout="wide")
 
 st.title("🔬 Offline Forensic Analysis")
-st.markdown("### Parse auditd logs and build provenance graphs")
-
-# Session state
-if 'events' not in st.session_state:
-    st.session_state['events'] = []
-if 'graph_builder' not in st.session_state:
-    st.session_state['graph_builder'] = None
-if 'narrative' not in st.session_state:
-    st.session_state['narrative'] = None
+st.markdown("### Upload auditd logs and build attack provenance graphs")
+st.markdown("Uses the same noise reduction algorithms (HOLMES & BEEP) as the live eBPF system.")
 
 # Load config
 config = load_config()
 es_config = config.get("es_config", {})
+output_dir = os.path.abspath(config.get("output_dir", "."))
+os.makedirs(output_dir, exist_ok=True)
+
+# Session state initialization
+if 'ecs_events' not in st.session_state:
+    st.session_state['ecs_events'] = []
+if 'dot_file_path' not in st.session_state:
+    st.session_state['dot_file_path'] = None
+if 'text_summary' not in st.session_state:
+    st.session_state['text_summary'] = None
+if 'analyzer_stats' not in st.session_state:
+    st.session_state['analyzer_stats'] = {}
+if 'mitre_techniques' not in st.session_state:
+    st.session_state['mitre_techniques'] = []
+
+def create_interactive_graph(dot_file_path):
+    """Create interactive PyVis graph from DOT file (same as provenance.py)"""
+    if not os.path.exists(dot_file_path):
+        st.error(f"DOT file not found: {dot_file_path}")
+        return None
+
+    try:
+        graph = nx.drawing.nx_pydot.read_dot(dot_file_path)
+        graph = nx.DiGraph(graph)
+
+        net = Network(
+            height="750px",
+            width="100%",
+            bgcolor="#222222",
+            font_color="white",
+            directed=True
+        )
+
+        net.set_options("""
+        {
+          "nodes": {"font": {"size": 14}},
+          "edges": {"color": {"inherit": true},
+                    "smooth": {"type": "continuous"},
+                    "arrows": {"to": {"enabled": true, "scaleFactor": 0.5}}},
+          "physics": {"enabled": true,
+                      "stabilization": {"iterations": 200},
+                      "barnesHut": {"gravitationalConstant": -8000,
+                                    "centralGravity": 0.3,
+                                    "springLength": 150,
+                                    "springConstant": 0.04}},
+          "interaction": {"hover": true,
+                          "tooltipDelay": 100,
+                          "navigationButtons": true,
+                          "keyboard": true}
+        }
+        """)
+
+        # Add nodes
+        for node_id, attrs in graph.nodes(data=True):
+            label = str(attrs.get("label", node_id)).strip('"').replace("\\n", "\n")
+            tooltip = label
+            fillcolor = str(attrs.get("fillcolor", "#CCCCCC")).strip('"')
+            shape = attrs.get("shape", "box")
+
+            net.add_node(
+                node_id,
+                label=label,
+                title=tooltip,
+                color=fillcolor,
+                shape=shape,
+                size=18
+            )
+
+        # Add edges
+        for u, v, attrs in graph.edges(data=True):
+            label = attrs.get("label", "").strip('"')
+            tooltip = label
+            color = attrs.get("color", "gray").strip('"')
+            net.add_edge(u, v, label=label, title=tooltip, color=color)
+
+        return net
+
+    except Exception as e:
+        st.error(f"Error creating interactive graph: {e}")
+        return None
+
+def parse_mitre_from_summary(summary_text):
+    """Parse MITRE ATT&CK techniques from text summary (same as provenance.py)"""
+    if not summary_text:
+        return []
+
+    techniques = []
+    current = None
+    in_section = False
+
+    for raw_line in summary_text.splitlines():
+        line = raw_line.rstrip()
+
+        if line.startswith("=== MITRE ATT&CK TECHNIQUE INFERENCE"):
+            in_section = True
+            continue
+
+        if not in_section:
+            continue
+
+        if line.startswith("=== CHRONOLOGICAL EVENTS"):
+            break
+
+        if not line.strip():
+            continue
+
+        # Technique line: "- T1059 | Execution | Command and Scripting Interpreter"
+        if line.startswith("- "):
+            body = line[2:]
+            parts = [p.strip() for p in body.split("|")]
+            tid = parts[0] if len(parts) > 0 else ""
+            tactic = parts[1] if len(parts) > 1 else ""
+            name = parts[2] if len(parts) > 2 else ""
+
+            if current:
+                techniques.append(current)
+
+            current = {
+                "tid": tid,
+                "tactic": tactic,
+                "name": name,
+                "description": "",
+                "evidence": [],
+            }
+            continue
+
+        if line.strip().startswith("Description:") and current:
+            current["description"] = line.split("Description:", 1)[1].strip()
+            continue
+
+        stripped = line.lstrip()
+        if current and (stripped.startswith("* ") or stripped.startswith("- ") or stripped.startswith("• ")):
+            ev = stripped[1:].strip() if stripped[1:].strip() else stripped.strip()
+            if ev:
+                current["evidence"].append(ev)
+
+    if current:
+        techniques.append(current)
+
+    return techniques
 
 # ===== FILE UPLOAD =====
 st.markdown("## 📁 Upload Auditd Raw Logs")
 
 log_file = st.file_uploader(
-    "Upload auditd log file",
+    "Upload auditd log file (e.g., /var/log/audit/audit.log)",
     type=['log', 'txt', 'audit'],
-    help="Raw auditd log file (e.g., /var/log/audit/audit.log)"
+    help="Raw auditd log file in standard Linux audit format"
 )
 
 if log_file:
     st.success(f"✅ Uploaded: {log_file.name} ({log_file.size:,} bytes)")
 
-    # Processing options
-    with st.expander("⚙️ Processing Options", expanded=True):
-        col1, col2 = st.columns(2)
+    with st.expander("⚙️ Parsing Options", expanded=True):
+        col1, col2, col3 = st.columns(3)
 
         with col1:
             max_lines = st.number_input(
@@ -63,120 +197,72 @@ if log_file:
         with col2:
             event_filter = st.text_input(
                 "Event type filter (optional)",
-                placeholder="e.g., EXECVE,SYSCALL,CONNECT",
-                help="Comma-separated event types to include"
+                placeholder="e.g., SYSCALL,EXECVE,PATH",
+                help="Comma-separated audit event types"
             )
 
-    if st.button("🔄 Parse & Build Graph", type="primary"):
-        with st.spinner("Parsing auditd logs..."):
+        with col3:
+            hostname = st.text_input(
+                "Hostname",
+                value="forensic-analysis",
+                help="Hostname to use for events"
+            )
+
+    if st.button("🔄 Parse Auditd Logs", type="primary"):
+        with st.spinner("Parsing auditd logs and normalizing to ECS..."):
             try:
                 # Read log file
                 content = log_file.getvalue().decode('utf-8', errors='ignore')
-                lines = content.split('\n')
 
-                # Parse auditd raw format
-                events = []
-                current_event_id = None
-                current_event = {}
+                # Parse event type filter
+                event_filters = [f.strip().upper() for f in event_filter.split(',')] if event_filter else None
 
-                event_filters = [f.strip().upper() for f in event_filter.split(',')] if event_filter else []
-
+                # Progress tracking
                 progress_bar = st.progress(0)
                 status_text = st.empty()
 
-                for idx, line in enumerate(lines[:max_lines]):
-                    if idx % 1000 == 0:
-                        progress = min(idx / min(len(lines), max_lines), 1.0)
-                        progress_bar.progress(progress)
-                        status_text.text(f"Processing line {idx:,} of {min(len(lines), max_lines):,}")
+                status_text.text("Parsing auditd logs...")
+                progress_bar.progress(0.3)
 
-                    if not line.strip() or line.startswith('#'):
-                        continue
-
-                    # Parse auditd line: type=TYPE msg=audit(timestamp:sequence): key=value ...
-                    if 'type=' in line and 'msg=audit' in line:
-                        try:
-                            # Extract type
-                            type_start = line.find('type=') + 5
-                            type_end = line.find(' ', type_start)
-                            event_type = line[type_start:type_end]
-
-                            # Apply filter
-                            if event_filters and event_type not in event_filters:
-                                continue
-
-                            # Extract timestamp and sequence
-                            if 'msg=audit(' in line:
-                                msg_start = line.find('msg=audit(') + 10
-                                msg_end = line.find(')', msg_start)
-                                ts_seq = line[msg_start:msg_end]
-                                timestamp, sequence = ts_seq.split(':')
-
-                                event_id = f"{timestamp}:{sequence}"
-
-                                # New event
-                                if event_id != current_event_id:
-                                    if current_event:
-                                        events.append(current_event)
-                                    current_event_id = event_id
-                                    current_event = {
-                                        'type': event_type,
-                                        'timestamp': float(timestamp),
-                                        'sequence': sequence,
-                                        '@timestamp': datetime.fromtimestamp(float(timestamp)).isoformat()
-                                    }
-
-                                # Extract key-value pairs
-                                kv_part = line[msg_end+2:] if msg_end+2 < len(line) else ""
-
-                                # Parse fields
-                                import re
-                                # Match key=value or key="value"
-                                pattern = r'(\w+)=(?:"([^"]*)"|(\S+))'
-                                matches = re.findall(pattern, kv_part)
-
-                                for key, quoted_val, unquoted_val in matches:
-                                    value = quoted_val if quoted_val else unquoted_val
-                                    current_event[key] = value
-
-                        except Exception as e:
-                            continue
-
-                # Add last event
-                if current_event:
-                    events.append(current_event)
+                # Parse and normalize to ECS
+                ecs_events = parse_auditd_logs(
+                    content,
+                    hostname=hostname,
+                    max_lines=max_lines,
+                    event_type_filter=event_filters
+                )
 
                 progress_bar.progress(1.0)
-                status_text.text(f"✅ Parsing complete!")
+                status_text.text(f"✅ Parsed {len(ecs_events)} ECS-normalized events!")
 
-                st.session_state['events'] = events
+                st.session_state['ecs_events'] = ecs_events
 
-                if events:
-                    st.success(f"✅ Parsed {len(events)} audit events")
+                if ecs_events:
+                    st.success(f"✅ Normalized {len(ecs_events)} audit events to ECS format")
 
                     # Quick stats
                     col1, col2, col3, col4 = st.columns(4)
 
                     with col1:
-                        st.metric("Total Events", f"{len(events):,}")
+                        st.metric("Total Events", f"{len(ecs_events):,}")
 
                     with col2:
-                        event_types = set(e.get('type') for e in events if e.get('type'))
-                        st.metric("Event Types", len(event_types))
+                        syscalls = set(e.get('syscall') for e in ecs_events if e.get('syscall'))
+                        st.metric("Unique Syscalls", len(syscalls))
 
                     with col3:
-                        pids = set(e.get('pid') for e in events if e.get('pid'))
+                        pids = set(e.get('process.pid') for e in ecs_events if e.get('process.pid'))
                         st.metric("Unique PIDs", len(pids))
 
                     with col4:
-                        timestamps = [e['timestamp'] for e in events if 'timestamp' in e]
+                        timestamps = [e['timestamp'] for e in ecs_events if 'timestamp' in e]
                         if timestamps:
-                            duration = max(timestamps) - min(timestamps)
+                            duration = (max(timestamps) - min(timestamps)) / 1000.0
                             st.metric("Time Span", f"{duration:.1f}s")
 
                     # Show sample
-                    with st.expander("📋 Sample Events"):
-                        st.json(events[:5])
+                    with st.expander("📋 Sample ECS Events"):
+                        st.json(ecs_events[:3])
 
                 else:
                     st.error("No valid audit events found in log file")
@@ -187,305 +273,300 @@ if log_file:
                 st.text(traceback.format_exc())
 
 # ===== PROVENANCE GRAPH BUILDING =====
-if st.session_state['events']:
+if st.session_state['ecs_events']:
     st.markdown("---")
     st.markdown("## 🕸️ Build Provenance Graph")
+    st.caption("Uses the same ProvenanceGraph analyzer as the live eBPF system")
 
-    col1, col2 = st.columns(2)
+    col1, col2 = st.columns([1, 1])
 
     with col1:
-        generate_narrative = st.checkbox("Generate Attack Narrative", value=True)
+        target_comm = st.text_input(
+            "Target Process Name (optional)",
+            value="",
+            help="Focus graph on specific process (e.g., bash, suspicious-script.sh)"
+        )
 
     with col2:
-        visualize_graph = st.checkbox("Visualize Graph", value=True)
+        target_pid = st.text_input(
+            "Target PID (optional)",
+            help="Focus graph on specific PID"
+        )
+
+    with st.expander("⚙️ Graph Analysis Options", expanded=True):
+        col3, col4 = st.columns(2)
+
+        with col3:
+            max_depth = st.slider(
+                "Graph Depth",
+                min_value=1,
+                max_value=10,
+                value=5,
+                help="Maximum traversal depth in the process tree"
+            )
+
+        with col4:
+            disable_filtering = st.checkbox(
+                "Disable Event Filtering",
+                value=False,
+                help="Show all events (not recommended for large datasets)"
+            )
+
+        col5, col6 = st.columns(2)
+
+        with col5:
+            prune_noise = st.checkbox(
+                "Prune High-Degree Files",
+                value=True,
+                help="Remove files accessed by many processes"
+            )
+
+        with col6:
+            degree_threshold = st.number_input(
+                "Degree Threshold",
+                min_value=3,
+                max_value=20,
+                value=5,
+                help="Degree threshold for pruning"
+            )
+
+        analysis_mode = st.selectbox(
+            "Select Analysis Strategy",
+            options=[
+                "Standard",
+                "HOLMES Backward Slicing",
+                "BEEP Edge Grouping",
+                "Both HOLMES & BEEP"
+            ],
+            index=3,  # Default to both
+            help="Select noise reduction algorithm"
+        )
+
+        use_holmes = "HOLMES" in analysis_mode
+        use_beep = "BEEP" in analysis_mode
+        use_both = "Both" in analysis_mode
 
     if st.button("🔬 Build Provenance Graph", type="primary"):
-        with st.spinner("Building provenance graph from events..."):
+        with st.spinner("Building provenance graph from auditd events..."):
             try:
-                # Create graph builder
-                graph_builder = ProvenanceGraph(es_config)
-                events = st.session_state['events']
+                # Initialize analyzer (same as live system)
+                analyzer = ProvenanceGraph(es_config)
+                events = st.session_state['ecs_events']
 
-                # Process events into graph
                 progress_bar = st.progress(0)
                 status_text = st.empty()
 
-                process_nodes = {}
-                file_nodes = set()
-                network_nodes = set()
+                # Build graph using analyzer.py logic
+                status_text.text("Building provenance graph...")
+                analyzer.build_graph(
+                    events,
+                    enable_filtering=not disable_filtering,
+                    enable_event_compression=False  # BEEP is applied at graph level
+                )
+                progress_bar.progress(0.4)
 
-                for idx, event in enumerate(events):
-                    if idx % 100 == 0:
-                        progress = idx / len(events)
-                        progress_bar.progress(progress)
-                        status_text.text(f"Processing event {idx:,} of {len(events):,}")
+                # Get subgraph if target specified
+                if target_comm or target_pid:
+                    status_text.text("Extracting target subgraph...")
 
-                    event_type = event.get('type', '')
-                    pid = event.get('pid')
-                    ppid = event.get('ppid')
-                    comm = event.get('comm', '')
-                    exe = event.get('exe', '')
+                    if target_pid:
+                        target_procs = analyzer.find_processes_by_pid(target_pid)
+                    else:
+                        target_procs = analyzer.find_processes_by_name(target_comm)
 
-                    # Track processes
-                    if pid:
-                        proc_id = f"pid_{pid}"
-                        if proc_id not in process_nodes:
-                            process_nodes[proc_id] = {
-                                'pid': pid,
-                                'comm': comm,
-                                'exe': exe,
-                                'type': 'process'
-                            }
-                            graph_builder.graph.add_node(proc_id, **process_nodes[proc_id])
+                    if not target_procs:
+                        st.error(f"Process not found: {target_pid or target_comm}")
+                    else:
+                        attack_subgraph = analyzer.get_attack_subgraph(
+                            [target_procs[0]],
+                            max_depth=max_depth,
+                            include_parents=True,
+                            include_children=True
+                        )
+                        analyzer.graph = attack_subgraph
 
-                        # Parent-child relationship
-                        if ppid and ppid != pid:
-                            parent_id = f"pid_{ppid}"
-                            if parent_id not in process_nodes:
-                                process_nodes[parent_id] = {
-                                    'pid': ppid,
-                                    'type': 'process'
-                                }
-                                graph_builder.graph.add_node(parent_id, **process_nodes[parent_id])
+                progress_bar.progress(0.6)
 
-                            if not graph_builder.graph.has_edge(parent_id, proc_id):
-                                graph_builder.graph.add_edge(parent_id, proc_id, relation='spawned')
+                # Apply noise reduction algorithms
+                if prune_noise:
+                    status_text.text("Pruning high-degree files...")
+                    analyzer.graph = analyzer.prune_high_degree_files(
+                        analyzer.graph,
+                        degree_threshold=degree_threshold
+                    )
 
-                    # File operations
-                    if event_type in ['EXECVE', 'PATH', 'OPENAT', 'OPEN']:
-                        file_path = event.get('name', event.get('a0', ''))
-                        if file_path and file_path not in ['/dev/null', '/dev/urandom'] and pid:
-                            # Clean up hex encoding if present
-                            if all(c in '0123456789ABCDEFabcdef' for c in file_path.replace('/', '')):
-                                try:
-                                    file_path = bytes.fromhex(file_path.replace('/', '')).decode('utf-8', errors='ignore')
-                                except:
-                                    pass
+                if use_holmes:
+                    status_text.text("Applying HOLMES backward slicing...")
+                    analyzer.graph = analyzer.holmes_backward_slice(
+                        analyzer.graph,
+                        enable_forward=True
+                    )
+                    analyzer.graph = analyzer.compress_structural_nodes(analyzer.graph)
+                    progress_bar.progress(0.75)
 
-                            if file_path and len(file_path) < 200:
-                                file_nodes.add(file_path)
-                                graph_builder.graph.add_node(file_path, type='file', path=file_path)
+                if use_beep:
+                    status_text.text("Applying BEEP edge grouping...")
+                    analyzer.graph = analyzer.beep_edge_grouping(
+                        analyzer.graph,
+                        time_window_ms=2000,
+                        min_group_size=3
+                    )
+                    analyzer.graph = analyzer.collapse_sibling_processes(analyzer.graph)
+                    progress_bar.progress(0.85)
 
-                                proc_id = f"pid_{pid}"
-                                if event_type == 'EXECVE':
-                                    graph_builder.graph.add_edge(proc_id, file_path, relation='executed')
-                                else:
-                                    graph_builder.graph.add_edge(proc_id, file_path, relation='accessed')
+                if use_both:
+                    status_text.text("Applying combined HOLMES + BEEP...")
+                    analyzer.graph = analyzer.remove_benign_only_subgraphs(analyzer.graph)
 
-                    # Network operations
-                    if event_type in ['SOCKADDR', 'CONNECT']:
-                        saddr = event.get('saddr', '')
-                        if saddr and pid:
-                            # Parse socket address (simplified)
-                            if 'sin_addr' in saddr:
-                                # Extract IP from saddr
-                                import re
-                                ip_match = re.search(r'\d+\.\d+\.\d+\.\d+', saddr)
-                                if ip_match:
-                                    dest_ip = ip_match.group()
-                                    net_node = f"net_{dest_ip}"
-                                    network_nodes.add(net_node)
+                analyzer.graph = analyzer.remove_isolated_nodes(analyzer.graph)
 
-                                    graph_builder.graph.add_node(net_node, type='network', ip=dest_ip)
+                progress_bar.progress(0.95)
 
-                                    proc_id = f"pid_{pid}"
-                                    graph_builder.graph.add_edge(proc_id, net_node, relation='connected')
+                # Infer MITRE ATT&CK techniques
+                status_text.text("Inferring MITRE ATT&CK techniques...")
+                analyzer.infer_mitre_techniques(analyzer.graph)
 
-                progress_bar.progress(1.0)
-                status_text.text("✅ Graph construction complete!")
+                # Export to files
+                timestamp = int(time.time())
+                DOT_FILE = os.path.join(output_dir, f"offline_provenance_{timestamp}.dot")
+                TXT_OUTPUT = os.path.join(output_dir, f"offline_summary_{timestamp}.txt")
 
-                st.session_state['graph_builder'] = graph_builder
+                if analyzer.graph.number_of_nodes() > 0:
+                    focus_nodes = target_procs if (target_comm or target_pid) and target_procs else None
+                    analyzer.export_to_dot(analyzer.graph, DOT_FILE, focus_nodes=focus_nodes)
+                    analyzer.export_text_summary(analyzer.graph, TXT_OUTPUT)
 
-                # Display stats
-                st.success("✅ Provenance graph built successfully!")
+                    # Read summary for MITRE parsing
+                    with open(TXT_OUTPUT, 'r') as f:
+                        summary_text = f.read()
 
-                col1, col2, col3, col4 = st.columns(4)
+                    st.session_state['dot_file_path'] = DOT_FILE
+                    st.session_state['text_summary'] = summary_text
+                    st.session_state['mitre_techniques'] = parse_mitre_from_summary(summary_text)
+                    st.session_state['analyzer_stats'] = {
+                        'events_loaded': len(events),
+                        'events_filtered': analyzer.filtered_events,
+                        'filter_percentage': (analyzer.filtered_events / len(events) * 100) if len(events) > 0 else 0,
+                        'nodes': analyzer.graph.number_of_nodes(),
+                        'edges': analyzer.graph.number_of_edges()
+                    }
 
-                with col1:
-                    st.metric("Total Nodes", graph_builder.graph.number_of_nodes())
-                with col2:
-                    st.metric("Total Edges", graph_builder.graph.number_of_edges())
-                with col3:
-                    st.metric("Process Nodes", len(process_nodes))
-                with col4:
-                    st.metric("File Nodes", len(file_nodes))
+                    progress_bar.progress(1.0)
+                    status_text.text("✅ Provenance graph built successfully!")
 
-                # Generate narrative
-                if generate_narrative:
-                    with st.spinner("Generating narrative..."):
-                        try:
-                            narrative_result = generate_narrative_from_analysis(
-                                graph=graph_builder.graph,
-                                events=events[:1000],
-                                stats={
-                                    'total_events': len(events),
-                                    'processes': len(process_nodes),
-                                    'files': len(file_nodes),
-                                    'network': len(network_nodes)
-                                }
-                            )
-                            # Handle both string and tuple returns
-                            if isinstance(narrative_result, tuple):
-                                narrative = narrative_result[0]  # First element is usually the narrative
-                            else:
-                                narrative = str(narrative_result)
-
-                            st.session_state['narrative'] = narrative
-                        except Exception as e:
-                            st.warning(f"Narrative generation failed: {e}")
+                else:
+                    st.error("Graph is empty after filtering. Try disabling filters or changing target.")
 
             except Exception as e:
                 st.error(f"Graph building failed: {e}")
                 import traceback
                 st.text(traceback.format_exc())
 
-# ===== NARRATIVE DISPLAY =====
-if st.session_state.get('narrative'):
-    st.markdown("---")
-    st.markdown("## 📖 Attack Narrative")
+    # Display statistics
+    if st.session_state.get('analyzer_stats'):
+        stats = st.session_state['analyzer_stats']
 
-    st.markdown(st.session_state['narrative'])
-
-    st.download_button(
-        label="📥 Download Narrative",
-        data=st.session_state['narrative'],
-        file_name=f"narrative_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
-        mime="text/markdown"
-    )
-
-# ===== GRAPH VISUALIZATION =====
-if st.session_state.get('graph_builder') and visualize_graph:
-    st.markdown("---")
-    st.markdown("## 🗺️ Provenance Graph Visualization")
-
-    G = st.session_state['graph_builder'].graph
-
-    if G.number_of_nodes() > 0:
-        # Limit graph size
-        max_nodes = st.slider("Max nodes to display", 10, 200, 50, 10)
-
-        if G.number_of_nodes() > max_nodes:
-            # Get most connected nodes
-            degrees = dict(G.degree())
-            top_nodes = sorted(degrees.keys(), key=lambda x: degrees[x], reverse=True)[:max_nodes]
-            G_viz = G.subgraph(top_nodes).copy()
-            st.info(f"Showing top {max_nodes} most connected nodes (out of {G.number_of_nodes()} total)")
-        else:
-            G_viz = G.copy()
-
-        # Layout
-        pos = nx.spring_layout(G_viz, k=0.5, iterations=50)
-
-        # Create plotly figure
-        edge_x = []
-        edge_y = []
-        for edge in G_viz.edges():
-            x0, y0 = pos[edge[0]]
-            x1, y1 = pos[edge[1]]
-            edge_x.extend([x0, x1, None])
-            edge_y.extend([y0, y1, None])
-
-        edge_trace = go.Scatter(
-            x=edge_x, y=edge_y,
-            line=dict(width=0.5, color='#888'),
-            hoverinfo='none',
-            mode='lines'
-        )
-
-        # Nodes
-        node_x = []
-        node_y = []
-        node_text = []
-        node_color = []
-
-        for node in G_viz.nodes():
-            x, y = pos[node]
-            node_x.append(x)
-            node_y.append(y)
-
-            # Label
-            if str(node).startswith('pid_'):
-                node_data = G_viz.nodes[node]
-                label = node_data.get('comm', node)[:20]
-            else:
-                label = str(node)[:30]
-            node_text.append(label)
-
-            # Color by type
-            node_data = G_viz.nodes[node]
-            node_type = node_data.get('type', 'unknown')
-            if node_type == 'process':
-                node_color.append(0)
-            elif node_type == 'file':
-                node_color.append(1)
-            elif node_type == 'network':
-                node_color.append(2)
-            else:
-                node_color.append(3)
-
-        node_trace = go.Scatter(
-            x=node_x, y=node_y,
-            mode='markers+text',
-            text=node_text,
-            textposition="top center",
-            marker=dict(
-                size=10,
-                color=node_color,
-                colorscale='Viridis',
-                showscale=True,
-                colorbar=dict(
-                    title="Node Type",
-                    tickvals=[0, 1, 2, 3],
-                    ticktext=['Process', 'File', 'Network', 'Other']
-                )
-            ),
-            hoverinfo='text'
-        )
-
-        fig = go.Figure(
-            data=[edge_trace, node_trace],
-            layout=go.Layout(
-                title=f'Provenance Graph ({G_viz.number_of_nodes()} nodes, {G_viz.number_of_edges()} edges)',
-                showlegend=False,
-                hovermode='closest',
-                xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                height=600
-            )
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Export graph
-        st.markdown("### 📥 Export Graph")
-
-        col1, col2 = st.columns(2)
+        st.markdown("---")
+        st.markdown("### Analysis Statistics")
+        col1, col2, col3, col4 = st.columns(4)
 
         with col1:
-            # Export as GraphML
-            import io
-            buffer = io.StringIO()
-            nx.write_graphml(G, buffer)
-            st.download_button(
-                "Download GraphML",
-                data=buffer.getvalue(),
-                file_name=f"graph_{datetime.now().strftime('%Y%m%d_%H%M%S')}.graphml",
-                mime="application/xml"
-            )
+            st.metric("Events Loaded", f"{stats['events_loaded']:,}")
 
         with col2:
-            # Export events as JSON
-            events_json = json.dumps(st.session_state['events'], indent=2)
-            st.download_button(
-                "Download Events JSON",
-                data=events_json,
-                file_name=f"events_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json"
-            )
+            if stats['events_filtered'] > 0:
+                st.metric("Events Filtered", f"{stats['events_filtered']:,}",
+                         delta=f"-{stats['filter_percentage']:.1f}%")
+            else:
+                st.metric("Events Filtered", "0")
+
+        with col3:
+            st.metric("Graph Nodes", f"{stats['nodes']}")
+
+        with col4:
+            st.metric("Graph Edges", f"{stats['edges']}")
+
+        # MITRE ATT&CK techniques
+        if st.session_state.get('mitre_techniques'):
+            st.markdown("### 🧬 MITRE ATT&CK Techniques Detected")
+            mitre_list = st.session_state['mitre_techniques']
+            for tech in mitre_list:
+                with st.expander(f"{tech['tid']} • {tech['tactic']} • {tech['name']}", expanded=False):
+                    if tech.get('description'):
+                        st.markdown(f"**Description:** {tech['description']}")
+                    if tech.get('evidence'):
+                        st.markdown("**Evidence:**")
+                        for ev in tech['evidence']:
+                            st.markdown(f"- {ev}")
+        else:
+            st.markdown("### 🧬 MITRE ATT&CK Techniques Detected")
+            st.caption("No strong MITRE ATT&CK patterns identified")
+
+    # Display interactive graph
+    if st.session_state.get('dot_file_path'):
+        st.markdown("---")
+        st.markdown("### Interactive Provenance Graph")
+
+        dot_file = st.session_state['dot_file_path']
+        interactive_graph = create_interactive_graph(dot_file)
+
+        if interactive_graph:
+            try:
+                temp_html_name = "offline_graph_temp.html"
+                interactive_graph.write_html(temp_html_name)
+
+                final_html_path = os.path.join(output_dir, "offline_provenance_graph.html")
+                os.replace(temp_html_name, final_html_path)
+
+                with open(final_html_path, "r", encoding="utf-8") as f:
+                    components.html(f.read(), height=800, scrolling=True)
+
+            except Exception as e:
+                st.error(f"Failed to render interactive graph: {e}")
+
+            # PNG export
+            png_file = dot_file.replace(".dot", ".png")
+            try:
+                if not os.path.exists(png_file):
+                    subprocess.run(
+                        ["dot", "-Tpng", dot_file, "-o", png_file],
+                        check=True,
+                        timeout=60,
+                        capture_output=True
+                    )
+
+                if os.path.exists(png_file):
+                    with open(png_file, "rb") as f:
+                        st.download_button(
+                            label="📥 Download PNG Image",
+                            data=f.read(),
+                            file_name=os.path.basename(png_file),
+                            mime="image/png"
+                        )
+
+            except Exception as e:
+                st.warning(f"PNG generation unavailable: {e}")
+
+        # Text summary
+        if st.session_state.get('text_summary'):
+            with st.expander("📄 View Attack Analysis", expanded=False):
+                st.text_area(
+                    "Attack Chain Summary",
+                    value=st.session_state['text_summary'],
+                    height=300,
+                    label_visibility="hidden"
+                )
+
+                st.download_button(
+                    label="📥 Download Summary",
+                    data=st.session_state['text_summary'],
+                    file_name="offline_attack_summary.txt",
+                    mime="text/plain"
+                )
 
 else:
-    if not st.session_state['events']:
-        st.info("👆 Upload an auditd log file to begin")
+    if not st.session_state['ecs_events']:
+        st.info("👆 Upload an auditd log file to begin offline forensic analysis")
 
 st.markdown("---")
-st.caption("*Offline Forensic Analysis - Parse auditd logs and build provenance graphs*")
+st.caption("*Offline Forensic Analysis - Uses the same provenance analysis algorithms as live eBPF monitoring*")

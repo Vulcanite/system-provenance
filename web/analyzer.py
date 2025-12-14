@@ -535,8 +535,15 @@ class ProvenanceGraph:
         })
 
         for event in events:
-            pid = str(event['process.pid'])
-            sc = event['syscall']
+            # Safely get PID and syscall
+            pid = event.get('process.pid')
+            if not pid:
+                continue
+            pid = str(pid)
+
+            sc = event.get('syscall')
+            if not sc:
+                continue
 
             if sc in ['openat', 'read', 'write']:
                 process_stats[pid]['file_ops'] += 1
@@ -553,8 +560,11 @@ class ProvenanceGraph:
                 process_stats[pid]['net_connections'] += 1
 
             if sc == 'execve':
-                parent = str(event['process.parent.pid'])
-                process_stats[parent]['child_processes'] += 1
+                # Safely get parent PID
+                parent_pid = event.get('process.parent.pid')
+                if parent_pid:
+                    parent = str(parent_pid)
+                    process_stats[parent]['child_processes'] += 1
 
         for pid, stats in process_stats.items():
             suspicious = (
@@ -911,10 +921,17 @@ class ProvenanceGraph:
 
     def is_noise_category(self, event):
         """Check if event belongs to a noise category"""
-        syscall = event['syscall']
+        syscall = event.get('syscall')
+        if not syscall:
+            return False
+
         filename = event.get('file.path', '')
         comm = event.get('process.name', '')
-        pid = str(event['process.pid'])
+
+        pid = event.get('process.pid')
+        if not pid:
+            return False
+        pid = str(pid)
 
         for _, rules in NOISE_CATEGORIES.items():
             sensitivity = rules.get('sensitivity', 'medium')
@@ -952,10 +969,19 @@ class ProvenanceGraph:
         return False
 
     def _should_filter_event(self, event):
-        syscall = event['syscall']
+        syscall = event.get('syscall')
+        if not syscall:
+            return True  # Filter events without syscall
+
         filename = event.get('file.path', '')
-        comm = event.get('process.name', '').split('\x00', 1)[0].strip()
-        pid = str(event['process.pid'])
+        comm = event.get('process.name', '')
+        if isinstance(comm, str):
+            comm = comm.split('\x00', 1)[0].strip()
+
+        pid = event.get('process.pid')
+        if not pid:
+            return True  # Filter events without PID
+        pid = str(pid)
 
         # ------------------------------
         # 0. Filter out gdbus completely
@@ -1150,10 +1176,22 @@ class ProvenanceGraph:
                 self.filtered_events += 1
                 continue
 
-            pid = str(event['process.pid'])
-            ppid = str(event['process.parent.pid'])
-            comm = event.get('process.name', 'unknown').split('\x00', 1)[0].strip()
-            syscall = event['syscall']
+            # Safely extract required fields
+            pid = event.get('process.pid')
+            if not pid:
+                continue
+            pid = str(pid)
+
+            ppid = event.get('process.parent.pid', 0)
+            ppid = str(ppid)
+
+            comm = event.get('process.name', 'unknown')
+            if isinstance(comm, str):
+                comm = comm.split('\x00', 1)[0].strip()
+
+            syscall = event.get('syscall')
+            if not syscall:
+                continue
 
             if 'timestamp' in event:
                 timestamp_ms = event['timestamp']
