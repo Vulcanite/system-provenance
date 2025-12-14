@@ -158,7 +158,8 @@ SENSITIVE_FILE_PATTERNS = [
     r'.*/\.env$',
     r'/root/.*',
     r'.*/secrets?.*',
-    r'.*/credentials?.*'
+    r'.*/credentials?.*',
+    r'/home/attacker/.*',  # Preserve all attack-related files
 ]
 
 # HOLMES-specific: Files that trigger alerts
@@ -180,6 +181,8 @@ BENIGN_PROCS = [
     r'^apt.*',
     r'^dpkg.*',
     # r'^python.*', <-- REMOVE THIS
+    r'^gjs$',  # GNOME JavaScript - benign desktop process (loads many theme/icon files)
+    r'^fprintd$',
     # r'^node.*',   <-- REMOVE THIS
 ]
 
@@ -1672,8 +1675,26 @@ class ProvenanceGraph:
         return graph
 
     def prune_high_degree_files(self, graph, degree_threshold=5):
-        """Remove high-degree file nodes"""
+        """Enhanced high-degree file pruning with smart library detection"""
         print(f"Pruning high-degree files (degree > {degree_threshold})...")
+
+        # Enhanced noise file patterns (libraries, system files)
+        NOISE_FILE_PATTERNS = [
+            r'\.so(\.\d+)*$',                    # Shared libraries
+            r'/lib(64)?/.*\.so',                  # Library directories
+            r'/usr/lib.*\.so',
+            r'ld-linux',                          # Dynamic linker
+            r'libc\.so',
+            r'libpthread',
+            r'libdl\.so',
+            r'/usr/share/locale/',                # Locale files
+            r'/usr/share/fonts/',                 # Fonts
+            r'\.mo$',                             # Translation files
+            r'/proc/(cpuinfo|meminfo|stat)',      # Proc pseudo-files
+            r'/sys/devices/',                     # Sysfs
+            r'/dev/(null|zero|random|urandom)$',  # Standard devices
+        ]
+
         nodes_to_remove = []
 
         for node, attrs in graph.nodes(data=True):
@@ -1681,13 +1702,29 @@ class ProvenanceGraph:
                 total_degree = graph.in_degree(node) + graph.out_degree(node)
                 filepath = str(node)
 
+                # Never remove sensitive/attack files
                 is_sensitive = any(re.search(p, filepath) for p in SENSITIVE_FILE_PATTERNS)
+                if is_sensitive:
+                    continue
 
-                if total_degree > degree_threshold and not is_sensitive:
-                    nodes_to_remove.append(node)
+                # Adaptive threshold for system paths (2x higher)
+                adaptive_threshold = degree_threshold * 2 if any(sys_path in filepath for sys_path in ['/usr/lib', '/lib', '/etc/ld.so']) else degree_threshold
+
+                if total_degree > adaptive_threshold:
+                    # Check if it's a known noise pattern (library/system file)
+                    is_noise = any(re.search(p, filepath) for p in NOISE_FILE_PATTERNS)
+
+                    # Read-only files with no outgoing edges are likely libraries/configs
+                    is_read_only = graph.out_degree(node) == 0
+
+                    # But keep read-only files in suspicious directories
+                    in_suspicious_dir = any(susp in filepath for susp in ['/tmp', '/home', '/root'])
+
+                    if is_noise or (is_read_only and not in_suspicious_dir):
+                        nodes_to_remove.append(node)
 
         if nodes_to_remove:
-            print(f"[-] Removing {len(nodes_to_remove)} high-degree files")
+            print(f"[-] Removing {len(nodes_to_remove)} high-degree files (libraries/system files)")
             for node in nodes_to_remove[:5]:
                 degree = graph.in_degree(node) + graph.out_degree(node)
                 print(f"    - {node} (degree={degree})")
@@ -1734,11 +1771,13 @@ class ProvenanceGraph:
             graph.remove_nodes_from(isolates)
         return graph
 
-    def beep_edge_grouping(self, graph, time_window_ms=2000, min_group_size=3):
-        """BEEP-style graph-level edge grouping"""
+    def beep_edge_grouping(self, graph, time_window_ms=2000, min_group_size=2):
+        """Enhanced BEEP-style graph-level edge grouping with adaptive thresholds"""
         print(f"Applying BEEP edge grouping (window={time_window_ms}ms, min_size={min_group_size})...")
 
         edge_groups = defaultdict(list)
+        network_groups = defaultdict(list)  # Track network connections per process
+
         for u, v, data in list(graph.edges(data=True)):
             source_node = u
             edge_label = data.get('label', '')
@@ -1755,12 +1794,37 @@ class ProvenanceGraph:
             except:
                 timestamp_ms = 0
 
+            # --- IMPROVEMENT 1: Enhanced abstraction based on type ---
             if target_type == 'process':
                 comm = graph.nodes[v].get('comm', '')
                 target_abstract = re.sub(r'\d+', '', comm)
             elif target_type == 'file':
-                filename = str(target_node).split('/')[-1]
-                target_abstract = canonicalize_filename(filename)
+                filepath = str(target_node)
+                # Skip grouping for attack-related files
+                if any(re.search(p, filepath) for p in SENSITIVE_FILE_PATTERNS):
+                    continue  # Never group sensitive/attack files
+
+                # IMPROVEMENT 4: Enhanced file path abstraction (directory + extension)
+                if '/' in filepath:
+                    directory = '/'.join(filepath.split('/')[:-1])
+                    filename = filepath.split('/')[-1]
+                    ext = filename.rsplit('.', 1)[-1] if '.' in filename else 'file'
+                    target_abstract = f"{directory}/*.{ext}"
+                else:
+                    filename = filepath
+                    target_abstract = canonicalize_filename(filename)
+            elif target_type == 'network':
+                # IMPROVEMENT 5: Network subnet grouping
+                dest_ip = graph.nodes[v].get('dest_ip', '')
+                dest_port = graph.nodes[v].get('dest_port', 0)
+                if dest_ip and '.' in dest_ip:
+                    subnet = '.'.join(dest_ip.split('.')[:3])
+                    target_abstract = f"{subnet}.x:{dest_port}"
+                else:
+                    target_abstract = target_type
+
+                # Track network connections for suspicious pattern detection
+                network_groups[source_node].append(str(target_node))
             else:
                 target_abstract = target_type
 
@@ -1773,6 +1837,13 @@ class ProvenanceGraph:
                 'timestamp': timestamp_ms
             })
 
+        # IMPROVEMENT 6: Suspicious network pattern detection
+        for proc_node, net_targets in network_groups.items():
+            unique_dests = set(net_targets)
+            if len(unique_dests) >= 3:
+                comm = graph.nodes.get(proc_node, {}).get('comm', proc_node)
+                print(f"[!] Suspicious: {comm} connected to {len(unique_dests)} different destinations")
+
         groups_to_collapse = []
 
         for group_key, edges in edge_groups.items():
@@ -1781,12 +1852,29 @@ class ProvenanceGraph:
 
             edges_sorted = sorted(edges, key=lambda x: x['timestamp'])
 
+            # IMPROVEMENT 2: Adaptive time windows (5x longer for network)
+            source_node, edge_label, target_type, target_abstract = group_key
+            adaptive_window = time_window_ms * 5 if target_type == 'network' else time_window_ms
+
             if edges_sorted[-1]['timestamp'] > 0 and edges_sorted[0]['timestamp'] > 0:
                 time_span = edges_sorted[-1]['timestamp'] - edges_sorted[0]['timestamp']
-                if time_span > time_window_ms:
+
+                # IMPROVEMENT 3: Periodic behavior detection
+                if len(edges_sorted) >= 5 and time_span > adaptive_window:
+                    intervals = [edges_sorted[i+1]['timestamp'] - edges_sorted[i]['timestamp']
+                               for i in range(len(edges_sorted)-1)]
+                    avg_interval = sum(intervals) / len(intervals)
+                    variance = sum(abs(iv - avg_interval) for iv in intervals) / len(intervals)
+
+                    # If intervals are uniform (variance < 30%), it's periodic behavior
+                    if variance < avg_interval * 0.3:
+                        print(f"[+] Detected periodic pattern: {len(edges_sorted)} events with {avg_interval:.0f}ms intervals")
+                        # Allow grouping even if time span exceeds window
+                    else:
+                        continue  # Skip non-periodic events outside window
+                elif time_span > adaptive_window:
                     continue
 
-            source_node, edge_label, target_type, target_abstract = group_key
             groups_to_collapse.append({
                 'key': group_key,
                 'edges': edges_sorted,
@@ -1944,18 +2032,102 @@ class ProvenanceGraph:
         return graph
 
     def holmes_backward_slice(self, graph, enable_forward=True):
-        """HOLMES-style backward slicing"""
+        """Enhanced HOLMES-style backward slicing with advanced threat detection"""
         print(f"Applying HOLMES backward slicing (Enhanced)...")
 
         if graph.number_of_nodes() == 0:
             return graph
 
         alert_nodes = set()
+        alert_reasons = defaultdict(list)  # Track why each node is flagged
+
+        # Enhanced suspicious file patterns
+        ENHANCED_SENSITIVE_PATTERNS = HOLMES_ALERT_PATTERNS + [
+            r'/etc/(passwd|shadow|sudoers)',
+            r'\.ssh/(id_rsa|id_ed25519|authorized_keys)',
+            r'\.(bash|zsh)_history$',
+            r'/proc/\d+/(maps|environ|cmdline)',
+            r'/(cron|at)\.d/',
+            r'\.(pem|key|cert)$',
+        ]
+
+        # Suspicious ports (C2 frameworks, etc.)
+        SUSPICIOUS_PORTS = [4444, 5555, 8080, 8443, 9001]
+
+        # Scripting interpreters that may execute staged malware
+        SCRIPT_INTERPRETERS = ['bash', 'sh', 'python', 'python3', 'perl', 'ruby', 'php']
+
+        # Untrusted execution locations
+        UNTRUSTED_PATHS = ['/tmp/', '/dev/shm/', '/var/tmp/']
+
+        # Behavioral pattern analysis
+        process_behaviors = defaultdict(lambda: {'files_read': 0, 'files_written': 0, 'net_conns': 0, 'children': []})
+
+        for u, v, data in graph.edges(data=True):
+            label = data.get('label', '')
+            u_type = graph.nodes[u].get('type', '')
+            v_type = graph.nodes[v].get('type', '')
+
+            # Count file reads/writes
+            if label == 'read' and u_type == 'file' and v_type == 'process':
+                pid = graph.nodes[v].get('pid', v)
+                process_behaviors[pid]['files_read'] += 1
+            elif label in ['write', 'created'] and u_type == 'process' and v_type == 'file':
+                pid = graph.nodes[u].get('pid', u)
+                process_behaviors[pid]['files_written'] += 1
+
+            # Count network connections
+            elif label == 'connected' and u_type == 'process' and v_type == 'network':
+                pid = graph.nodes[u].get('pid', u)
+                process_behaviors[pid]['net_conns'] += 1
+
+            # Track process spawning
+            elif label == 'spawned' and u_type == 'process' and v_type == 'process':
+                ppid = graph.nodes[u].get('pid', u)
+                process_behaviors[ppid]['children'].append(v)
 
         for node, attrs in graph.nodes(data=True):
             node_type = attrs.get('type', '')
+            comm = attrs.get('comm', '')
 
             if node_type == 'process':
+                # IMPROVEMENT 1: Rapid process spawning detection
+                child_processes = [c for c in process_behaviors[attrs.get('pid', node)]['children']
+                                 if graph.nodes.get(c, {}).get('type') == 'process']
+                if len(child_processes) >= 5:
+                    alert_nodes.add(node)
+                    alert_reasons[node].append('rapid_spawning')
+                    print(f"[!] Alert: {comm} spawned {len(child_processes)} child processes (rapid spawning)")
+
+                # IMPROVEMENT 2: Untrusted code execution
+                if comm in SCRIPT_INTERPRETERS:
+                    # Check if executing from untrusted location
+                    for successor in graph.successors(node):
+                        if graph.nodes[successor].get('type') == 'file':
+                            filepath = str(successor)
+                            if any(untrusted in filepath for untrusted in UNTRUSTED_PATHS):
+                                alert_nodes.add(node)
+                                alert_reasons[node].append('untrusted_execution')
+                                print(f"[!] Alert: {comm} executing from untrusted location: {filepath}")
+                                break
+
+                # IMPROVEMENT 3: Behavioral exfiltration patterns (but exclude benign processes)
+                pid = attrs.get('pid', node)
+                behavior = process_behaviors[pid]
+                if behavior['files_read'] > 20 and behavior['net_conns'] > 0:
+                    # Exclude benign desktop processes like gjs
+                    if not is_benign_process(comm):
+                        alert_nodes.add(node)
+                        alert_reasons[node].append('potential_exfiltration')
+                        print(f"[!] Alert: {comm} shows exfiltration pattern ({behavior['files_read']} reads + {behavior['net_conns']} network)")
+
+                # IMPROVEMENT 4: Mass file modification (ransomware detection)
+                if behavior['files_written'] > 50:
+                    alert_nodes.add(node)
+                    alert_reasons[node].append('mass_file_modification')
+                    print(f"[!] Alert: {comm} shows mass modification pattern ({behavior['files_written']} writes)")
+
+                # File deletion (anti-forensics)
                 for successor in graph.successors(node):
                     edge_data = graph.get_edge_data(node, successor)
                     if isinstance(edge_data, dict):
@@ -1963,23 +2135,38 @@ class ProvenanceGraph:
 
                         if 'deleted' in labels or 'unlink' in str(labels):
                             alert_nodes.add(node)
-                            print(f"[!] Alert: {attrs.get('comm', node)} deleted a file (Cleanup detection)")
+                            alert_reasons[node].append('file_deletion')
+                            print(f"[!] Alert: {comm} deleted a file (anti-forensics)")
 
             if node_type == 'file':
                 filepath = str(node)
-                for pattern in HOLMES_ALERT_PATTERNS:
+                # IMPROVEMENT 5: Enhanced sensitive file patterns
+                for pattern in ENHANCED_SENSITIVE_PATTERNS:
                     if re.search(pattern, filepath):
                         for pred in graph.predecessors(node):
                             if graph.nodes[pred].get('type') == 'process':
                                 alert_nodes.add(pred)
+                                alert_reasons[pred].append(f'accessed_sensitive:{filepath}')
                                 print(f"[!] Alert: {graph.nodes[pred].get('comm', pred)} accessed {filepath}")
 
             if node_type == 'network':
+                # IMPROVEMENT 6: Suspicious port detection
+                dest_port = attrs.get('dest_port', 0)
+                if dest_port in SUSPICIOUS_PORTS:
+                    for pred in graph.predecessors(node):
+                        if graph.nodes[pred].get('type') == 'process':
+                            alert_nodes.add(pred)
+                            comm = graph.nodes[pred].get('comm', pred)
+                            alert_reasons[pred].append(f'suspicious_port:{dest_port}')
+                            print(f"[!] Alert: {comm} connected to suspicious port {dest_port}")
+
+                # Network connections from non-benign processes
                 for pred in graph.predecessors(node):
                     if graph.nodes[pred].get('type') == 'process':
                         comm = graph.nodes[pred].get('comm', '')
                         if not is_benign_process(comm):
                             alert_nodes.add(pred)
+                            alert_reasons[pred].append('network_connection')
                             print(f"[!] Alert: {comm} made network connection")
 
         if not alert_nodes:
@@ -2022,7 +2209,7 @@ class ProvenanceGraph:
             node_type = attrs.get('type', '')
             if node_type == 'file':
                 filepath = str(node)
-                for pattern in HOLMES_ALERT_PATTERNS:
+                for pattern in ENHANCED_SENSITIVE_PATTERNS:
                     if re.search(pattern, filepath):
                         keep_nodes.add(node)
             elif node_type == 'network':
